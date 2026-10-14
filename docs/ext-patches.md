@@ -14,6 +14,9 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 | `src/adg/policy/runtime.py` | `ext_hooks.field_denied`（2 处） | 封闭列范围 |
 | `src/adg/app/main.py` | `ext_install(app, factory)` | 挂载 `/admin/ext/*`、`/ext/delegated/*` |
 | `src/adg/app/dependencies.py` | 吊销名单检查 | 凭据吊销立即生效 |
+| `src/adg/app/main.py` | `FastAPI(..., **ext_app_kwargs())` | `/docs`、`/redoc`、`/openapi.json` 默认关闭（2.6） |
+| `src/adg/shared/crypto.py` | `_decrypt_v2_envelope` 经 `adg_ext.kdf_cache.derive_key` 取派生密钥 | PBKDF2 输出缓存（2.4）；扩展关闭时等同原调用 |
+| `src/adg/control_plane/db.py` | `create_engine_from_url` 在扩展开启时带连接池参数 | 控制面连接池大小与等待超时（2.5） |
 | `src/adg/admin_api/console.py` | 新增 `entry` scope、`key_hash` | 入口服务凭据、外部哈希 Key |
 | `src/adg/control_plane/services/api_key_service.py` | 支持外部提供 `key_hash` | 明文不落地 |
 | `src/adg/control_plane/models/__init__.py` | 导入 `adg_ext.models` | `ext_*` 表共用元数据 |
@@ -151,6 +154,105 @@ MySQL 用例在改动前稳定复现 `status=error`，并含「库端确实拒�
 `tests/ext/test_ext_sync_tombstone.py`、`tests/ext_integration/test_extint_runtime.py`
 （`test_k3_*`、`test_replaying_user_and_credential_after_a_delete_*`）。
 
+## 2.4 PBKDF2 派生缓存（PER-1）
+
+**证据**：压测报告里默认配置下额外延迟 P95 约 160–670 ms，把 `ADG_SECRET_KDF_ITERATIONS` 降到 1200 后降到 31–55 ms。
+剖析（给 `derive_pbkdf2_fernet_key` 打计时与调用栈）结果：**每个查询恰好一次 PBKDF2**，来自
+`pipeline._run_connector → Datasource.config() → SecretConfigService.reveal_runtime_config → decrypt_fernet_envelope`
+——即解密**数据源账号密码**的信封（迭代数取自信封本身，390 000 次约 45–130 ms CPU）。**API Key 与委托凭证的认证不涉及
+PBKDF2**：API Key 是 `SHA-256(key)` 的索引查找，委托路径只做 `ext_sync_objects` 读取。所以「缓存已验证的凭证」没有收益，也
+不做：不缓存任何授权结果，也就没有「吊销要主动清缓存」的问题。
+
+**修复**：`adg_ext/kdf_cache.py` 缓存 **PBKDF2 的输出**（派生出的 Fernet 密钥），挂在 `crypto._decrypt_v2_envelope` 上：
+
+- 派生是 `(主密钥, 盐, 迭代数)` 的纯函数，缓存不改变任何授权结果；Fernet 令牌（HMAC、时间戳）**每次仍完整校验**，迭代数范围
+  检查在查缓存之前，**不降低迭代数、不放宽校验**。错误的主密钥、被篡改的信封、被改的盐或迭代数都得到各自的键，不会命中他人条目。
+- 缓存键是 `HMAC-SHA256(进程内随机密钥, 主密钥‖盐‖迭代数)`，不是明文、也不是明文的哈希；值只在内存里，不落盘、不写日志、不经任何接口。
+- 有上限（`ADG_EXT_KDF_CACHE_SIZE`，默认 64，LRU）和过期（`ADG_EXT_KDF_CACHE_TTL_SECONDS`，默认 300 秒）；任一为 0 即关闭。
+  TTL 不涉及授权：吊销、删除用户、过期、墓碑都在认证与 `ext_sync_objects` 里先于、独立于该缓存判定，因此**不会让吊销生效时间超过原有
+  5 秒目标**（测试在缓存已热的情况下逐项验证）。数据源账号换密码会产生新信封（新的随机盐），自然得到新键；主密钥轮换同理。
+- 并发未命中合并为一次派生（single-flight）；派生失败不缓存、不会卡住等待者。
+- **多进程**：每个 worker 进程各有一份缓存，互不共享，新进程每个数据源首次查询仍付一次派生（约 50–130 ms，一次性）。
+- 默认值选择：64 条够覆盖数据源账号数（每个账号一个信封）；300 秒只是限制密钥材料在内存里的驻留时间（主密钥本来就常驻进程），
+  不是正确性参数，缩短只会让每个 TTL 周期多付一次派生。
+
+**前后对比**（同一台高负载开发机——负载 7–9，Docker 里 MySQL 8.4；执行器在本机 uvicorn，httpx 保活连接；做法同压测 S3：交替
+「经网关一次查询」与「库上长连接直连同一语义语句」，300 对，逐次配对差值；每个设置各跑多次，波动来自机器负载）：
+
+| 配置 | 额外延迟 P50 | 额外延迟 P95 | P99 | 运行次数 |
+|---|---|---|---|---|
+| 修复前（390 000 次，无缓存） | 61.6–63.6 ms | 77.0–116.2 ms | 108–164 ms | 3 |
+| 缓存关闭（`ADG_EXT_KDF_CACHE_SIZE=0`，与修复前等价） | 61.3–65.7 ms | 91.5–113.8 ms | 116–149 ms | 3 |
+| **修复后（390 000 次，缓存开启）** | **13.7–14.7 ms** | **23.3–33.8 ms** | 39–90 ms | 5 |
+| 参照：迭代数 1200、缓存关闭 | 12.8–14.2 ms | 22.5–40.1 ms | 34–78 ms | 3 |
+
+修复后与「把迭代数降到 1200」在波动范围内一致，而迭代数没有动。绝对值只代表这台机器这个时刻；压测报告里的 160–670 ms 来自另一种
+并发形态（多线程、同机多容器），本表是单线程配对测量，不能直接对照。方法见 `tests/ext_integration/test_extint_bench.py`
+（`ADG_EXT_BENCH=1`，默认跳过）。
+
+测试：`tests/ext/test_ext_kdf_cache.py`（命中/键含全部输入/键不含明文/过期/LRU 上限/关闭/single-flight/失败不缓存/不写日志/
+错误主密钥与篡改信封在缓存已热时仍失败/迭代数范围）、`tests/ext_integration/test_extint_kdf_cache.py`（真实 MySQL：多次查询只派生一次且
+用信封自带的 390 000 次；委托路径同一份派生；缓存已热时删除凭证、删除用户、授权过期、凭证过期、吊销名单、墓碑重放都立即生效；
+数据源账号轮换使用新信封）。
+
+## 2.5 控制面连接池占满：不泄漏、不死锁，池满返回 503 `admission_pool_exhausted`
+
+**现象**（压测报告）：多个授权同时排队时，所有请求停约 30 秒，之后部分 HTTP 500，日志
+`QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00`。复现：
+`sql-gateway/scripts/loadtest/repro_inflight_stall.py`（5 授权 × 6 并发），或本仓库
+`tests/ext_integration/test_extint_bench.py -k stall`。
+
+**根因（线程转储为证）：不是连接泄漏，是「持有连接等待」造成的死锁**。请求的会话在认证时就借了一个控制面连接，
+`pipeline._execute` 随后在**持有该连接**的情况下进入准入队列（最长 `queueTimeoutSeconds`，默认 30 s）。排队的请求越多，
+池里被占住的连接越多；已经被放行、正在执行的请求在结束时需要一个连接写完成审计（`_persist`），却拿不到——而它们不结束，
+排队的就永远等不到槽位。直到池超时（30 s）才解开。转储里 30 个请求中 15 个卡在 `_persist` 的 `pool._do_get`，其余在准入队列里
+（各占一个连接）或在库上执行语句。取消、超时、异常路径都经 `finally: ticket.release()` 归还槽位与连接（压测后 `pool.checkedout() == 0`、
+准入 `running/queued == 0` 由回归测试断言）。委托路径与运行时路径走同一个 `pipeline.run`，两者同样受影响，也同样被修复。
+
+**修复**：
+
+1. **排队前归还连接**（`pipeline.release_connection`）：等待准入前 `session.commit()`（此时没有待写内容；会话工厂是
+   `expire_on_commit=False`，已加载对象继续可用），排队的请求不再占池。
+2. **池等待有界**：扩展开启时控制面引擎使用 `ADG_EXT_CONTROL_PLANE_POOL_SIZE`（默认 10）、`..._POOL_MAX_OVERFLOW`（默认 30，
+   合计 40 = 默认工作线程数）、`..._POOL_TIMEOUT_SECONDS`（默认 **5**，上游为 30）。
+3. **池满返回明确的 503，不是 500**：任何路径（认证、读、审计写）拿不到连接时，`sqlalchemy.exc.TimeoutError` 由
+   `adg_ext.app` 注册的处理器转成
+   `HTTP 503`、头 `Retry-After: <ADG_EXT_POOL_EXHAUSTED_RETRY_AFTER_SECONDS，默认 1>`、响应体
+   `{"status":"rejected","reason":"admission_pool_exhausted","detail":"admission_pool_exhausted","retry_after_seconds":1}`。
+   与既有 `admission_*` 原因码同一词表（`reason` 同名字段，进 `adg_ext_query_rejected_total{reason="admission_pool_exhausted"}` 与
+   `adg_ext_admission_rejected_total{reason="pool_exhausted"}`），但**用 HTTP 503 而不是 200**：此时没有控制面连接，无法写审计行，
+   所以这类拒绝**没有审计行**（只有指标与日志）。放行后才拿不到连接（写开始审计行时）同样 503，槽位与熔断探针照常释放。
+4. **数据源并发上限不超过运行时连接池**（`pipeline.effective_datasource_limit`）：`ADG_EXT_DATASOURCE_MAX_CONCURRENCY`（默认 20）
+   与 `ADG_RUNTIME_DATASOURCE_POOL_SIZE + MAX_OVERFLOW`（默认 5 + 0）相互矛盾时，多放行的语句会停在连接器自己的池里（上游池等待 30 s），
+   既不排队也不受排队超时约束；更糟的是等待连接超过了语句超时后，请求已返回 `query_timeout`，工作线程却仍在等池、之后照样执行
+   （线程转储里有 4 个线程卡在 `relational.py` 的池取连接）。现在有效上限取两者较小值（gauge `adg_ext_admission_datasource_limit` 反映有效值）；
+   要提高单数据源并发，同时调大 `ADG_RUNTIME_DATASOURCE_POOL_SIZE`。
+
+**前后对比**（`test_extint_bench.py -k stall`，5 授权 × 每授权 6 并发，授权上限 3 / 队列 10 / 排队超时 30 s，语句超时 2 s，
+真实 uvicorn，MySQL 慢查询）：
+
+| | 最快请求 | 最慢请求 | 结果 |
+|---|---|---|---|
+| 修复前（3 轮） | 30.3–30.4 s | 37.8–38.3 s | 每一轮 30 个请求全部停约 30 s 才返回（含 4 个 `admission_queue_timeout`） |
+| 修复后（4 轮，默认池 10+30/5 s） | 2.5–3.1 s | 13.8–14.9 s | 30 个全部按各自的语句超时返回 `query_timeout`，无 5xx/503 |
+| 修复后（4 轮，仍用上游池 5+10/30 s） | 2.4–2.6 s | 14.0–14.6 s | 同上——死锁本身已消除，与池大小无关 |
+
+修复后最慢约 14 s 只是 30 条各 2 s 的慢语句在 5 个连接上排队的串行时间（数据源有效上限 = 运行时池 5）。
+
+测试（真实 MySQL 8.4，控制面为 file SQLite 加极小的 QueuePool）：`tests/ext_integration/test_extint_pool.py`——
+8 个在途请求对 3 个连接的池，运行时与委托两条路径各一遍（修复前稳定出现 503，已用「去掉 `release_connection`」验证会失败），
+断言全部 200、结束后 `pool.checkedout()==0`、准入无残留；连接被占满时两条路径都在约 1 s 内得到 503 + `Retry-After` 且不含 SQL/密钥，
+释放后恢复，指标计数；放行后拿不到连接 → 503 且释放槽位；数据源有效上限等于运行时池容量。
+
+## 2.6 关闭 `/docs`、`/redoc`、`/openapi.json`（N05）
+
+`ADG_EXT_ENABLE_DOCS`（默认 `false`）。扩展开启（`ADG_EXT_ENABLED=true`）且该开关为假时，`create_app` 以
+`docs_url=None, redoc_url=None, openapi_url=None` 构造应用，三个路径返回 404；`/mcp`、`/api/tools/*`、`/health` 与 `/admin`、`/ext`
+不受影响。**默认值选择**：这三个页面无需认证，会暴露全部接口与模型，生产里没有理由开着；沿用本项目的正向命名风格
+（`ADG_EXT_ENABLED`、`ADG_EXT_AUDIT_FAIL_CLOSED`），所以是「显式开启」而不是 `DISABLE_DOCS`，漏配时安全（关闭）。无效值（如
+`maybe`）会让启动失败，而不是静默打开。开发环境需要时设为 `true`。`ADG_EXT_ENABLED=false` 时保持上游行为（页面可用）。
+入口代理的路径白名单仍然是第二道防线（部署侧不应因此放松）。测试：`tests/ext/test_ext_docs.py`。
+
 ## 3. 安全不变量
 
 - 行过滤基于解析后的 AST 注入，参数为带类型的字面量；注入后会二次 `verify`，任何不确定均拒绝（fail-closed）。
@@ -159,6 +261,9 @@ MySQL 用例在改动前稳定复现 `status=error`，并含「库端确实拒�
 - 审计在执行前提交；写入失败则拒绝执行（`audit_unavailable`）。
 - 日志与响应不包含管理 Key、明文凭据、数据库密码；Prometheus 标签不含用户、SQL、密钥（见 2.2）。
 - 已吊销的凭证与已删除的用户不会被同步重放恢复，须显式 `reinstate`（见 2.3）。
+- 不缓存任何授权结果；PBKDF2 派生缓存只存派生密钥、键为 HMAC、有上限与过期、不写日志，吊销/删除/过期/墓碑不经过它（2.4）。
+- 请求不在持有控制面连接时排队；拿不到连接是 503 `admission_pool_exhausted`，不是 500（2.5）。
+- 生产配置下 `/docs`、`/redoc`、`/openapi.json` 默认不存在（2.6）。
 
 ## 4. 已知限制
 
@@ -170,4 +275,9 @@ MySQL 用例在改动前稳定复现 `status=error`，并含「库端确实拒�
 - 行过滤派生表假定库账号对**全部**允许列有 `SELECT`（管理服务按 `allow` 授权）。若库里实际授权比 `allow` 窄且目录又不反映
   （MySQL 的目录来自管理账号之外的扫描，可能列出账号读不了的列），该表上带行过滤的查询会在库端失败；需要管理服务保持授权与 `allow` 一致。
 - 行过滤读取的列必须在 `allow` 里（且不在 `deny`）；把过滤列设为「只用于过滤、不对外开放」目前不支持，会被明确拒绝。
+- 池耗尽的 503（`admission_pool_exhausted`）没有审计行（无连接可写）；`audit_fail_closed=false` 时放行后的语句在执行期间仍占用一个
+  控制面连接（开始审计行与完成审计行在同一事务里），此时池容量应不小于同时执行数。
+- 经 `/mcp`（流式 MCP 服务，挂载的子应用）进入的请求不经过上述 FastAPI 异常处理器；排队前归还连接的修复对它同样生效（同一个 `pipeline.run`），但池真的满了时它的表现由 MCP 框架决定（**未验证**，不保证是 503）。
+- PBKDF2 缓存按进程；每个新进程每个数据源账号首次查询仍付一次派生。
+- 同一数据库账号被多个数据源共用时，它们共享运行时连接池（缓存键是连接 URL），有效并发上限按单个数据源计算，不按池的使用者数。
 - 审计查询的 `table`、`status` 过滤使用 `LIKE`，不走索引，依赖时间窗口先行（≤93 天）与 `offset` 上限控制成本。
