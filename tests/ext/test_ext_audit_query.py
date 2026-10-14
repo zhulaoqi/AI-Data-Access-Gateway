@@ -306,6 +306,8 @@ def test_list_defaults_to_24_hours_newest_first_and_never_carries_sql(env: Env) 
         "datasourceId": "ds1",
         "resourceIds": ["res-orders"],
         "queryId": "qry_done",
+        "requestId": None,  # rows written before the field existed
+        "channel": None,
         "status": "completed",
         "queueWaitMs": 12,
         "rowCount": 2,
@@ -394,6 +396,101 @@ def test_filter_by_query_id_event_type_datasource_and_window(env: Env) -> None:
         ).json()["detail"]
         == "time_window_too_large"
     )
+
+
+def _add_channel_rows(env: Env) -> None:
+    with env.factory() as session:
+        add(
+            session,
+            "jdbc_done",
+            env,
+            ago=timedelta(minutes=20),
+            query_id="qry_j1",
+            metadata={"phase": "completed", "channel": "jdbc", "request_id": "req-100"},
+        )
+        add(
+            session,
+            "jdbc_rejected",
+            env,
+            ago=timedelta(minutes=21),
+            event_type="permission_rejected",
+            decision="denied",
+            reason="column_not_allowed:ssn",
+            metadata={"channel": "jdbc", "request_id": "req-101"},
+        )
+        add(
+            session,
+            "mcp_done",
+            env,
+            ago=timedelta(minutes=22),
+            query_id="qry_m1",
+            metadata={"phase": "completed", "channel": "mcp"},
+        )
+        add(
+            session,
+            "pct",
+            env,
+            ago=timedelta(minutes=23),
+            metadata={"channel": "jdbc", "request_id": "a%b_c"},
+        )
+        # a SQL text that *looks* like the metadata key must not forge a match
+        add(
+            session,
+            "forged",
+            env,
+            ago=timedelta(minutes=24),
+            metadata={"rewritten_sql": 'x "request_id":"req-100" y', "channel": "mcp"},
+        )
+        session.commit()
+
+
+def test_events_expose_request_id_and_channel(env: Env) -> None:
+    _add_channel_rows(env)
+    items = {i["id"]: i for i in env.events(limit=200)}
+    done = items[env.ids["jdbc_done"]]
+    assert done["requestId"] == "req-100" and done["channel"] == "jdbc"
+    rejected = items[env.ids["jdbc_rejected"]]
+    assert rejected["requestId"] == "req-101" and rejected["channel"] == "jdbc"
+    assert rejected["queryId"] is None and rejected["decision"] == "rejected"
+    assert items[env.ids["mcp_done"]]["channel"] == "mcp"
+    assert items[env.ids["mcp_done"]]["requestId"] is None
+    old = items[env.ids["done"]]
+    assert old["requestId"] is None and old["channel"] is None
+    detail = env.get(f"/ext/audit/events/{env.ids['jdbc_done']}").json()
+    assert detail["requestId"] == "req-100" and detail["channel"] == "jdbc"
+    assert env.get(f"/ext/audit/events/{env.ids['jdbc_rejected']}").json()["requestId"] == "req-101"
+
+
+def test_filter_by_request_id_and_channel(env: Env) -> None:
+    _add_channel_rows(env)
+    assert env.ids_of(requestId="req-100") == {env.ids["jdbc_done"]}
+    assert env.ids_of(requestId="req-101") == {env.ids["jdbc_rejected"]}
+    assert env.ids_of(requestId="req-10") == set()  # exact, not a prefix
+    assert env.ids_of(requestId="req-1000") == set()
+    assert env.ids_of(requestId="nope") == set()
+    assert env.ids_of(channel="jdbc") == {
+        env.ids["jdbc_done"],
+        env.ids["jdbc_rejected"],
+        env.ids["pct"],
+    }
+    assert env.ids_of(channel="mcp") == {env.ids["mcp_done"], env.ids["forged"]}
+    assert env.ids_of(channel="jdbc", requestId="req-101") == {env.ids["jdbc_rejected"]}
+    assert env.ids_of(channel="mcp", requestId="req-101") == set()
+    assert env.ids_of(channel="jdbc", decision="rejected") == {env.ids["jdbc_rejected"]}
+    assert env.ids_of(requestId="  ") == env.ids_of()  # blank = no filter
+
+
+def test_request_id_filter_is_wildcard_and_injection_safe(env: Env) -> None:
+    _add_channel_rows(env)
+    assert env.ids_of(requestId="a%b_c") == {env.ids["pct"]}
+    assert env.ids_of(requestId="%") == set()
+    assert env.ids_of(requestId="_") == set()
+    assert env.ids_of(requestId="a_b_c") == set()
+    assert env.ids_of(requestId="req-100' OR '1'='1") == set()
+    assert env.ids_of(requestId="req-100\\") == set()
+    assert env.ids_of(requestId='req-100" y') == set()
+    assert env.get("/ext/audit/events", requestId="x" * 201).json()["detail"] == "filter_too_long"
+    assert env.get("/ext/audit/events", channel="x" * 201).status_code == 422
 
 
 def test_pagination_defaults_and_caps(env: Env) -> None:

@@ -5,6 +5,7 @@ behalf of a grant. The statement goes through exactly the pipeline of a ``runtim
 row filter, admission, audit); revoked or expired grants are refused here.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +20,9 @@ from adg_ext import context as ctxmod
 from adg_ext import pipeline
 from adg_ext.models import ExtSyncObject
 from adg_ext.sync import PREFIX
+
+_CHANNEL = re.compile(r"[a-z][a-z0-9_.-]{0,31}")
+MAX_REQUEST_ID = 200  # the audit ``requestId`` filter accepts the same length
 
 
 class DelegatedError(Exception):
@@ -54,6 +58,11 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
     request_id = str(body.get("requestId") or "")
     if not grant_id or not sql or not request_id:
         raise DelegatedError(400, "grantId, sql and requestId are required")
+    if len(request_id) > MAX_REQUEST_ID:
+        raise DelegatedError(400, "requestId_too_long")
+    channel = str(body.get("channel") or "jdbc").strip().lower()
+    if not _CHANNEL.fullmatch(channel):
+        raise DelegatedError(400, "invalid_channel")
     user = _grant_user(session, grant_id)
     identity = load_runtime_identity_for_user(session, user_id=user.id)
     ctx = ctxmod.load(session, user_id=user.id, role_ids=identity.roles)
@@ -87,7 +96,7 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
         event_type="query_execution",
         request_id=request_id,
         audit_extra={
-            "channel": str(body.get("channel") or "jdbc"),
+            "channel": channel,
             "request_id": request_id,
             "client_ip": str(body.get("clientIp") or ""),
             "grant_id": grant_id,

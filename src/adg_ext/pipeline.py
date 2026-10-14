@@ -132,6 +132,48 @@ def build_views(
     return views, time_columns
 
 
+def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> dict[str, Any]:
+    """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
+
+    ``channel`` defaults to ``mcp`` (the MCP/HTTP runtime path never passes one); the delegated
+    entry passes ``jdbc`` etc. through ``audit_extra``.
+    """
+
+    meta: dict[str, Any] = {"channel": "mcp"}
+    meta.update(audit_extra or {})
+    if request_id:
+        meta["request_id"] = request_id
+    return meta
+
+
+def _record_rejection(
+    svc: "GatewayRuntimeService",
+    identity: IdentityContext,
+    api_key_id: str,
+    kind: str,
+    datasource_id: str | None,
+    resource_ids: list[str],
+    sql_text: str | None,
+    reason: str,
+    meta: dict[str, Any],
+) -> None:
+    """Like the upstream ``_record_rejection`` but the row carries ``channel``/``request_id``."""
+
+    svc._audit.record_event(
+        user_id=identity.user_id,
+        api_key_id=api_key_id,
+        event_type=kind,
+        decision="denied",
+        datasource_id=datasource_id,
+        resource_ids=resource_ids,
+        query_id=None,
+        sql_text=sql_text,
+        reason=reason,
+        metadata=dict(meta),
+    )
+    svc._session.flush()
+
+
 class _Run:
     """Executes one statement on a worker thread, bounded by a timeout and cancellable."""
 
@@ -176,11 +218,12 @@ def run(
     if not ctx.managed:
         return None
     settings = get_settings()
+    audit_meta = _audit_meta(request_id, audit_extra)
 
     def reject(kind: str, reason: str, hint: dict[str, object] | None = None) -> dict[str, Any]:
         get_query_metrics().rejected(reason)
-        svc._record_rejection(
-            identity, api_key_id, kind, datasource_id, resource_ids, query, reason
+        _record_rejection(
+            svc, identity, api_key_id, kind, datasource_id, resource_ids, query, reason, audit_meta
         )
         out: dict[str, Any] = {"status": "rejected", "reason": reason}
         if hint:
@@ -273,7 +316,7 @@ def run(
         event_type=event_type,
         original_query=query,
         request_id=request_id,
-        audit_extra=audit_extra or {},
+        audit_extra=audit_meta,
     )
 
 
@@ -304,8 +347,16 @@ def _execute(
 
     def rejected(kind: str, reason: str) -> dict[str, Any]:
         get_query_metrics().rejected(reason)
-        svc._record_rejection(
-            identity, api_key_id, kind, datasource_id, actual_ids, original_query, reason
+        _record_rejection(
+            svc,
+            identity,
+            api_key_id,
+            kind,
+            datasource_id,
+            actual_ids,
+            original_query,
+            reason,
+            audit_extra,
         )
         return {"status": "rejected", "reason": reason}
 

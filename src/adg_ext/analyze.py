@@ -159,12 +159,28 @@ def rewrite(
         out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
         return out
 
+    # Names the statement defines itself (``expr AS name``); they are not physical columns.
+    aliases = {a.alias.lower() for a in tree.find_all(exp.Alias) if a.alias}
+    unrestricted = [v for v in views if not v.restricted]
     for name in dict.fromkeys(verdict.result.accessed_fields):
         for view in restricted:
             if view.has_column(name) and not view.permits(name):
                 out.reasons.append(f"column_not_allowed:{name}")
                 out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
                 return out
+        # Closed column scope: a name no restricted table permits is refused even when the synced
+        # catalog does not list it. The catalog is what the datasource account may *see* (ClickHouse
+        # only lists columns with a column-level grant) or what existed at the last scan, so a
+        # column missing from it must not slip through to the database (and fail there with an
+        # engine error instead of a guard rejection, or - for a column added later - be returned).
+        if (
+            not any(v.permits(name) for v in restricted)
+            and name.lower() not in aliases
+            and not any(v.has_column(name) for v in unrestricted)
+        ):
+            out.reasons.append(f"column_not_allowed:{name}")
+            out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
+            return out
 
     masked = {c.lower() for v in restricted for c in v.mask}
     misuse = _masked_misuse(tree, masked)

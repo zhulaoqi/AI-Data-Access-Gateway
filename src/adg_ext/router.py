@@ -186,6 +186,8 @@ def list_audit_events(
     reason: Annotated[str | None, Query()] = None,
     query_id: Annotated[str | None, Query(alias="queryId")] = None,
     event_type: Annotated[str | None, Query(alias="eventType")] = None,
+    request_id: Annotated[str | None, Query(alias="requestId")] = None,
+    channel: Annotated[str | None, Query()] = None,
     datasource_id: Annotated[str | None, Query(alias="datasourceId")] = None,
     limit: Annotated[int | None, Query()] = None,
     offset: Annotated[int, Query()] = 0,
@@ -203,6 +205,8 @@ def list_audit_events(
             reason=reason,
             query_id=query_id,
             event_type=event_type,
+            request_id=request_id,
+            channel=channel,
         )
         return audit_query.list_events(session, filters, page_limit, page_offset)
     except audit_query.AuditQueryError as error:

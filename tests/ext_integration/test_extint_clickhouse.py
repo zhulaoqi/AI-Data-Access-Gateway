@@ -1,7 +1,8 @@
 import time
 from typing import Any
 
-from tests.ext_integration.conftest import Gateway
+import pytest
+from tests.ext_integration.conftest import CLICKHOUSE, Gateway
 from tests.ext_integration.test_extint_mysql import provision, query
 
 
@@ -76,3 +77,61 @@ def test_clickhouse_row_cap(gateway: Gateway, clickhouse_seed: dict[str, str]) -
     )
     out = query(gateway, key, "SELECT id FROM shop.orders ORDER BY id")
     assert out["status"] == "success" and len(out["rows"]) == 1 and out["truncated"] is True
+
+
+@pytest.fixture
+def clickhouse_column_grants(clickhouse_seed: dict[str, str]) -> dict[str, str]:
+    """An account with column-level grants only: ClickHouse then hides ``ssn`` from the catalog."""
+
+    import clickhouse_connect
+
+    admin = clickhouse_connect.get_client(
+        host=CLICKHOUSE[0], port=CLICKHOUSE[1], username="root", password="rootpw"
+    )
+    try:
+        admin.command("DROP USER IF EXISTS gw_cols")
+        admin.command("CREATE USER gw_cols IDENTIFIED BY 'colspw'")
+        admin.command(
+            "GRANT SELECT(id, tenant_id, phone, amount, created_at) ON shop.orders TO gw_cols"
+        )
+        admin.command("GRANT SELECT ON system.* TO gw_cols")
+    finally:
+        admin.close()
+    return {"user": "gw_cols", "password": "colspw"}
+
+
+def test_clickhouse_unlisted_column_is_a_guard_rejection_not_a_database_error(
+    gateway: Gateway, clickhouse_column_grants: dict[str, str]
+) -> None:
+    import clickhouse_connect
+
+    # premise: the database itself refuses the column, and the account's catalog does not list it
+    direct = clickhouse_connect.get_client(
+        host=CLICKHOUSE[0], port=CLICKHOUSE[1], username="gw_cols", password="colspw"
+    )
+    try:
+        with pytest.raises(Exception, match="ACCESS_DENIED|Not enough privileges"):
+            direct.query("SELECT ssn FROM shop.orders")
+        listed = {
+            r[0]
+            for r in direct.query(
+                "SELECT name FROM system.columns WHERE database = 'shop' AND table = 'orders'"
+            ).result_rows
+        }
+    finally:
+        direct.close()
+    assert "ssn" not in listed and "id" in listed
+
+    key = ch(gateway, clickhouse_column_grants)
+    for sql in [
+        "SELECT ssn FROM shop.orders",
+        "SELECT id FROM shop.orders WHERE ssn = '111'",
+        "SELECT id FROM shop.orders ORDER BY ssn",
+        "SELECT id FROM (SELECT id, ssn FROM shop.orders) t",
+        "SELECT id FROM shop.orders WHERE no_such_column = 1",
+    ]:
+        out = query(gateway, key, sql)
+        assert out["status"] == "rejected", (sql, out)  # same shape as MySQL, not "error"
+        assert out["reason"].startswith("column_not_allowed:"), (sql, out)
+    ok = query(gateway, key, "SELECT id, amount AS a FROM shop.orders WHERE a > 1 ORDER BY id")
+    assert ok["status"] == "success" and [r["id"] for r in ok["rows"]] == [1, 2]

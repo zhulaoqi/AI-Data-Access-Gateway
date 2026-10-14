@@ -62,6 +62,8 @@ class Filters:
     reason: str | None = None
     query_id: str | None = None
     event_type: str | None = None
+    request_id: str | None = None
+    channel: str | None = None
 
 
 # ---- input handling ---------------------------------------------------------------------------
@@ -116,6 +118,8 @@ def build_filters(
     reason: str | None = None,
     query_id: str | None = None,
     event_type: str | None = None,
+    request_id: str | None = None,
+    channel: str | None = None,
 ) -> Filters:
     window = resolve_window(start, end)
     ids = _split(grant_ids)
@@ -142,6 +146,8 @@ def build_filters(
         reason=_text(reason),
         query_id=_text(query_id),
         event_type=_text(event_type),
+        request_id=_text(request_id),
+        channel=_text(channel),
     )
 
 
@@ -236,6 +242,18 @@ def _table_condition(session: Session, table: str) -> ColumnElement[bool]:
     return or_(*conditions)
 
 
+def _meta_equals(key: str, value: str) -> ColumnElement[bool]:
+    """Event whose metadata has ``"<key>":"<value>"`` (compact JSON; the value is quoted whole).
+
+    ``json.dumps`` escapes quotes inside strings, so a value carrying ``"`` cannot forge a match
+    through another field (e.g. SQL text), and the closing quote makes the match exact, not a
+    prefix.
+    """
+
+    needle = f"{json.dumps(key)}:{json.dumps(value)}"
+    return _like(AuditEvent.metadata_json, f"%{like_escape(needle)}%")
+
+
 def _status_condition(status: str) -> ColumnElement[bool]:
     if status == "timeout":
         return and_(AuditEvent.decision == "error", AuditEvent.reason == _TIMEOUT)
@@ -284,6 +302,10 @@ def conditions(session: Session, f: Filters) -> list[ColumnElement[bool]]:
         out.append(AuditEvent.query_id == f.query_id)
     if f.event_type:
         out.append(AuditEvent.event_type == f.event_type)
+    if f.request_id:
+        out.append(_meta_equals("request_id", f.request_id))
+    if f.channel:
+        out.append(_meta_equals("channel", f.channel))
     return out
 
 
@@ -340,6 +362,11 @@ def _grant_id(external_ref: str | None, meta: dict[str, Any], user_id: str | Non
     return user_id
 
 
+def _meta_text(meta: dict[str, Any], key: str) -> str | None:
+    value = meta.get(key)
+    return value if isinstance(value, str) and value else None
+
+
 def serialize(event: AuditEvent, external_ref: str | None) -> dict[str, Any]:
     """List item: never contains SQL text."""
 
@@ -354,6 +381,8 @@ def serialize(event: AuditEvent, external_ref: str | None) -> dict[str, Any]:
         "datasourceId": event.datasource_id,
         "resourceIds": _resource_ids(event),
         "queryId": event.query_id,
+        "requestId": _meta_text(meta, "request_id"),
+        "channel": _meta_text(meta, "channel"),
         "status": derive_status(event, meta),
         "queueWaitMs": _int_or_none(meta.get("queue_wait_ms")),
         "rowCount": _int_or_none(meta.get("rows")),

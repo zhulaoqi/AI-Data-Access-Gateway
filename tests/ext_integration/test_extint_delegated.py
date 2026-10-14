@@ -6,12 +6,13 @@ from typing import Any
 import httpx
 from sqlalchemy import select
 from tests.ext_integration.conftest import Gateway
-from tests.ext_integration.test_extint_mysql import provision, sha
-from tests.ext_integration.test_extint_runtime import running_sleeps
+from tests.ext_integration.test_extint_mysql import provision, query, sha, target
+from tests.ext_integration.test_extint_runtime import _user_id, running_sleeps
 
 from adg.audit.models import AuditEvent
 from adg.control_plane.services.api_key_service import create_api_key
 from adg_ext import revocation
+from adg_ext.pipeline import get_admission
 
 
 def entry(gw: Gateway) -> dict[str, str]:
@@ -62,6 +63,125 @@ def test_delegated_query_matches_runtime_and_is_audited(
     assert meta["channel"] == "jdbc" and meta["request_id"] == "req-1"
     assert meta["client_ip"] == "10.1.2.3"
     assert key
+
+
+def _events(gw: Gateway, **params: Any) -> list[dict[str, Any]]:
+    r = gw.client.get("/ext/audit/events", params=params, headers={"X-ADG-API-Key": gw.admin})
+    assert r.status_code == 200, r.text
+    return list(r.json()["items"])
+
+
+def test_audit_carries_request_id_and_channel_for_every_outcome(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    key = provision(
+        gateway,
+        mysql_seed,
+        limits={
+            "maxConcurrency": 1,
+            "queueSize": 0,
+            "queueTimeoutSeconds": 1,
+            "queryTimeoutSeconds": 5,
+            "maxRows": 100,
+        },
+    )
+    h = entry(gateway)
+
+    def post(sql: str, request_id: str, **over: Any) -> Any:
+        return gateway.client.post(
+            "/ext/delegated/query", json=body(sql, requestId=request_id, **over), headers=h
+        )
+
+    ok = post("SELECT id FROM shop.orders ORDER BY id", "req-ok").json()
+    assert ok["status"] == "success"
+    wild = post("SELECT * FROM shop.orders", "req-wild").json()
+    assert wild["status"] == "rejected"
+    column = post("SELECT ssn FROM shop.orders", "req-ssn").json()
+    assert column["reason"].startswith("column_not_allowed")
+    other = post("SELECT id FROM shop.dim", "req-dim", channel="JDBC").json()
+    assert other["reason"] == "table_not_accessible"
+    insert = post("DELETE FROM shop.orders", "req-del").json()
+    assert insert["status"] == "rejected"
+
+    # admission rejection happens after the guard: hold the only slot
+    ds, _ = target(gateway, key)
+    holder = get_admission().acquire(
+        user_key=_user_id(gateway),
+        datasource_key=ds,
+        max_concurrency=1,
+        queue_size=0,
+        queue_timeout=1,
+    )
+    try:
+        busy = post("SELECT id FROM shop.orders", "req-busy").json()
+    finally:
+        holder.release()
+    assert busy["reason"] == "admission_queue_full"
+
+    done = _events(gateway, requestId="req-ok")
+    assert [(e["requestId"], e["channel"], e["decision"]) for e in done] == [
+        ("req-ok", "jdbc", "allowed")
+    ]
+    assert done[0]["queryId"] == ok["query_id"] and done[0]["status"] == "completed"
+    for request_id, reason in [
+        ("req-wild", "wildcard_projection_not_allowed"),
+        ("req-ssn", "column_not_allowed:ssn"),
+        ("req-dim", "table_not_accessible"),
+        ("req-del", None),
+        ("req-busy", "admission_queue_full"),
+    ]:
+        rows = _events(gateway, requestId=request_id)
+        assert len(rows) == 1, (request_id, rows)
+        row = rows[0]
+        assert row["decision"] == "rejected" and row["queryId"] is None
+        assert row["requestId"] == request_id and row["channel"] == "jdbc"
+        assert row["grantId"] == "g1"
+        if reason:
+            assert row["reason"] == reason
+    detail = gateway.client.get(
+        f"/ext/audit/events/{_events(gateway, requestId='req-ssn')[0]['id']}",
+        headers={"X-ADG-API-Key": gateway.admin},
+    ).json()
+    assert detail["requestId"] == "req-ssn" and detail["channel"] == "jdbc"
+    assert detail["sqlText"].lower().startswith("select ssn")
+
+    # the channel is normalised; the MCP/HTTP runtime path is ``mcp`` and has no request id
+    assert _events(gateway, requestId="req-dim")[0]["channel"] == "jdbc"
+    assert query(gateway, key, "SELECT id FROM shop.orders ORDER BY id")["status"] == "success"
+    assert query(gateway, key, "SELECT ssn FROM shop.orders")["reason"].startswith("column_not")
+    mcp = _events(gateway, channel="mcp")
+    assert len(mcp) == 2 and all(e["requestId"] is None for e in mcp)
+    assert {e["decision"] for e in mcp} == {"allowed", "rejected"}
+    jdbc = _events(gateway, channel="jdbc")
+    assert {e["requestId"] for e in jdbc} == {
+        "req-ok",
+        "req-wild",
+        "req-ssn",
+        "req-dim",
+        "req-del",
+        "req-busy",
+    }
+    assert len(jdbc) == 6
+    assert _events(gateway, channel="jdbc", requestId="req-ssn")[0]["reason"].startswith("column")
+    assert _events(gateway, channel="mcp", requestId="req-ssn") == []
+
+
+def test_delegated_validates_request_id_and_channel(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    provision(gateway, mysql_seed)
+    h = entry(gateway)
+    for over, detail in [
+        ({"channel": "x y"}, "invalid_channel"),
+        ({"channel": 'jdbc"'}, "invalid_channel"),
+        ({"channel": "a" * 33}, "invalid_channel"),
+        ({"requestId": "r" * 201}, "requestId_too_long"),
+    ]:
+        r = gateway.client.post(
+            "/ext/delegated/query", json=body("SELECT id FROM shop.orders", **over), headers=h
+        )
+        assert r.status_code == 400 and r.json()["detail"] == detail, (over, r.text)
+    assert _events(gateway) == []  # nothing was executed or audited
 
 
 def test_delegated_refuses_unknown_revoked_and_expired_grants(

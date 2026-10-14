@@ -44,8 +44,35 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 - `grantIds` 以授权 ID 传入，经 `User.external_ref = gw:user:<id>` 映射到审计的 `user_id`；响应 `grantId` 反向映射。
 - 时间窗口默认最近 24 小时、最长 93 天；`limit` 默认 50、上限 200；`offset` 上限 10000；越界返回 422。
 - 列表永不含 SQL；详情含 `sqlText`/`rewrittenSql`/`accessedFields`，每次成功读取经 `AuditService.record_sql_view` 写 `audit_sql_view`。
+- **`requestId`、`channel`**：每条查询类审计行（放行的 `started`/`completed`，以及 Guard、权限、准入拒绝）的元数据都带
+  `channel` 与（有则）`request_id`。委托查询由 `delegated.py` 校验后传入（`channel` 缺省 `jdbc`，须匹配
+  `[a-z][a-z0-9_.-]{0,31}`；`requestId` 最长 200），MCP/HTTP 运行时路径没有传入，`pipeline._audit_meta` 补
+  `channel=mcp`。被拒绝的事件改走 `pipeline._record_rejection`（与上游 `_record_rejection` 等价，只是多写元数据），
+  **没有修改上游 `tools.py`**。列表项与详情输出 `requestId`、`channel`，列表支持 `?requestId=`、`?channel=`：
+  对元数据 JSON 做 `LIKE`，模式是带引号的 `"request_id":"<值>"`（`json.dumps` 转义，通配符转义），所以是精确匹配、
+  不会被 SQL 文本里的相似片段伪造；MySQL 默认排序规则下不区分大小写。
 - 测试：`tests/ext/test_ext_audit_query.py`（SQLite）；`tests/ext_integration/test_extint_audit.py`
   （真实 MySQL 8.4 查询产生的审计行，并把同一套单测在 MySQL 控制面库上重跑，使用库 `adg_audit_cp`）。
+
+## 2.1.1 封闭列范围对「目录里没有的列」同样生效（`analyze.rewrite`）
+
+之前只有目录（`ResourceField`）里**已知**的列才会与授权列比对，目录里没有的列放行到库端。ClickHouse 的
+`system.columns` 只列出账号有列级授权的列，于是未授权列（目录里没有）被放行，库端报权限错误，客户端只见
+`connector_operation_error`（MySQL 因账号是库级授权、列都在目录里，所以由 Guard 直接拒绝）。现在
+`rewrite` 对 `accessed_fields` 中每个名字：没有任何受限表**允许**它、不是语句自己定义的别名（`expr AS name`）、
+也不是某个无限制表的列时，一律 `column_not_allowed:<col>`。三个引擎行为一致；同时堵住「目录之后新增的列」被
+读出的缺口。没有改任何上游文件，122 个绕过回归样本不变。测试：`tests/ext/test_ext_analyze.py`
+（目录缺列、别名不误伤、无限制表的列）与 `tests/ext_integration/test_extint_clickhouse.py`
+（真实 ClickHouse，列级授权账号；该用例在改动前稳定复现 `status=error`）。
+
+## 2.1.2 依赖：`clickhouse-connect`
+
+`pyproject.toml` 早已声明 `clickhouse = ["clickhouse-connect>=0.8.0"]`（上游约定的可选依赖组），`all` 也包含它，
+但 `uv.lock` 没随之更新，所以 `Dockerfile` 的 `uv sync --frozen --extra all` 装不上它。用 `uv lock` 补锁：只
+**新增**了 `clickhouse-connect 1.10.0` 及其依赖 `lz4`、`urllib3`、`backports-zstd`，其余版本未变；镜像源保持锁文件原有
+的清华镜像；顺带补上 `mcp` 约束 `<2`（pyproject 已有，锁里漏了）。锁文件头的 `revision` 因 uv 版本由 3 变为 5。
+验证：`uv sync --frozen --no-dev --extra all` 到独立环境后 `import clickhouse_connect` 与
+`adg_ext.clickhouse` 可用。未改 `pyproject.toml`，没有新增 `ext` 组（沿用既有的 `clickhouse`/`all`）。
 
 ## 2.2 Prometheus 指标（`/admin/ext/metrics/prometheus`）
 

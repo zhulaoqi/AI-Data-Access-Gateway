@@ -121,3 +121,65 @@ def test_clickhouse_dialect_roundtrip() -> None:
     r = run("SELECT id FROM shop.orders", dialect="clickhouse")
     assert r.allowed, r.reasons
     assert "tenant_id = 7" in r.sql
+
+
+# ---- closed column scope for columns the synced catalog does not list ---------------------------
+
+# ClickHouse lists only columns the datasource account holds a column-level grant on, so ``ssn`` is
+# absent from the catalog even though it exists in the table.
+ORDERS_GRANTED_ONLY = TableView(
+    path="shop.shop.orders",
+    restricted=True,
+    columns=frozenset({"id", "tenant_id", "phone", "amount", "created_at"}),
+    allow=frozenset({"id", "tenant_id", "phone", "amount", "created_at"}),
+    deny=frozenset({"ssn"}),
+    mask={"phone": "partial"},
+    filters=[FilterDef("tenant_id = {{tenant_id}}", (ParamSpec("tenant_id", "long"),))],
+)
+
+
+@pytest.mark.parametrize("dialect", ["mysql", "clickhouse"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT ssn FROM shop.orders",
+        "SELECT id FROM shop.orders WHERE ssn = '1'",
+        "SELECT id FROM shop.orders ORDER BY ssn",
+        "SELECT id FROM (SELECT id, ssn FROM shop.orders) t",
+        "SELECT id FROM shop.orders WHERE nonexistent > 1",  # never reaches the database
+    ],
+)
+def test_column_missing_from_the_catalog_is_rejected_by_the_guard(dialect: str, sql: str) -> None:
+    r = run(sql, dialect=dialect, views=[ORDERS_GRANTED_ONLY])
+    assert not r.allowed
+    assert r.reasons[0].startswith("column_not_allowed:")
+    assert "ssn" not in str(r.hint)
+
+
+@pytest.mark.parametrize("dialect", ["mysql", "clickhouse"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id, amount * 2 AS double_amount FROM shop.orders ORDER BY double_amount",
+        "SELECT id, amount AS a FROM shop.orders WHERE a > 1",  # alias reference (ClickHouse)
+        "SELECT count(*) AS n, max(amount) AS m FROM shop.orders HAVING m > 1",
+        "SELECT id FROM (SELECT id, amount AS a FROM shop.orders) t WHERE a > 1",
+    ],
+)
+def test_aliases_and_allowed_columns_still_pass(dialect: str, sql: str) -> None:
+    r = run(sql, dialect=dialect, views=[ORDERS_GRANTED_ONLY])
+    assert r.allowed, (sql, r.reasons)
+
+
+def test_column_of_an_unrestricted_table_is_not_mistaken_for_an_unlisted_one() -> None:
+    plain = TableView(path="shop.shop.dim", restricted=False, columns=frozenset({"id", "name"}))
+    ok = run(
+        "SELECT o.id, d.name FROM shop.orders o JOIN shop.dim d ON o.id = d.id",
+        views=[ORDERS_GRANTED_ONLY, plain],
+    )
+    assert ok.allowed, ok.reasons
+    bad = run(
+        "SELECT o.id FROM shop.orders o JOIN shop.dim d ON o.id = d.id WHERE d.secret = 1",
+        views=[ORDERS_GRANTED_ONLY, plain],
+    )
+    assert bad.reasons == ["column_not_allowed:secret"]
