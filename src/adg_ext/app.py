@@ -1,6 +1,7 @@
 """Wires the extension into the FastAPI app (called from ``create_app`` when enabled)."""
 
 import logging
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -21,6 +22,14 @@ from adg_ext.router import admin_router, audit_router, delegated_router
 logger = logging.getLogger(__name__)
 
 POOL_EXHAUSTED = "admission_pool_exhausted"
+
+
+def app_kwargs() -> dict[str, Any]:
+    """Extra ``FastAPI(...)`` arguments: docs and schema pages are off unless enabled (N05)."""
+
+    if not get_ext_settings().enabled or get_ext_settings().enable_docs:
+        return {}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
 
 
 def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:

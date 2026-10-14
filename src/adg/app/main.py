@@ -15,6 +15,7 @@ from adg.control_plane.db import get_session as get_db_session
 from adg.internal_api.decrypt import router as internal_decrypt_router
 from adg.mcp_api.tools import router as mcp_tools_router
 from adg.mcp_server.server import build_mcp_server_app, runtime_mcp_server
+from adg_ext.app import app_kwargs as ext_app_kwargs
 from adg_ext.app import install as ext_install
 from adg_ext.config import ext_enabled
 
@@ -34,7 +35,7 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
             finally:
                 runtime_engine_cache.dispose_all()
 
-    app = FastAPI(title=settings.service_name, lifespan=lifespan)
+    app = FastAPI(title=settings.service_name, lifespan=lifespan, **ext_app_kwargs())
     app.state.session_factory = factory
 
     @app.middleware("http")

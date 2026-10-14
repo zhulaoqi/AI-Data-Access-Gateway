@@ -49,6 +49,11 @@ class ExtSettings(BaseSettings):
     control_plane_pool_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
     pool_exhausted_retry_after_seconds: int = Field(default=1, ge=1, le=60)
 
+    # API docs pages (``/docs``, ``/redoc``, ``/openapi.json``) of the executor. They need no
+    # authentication, so they are off unless explicitly enabled (N05); only effective when the
+    # extension itself is enabled.
+    enable_docs: bool = False
+
 
 @lru_cache
 def get_ext_settings() -> ExtSettings:
