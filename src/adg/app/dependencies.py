@@ -18,6 +18,8 @@ from adg.control_plane.db import get_session
 from adg.control_plane.models.api_key import ApiKey
 from adg.policy.runtime import IdentityContext, load_runtime_identity_for_user
 from adg.shared.security import hash_api_key
+from adg_ext import revocation as ext_revocation
+from adg_ext.config import ext_enabled
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,12 @@ def authenticate_api_key_value(
         )
     ).scalar_one_or_none()
     if api_key is not None:
+        if ext_enabled() and ext_revocation.get_cache().is_revoked(api_key.key_hash):
+            _record_auth_failure_or_raise_rate_limited(raw_api_key, client_identifier)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Revoked API key",
+            )
         if api_key.expires_at is not None and _normalize_expiration(
             api_key.expires_at
         ) <= datetime.now(UTC):

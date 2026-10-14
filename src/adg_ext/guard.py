@@ -68,7 +68,21 @@ class Operations:
 
     mode: str = "read_only"
     deny_functions: frozenset[str] = frozenset()
+    deny_syntax: frozenset[str] = frozenset()
     require_time_range_days: int | None = None
+
+
+# ``operations.deny_syntax`` tokens a profile may use, and the AST nodes they forbid.
+SYNTAX_NODES: dict[str, tuple[type[exp.Expression], ...]] = {
+    "union": (exp.SetOperation,),
+    "join": (exp.Join,),
+    "subquery": (exp.Subquery,),
+    "cte": (exp.CTE,),
+    "window": (exp.Window,),
+    "distinct": (exp.Distinct,),
+    "group_by": (exp.Group,),
+    "order_by": (exp.Order,),
+}
 
 
 @dataclass(frozen=True)
@@ -259,6 +273,10 @@ def check(
             name = (func.name if isinstance(func, exp.Anonymous) else func.sql_name()).lower()
             if name in ops.deny_functions:
                 reasons.append(f"function_not_allowed:{name}")
+    for token in sorted(ops.deny_syntax):
+        nodes = SYNTAX_NODES.get(token)
+        if nodes and any(True for _ in statement.find_all(*nodes)):
+            reasons.append(f"syntax_not_allowed:{token}")
     if ops.require_time_range_days and not reasons:
         today = (now or datetime.now(UTC)).date()
         if not _time_range_satisfied(

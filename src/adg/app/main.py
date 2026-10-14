@@ -15,6 +15,8 @@ from adg.control_plane.db import get_session as get_db_session
 from adg.internal_api.decrypt import router as internal_decrypt_router
 from adg.mcp_api.tools import router as mcp_tools_router
 from adg.mcp_server.server import build_mcp_server_app, runtime_mcp_server
+from adg_ext.app import install as ext_install
+from adg_ext.config import ext_enabled
 
 
 def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
@@ -59,6 +61,8 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     app.include_router(internal_decrypt_router)
     app.include_router(mcp_tools_router)
     app.mount("/mcp", mcp_server_app)
+    if ext_enabled():
+        ext_install(app, factory)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:

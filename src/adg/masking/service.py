@@ -146,6 +146,8 @@ class MaskingService:
         if value is None:
             return None
         text = str(value)
+        if strategy == "null":
+            return None
         if strategy == "fixed":
             return str(config.get("replacement", "***"))
         if strategy == "partial":

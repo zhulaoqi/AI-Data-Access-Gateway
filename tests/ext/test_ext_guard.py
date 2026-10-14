@@ -164,3 +164,20 @@ def test_dialect_mapping() -> None:
     assert dialect_for("doris") == "starrocks"
     assert dialect_for("clickhouse") == "clickhouse"
     assert dialect_for("unknown") is None
+
+
+def test_deny_syntax_tokens_forbid_the_matching_constructs() -> None:
+    from adg_ext.guard import Operations
+
+    ops = Operations(deny_syntax=frozenset({"union", "join", "subquery", "cte"}))
+    cases = {
+        "union": "SELECT a FROM t UNION SELECT a FROM u",
+        "join": "SELECT t.a FROM t JOIN u ON t.a = u.a",
+        "subquery": "SELECT a FROM (SELECT a FROM t) x",
+        "cte": "WITH c AS (SELECT a FROM t) SELECT a FROM c",
+    }
+    for token, sql in cases.items():
+        v = check(sql, dialect="mysql", default_limit=10, max_limit=10, operations=ops)
+        assert f"syntax_not_allowed:{token}" in v.reasons, sql
+    ok = check("SELECT a FROM t", dialect="mysql", default_limit=10, max_limit=10, operations=ops)
+    assert ok.allowed

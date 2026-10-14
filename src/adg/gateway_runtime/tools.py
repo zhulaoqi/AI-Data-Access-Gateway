@@ -16,6 +16,8 @@ from adg.masking.service import MaskingService
 from adg.policy.runtime import IdentityContext, RuntimePolicyService
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
+from adg_ext import pipeline as ext_pipeline
+from adg_ext.config import ext_enabled
 
 
 class GatewayRuntimeService:
@@ -294,6 +296,19 @@ class GatewayRuntimeService:
         """Validate, authorize, execute, mask, and audit a read-only runtime query."""
 
         self._session.flush()
+        if ext_enabled():
+            managed = ext_pipeline.run(
+                self,
+                identity=identity,
+                api_key_id=api_key_id,
+                datasource_id=datasource_id,
+                resource_ids=resource_ids,
+                query=query,
+                limit=limit,
+                event_type=event_type,
+            )
+            if managed is not None:
+                return managed
         settings = get_settings()
         limit_reason = None
         if limit < 1:

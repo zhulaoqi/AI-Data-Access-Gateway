@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from adg.control_plane.models.directory import Role, User, UserRole
 from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy, ResourceTag
 from adg.control_plane.models.resource import Resource
+from adg_ext import hooks as ext_hooks
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,8 @@ class RuntimePolicyService:
         """Decide field-level access after the parent resource has already been allowed."""
 
         self._session.flush()
+        if ext_hooks.field_denied(self._session, identity, resource.id, field_name):
+            return PolicyDecision(allowed=False, reason="field_not_in_scope")
         policies = list(
             self._session.execute(
                 select(FieldPolicy).where(
@@ -232,6 +235,8 @@ class RuntimePolicyService:
 
         for resource in resources:
             for field_name in field_names:
+                if ext_hooks.field_denied(self._session, identity, resource.id, field_name):
+                    return field_name
                 decision = self._field_policy_decision(
                     policies=policies_by_scope.get((resource.id, field_name), []),
                     identity=identity,
