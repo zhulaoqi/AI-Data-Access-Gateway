@@ -30,3 +30,6 @@ __all__ = [
     "User",
     "UserRole",
 ]
+
+# SQL gateway extension tables share the same metadata (see adg_ext.models).
+import adg_ext.models  # noqa: E402,F401

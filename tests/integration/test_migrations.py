@@ -170,6 +170,7 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202604260002_security_hardening_runtime_admin.py",
         "202606090001_datasource_descriptions.py",
         "202606110001_resource_policy_datasource_scope.py",
+        "202610140001_ext_tables.py",
     ]
 
     revisions: dict[str, tuple[str, str | None]] = {}
@@ -200,4 +201,5 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
             "202606110001",
             "202606090001",
         ),
+        "202610140001_ext_tables.py": ("202610140001", "202606110001"),
     }
