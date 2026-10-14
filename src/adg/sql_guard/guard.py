@@ -112,9 +112,11 @@ class SqlGuard:
         max_limit: int = 1000,
         execution_mode: SqlExecutionMode = "read_only",
         strict_validation: bool = True,
+        dialect: str | None = None,
     ) -> None:
         """Configure statement permissions and strict validation for accepted queries."""
 
+        self._dialect = dialect
         self._default_limit = default_limit
         self._max_limit = max_limit
         self._execution_mode = execution_mode
@@ -126,7 +128,7 @@ class SqlGuard:
         try:
             statements = [
                 cast(exp.Expression, statement)
-                for statement in sqlglot.parse(sql)
+                for statement in sqlglot.parse(sql, read=self._dialect)
                 if statement is not None
             ]
         except sqlglot.errors.SqlglotError as error:
@@ -171,7 +173,7 @@ class SqlGuard:
             )
 
         if not isinstance(statement, exp.Select):
-            normalized_sql = statement.sql()
+            normalized_sql = statement.sql(dialect=self._dialect)
             return SqlGuardResult(
                 allowed=True,
                 normalized_sql=normalized_sql,
@@ -318,7 +320,7 @@ class SqlGuard:
 
         limited = statement.copy()
         limited.set("limit", exp.Limit(expression=exp.Literal.number(effective_limit)))
-        return limited.sql(), warnings
+        return limited.sql(dialect=self._dialect), warnings
 
     def _limit_value(self, statement: exp.Select) -> int | None:
         """Extract a literal LIMIT value, or None when no LIMIT is present."""
