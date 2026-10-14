@@ -177,6 +177,12 @@ class Admission:
     def _count(self, name: str) -> None:
         self._counters[name] = self._counters.get(name, 0) + 1
 
+    def count_rejection(self, reason: str) -> None:
+        """Count a refusal decided outside the controller (e.g. ``pool_exhausted``)."""
+
+        with self._cond:
+            self._count(f"rejected_{reason}")
+
     def metrics_view(self) -> MetricsView:
         with self._cond:
             return MetricsView(

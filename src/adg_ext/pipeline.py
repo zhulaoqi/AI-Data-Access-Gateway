@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import select
 
 from adg.app.settings import get_settings
@@ -50,13 +51,37 @@ _admission: Admission | None = None
 _admission_lock = threading.Lock()
 
 
+def effective_datasource_limit() -> int:
+    """The datasource-wide concurrency cap: never above what the runtime pool can serve.
+
+    The connector draws from a pool of ``ADG_RUNTIME_DATASOURCE_POOL_SIZE`` (+ overflow)
+    connections; admitting more statements than that parks them inside the pool, outside the
+    queue and its timeout, so they would neither queue nor be refused in a controlled way.
+    """
+
+    base = get_ext_settings().datasource_max_concurrency
+    runtime = get_settings()
+    capacity = runtime.runtime_datasource_pool_size + runtime.runtime_datasource_pool_max_overflow
+    return max(1, min(base, capacity))
+
+
+def release_connection(session: Any) -> None:
+    """Return the session's pooled connection (ends the read transaction).
+
+    Loaded objects stay usable (the session factory sets ``expire_on_commit=False``); the next
+    statement checks a connection out again. Nothing is pending here, so this writes nothing.
+    """
+
+    session.commit()
+
+
 def get_admission() -> Admission:
     global _admission
     with _admission_lock:
         if _admission is None:
             s = get_ext_settings()
             _admission = Admission(
-                datasource_limit=s.datasource_max_concurrency,
+                datasource_limit=effective_datasource_limit(),
                 breaker_threshold=s.breaker_failure_threshold,
                 breaker_open_seconds=s.breaker_open_seconds,
             )
@@ -360,6 +385,10 @@ def _execute(
         )
         return {"status": "rejected", "reason": reason}
 
+    # Never wait in the admission queue while holding a control-plane connection: every queued
+    # request would pin a pooled connection (opened by authentication and the reads above) while the
+    # running ones need one to write their audit rows, and the pool deadlocks until its timeout.
+    release_connection(session)
     try:
         ticket = admission.acquire(
             user_key=user_key,
@@ -407,6 +436,10 @@ def _execute(
             session.flush()
             if get_ext_settings().audit_fail_closed:
                 session.commit()
+        except sa_exc.TimeoutError:
+            final = ""  # no connection within the pool timeout: a 503 for the caller, see router
+            session.rollback()
+            raise
         except Exception:
             logger.error("audit write failed; refusing to execute query %s", query_id)
             session.rollback()

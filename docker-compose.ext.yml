@@ -1,11 +1,18 @@
 # Engines for the extension's integration tests (tests/ext_integration). Not started by default.
 #   docker compose -f docker-compose.ext.yml up -d --wait
+x-logging: &bounded-logs
+  # A runaway engine log must not fill the Docker VM disk (a ClickHouse log-channel error loop once
+  # wrote tens of GB to the container's json log and stalled every other container).
+  driver: json-file
+  options: {max-size: "50m", max-file: "2"}
+
 services:
   mysql:
     image: mysql:8.4
     environment:
       MYSQL_ROOT_PASSWORD: rootpw
     ports: ["33306:3306"]
+    logging: *bounded-logs
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpw"]
       interval: 3s
@@ -18,6 +25,7 @@ services:
       CLICKHOUSE_PASSWORD: rootpw
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports: ["38123:8123"]
+    logging: *bounded-logs
     ulimits:
       nofile: {soft: 262144, hard: 262144}
     healthcheck:

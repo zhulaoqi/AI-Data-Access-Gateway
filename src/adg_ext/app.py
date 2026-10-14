@@ -2,7 +2,9 @@
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -11,11 +13,33 @@ from adg.control_plane.models.api_key import ApiKey
 from adg_ext import revocation
 from adg_ext.clickhouse import ClickHouseConnector
 from adg_ext.config import get_ext_settings
+from adg_ext.metrics import get_query_metrics
 from adg_ext.mysql_scoped import ScopedMySqlConnector
 from adg_ext.pipeline import get_admission
 from adg_ext.router import admin_router, audit_router, delegated_router
 
 logger = logging.getLogger(__name__)
+
+POOL_EXHAUSTED = "admission_pool_exhausted"
+
+
+def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:
+    """No control-plane connection within the pool timeout: a clear, retryable 503 (never a 500)."""
+
+    retry_after = get_ext_settings().pool_exhausted_retry_after_seconds
+    logger.warning("control-plane pool exhausted: %s", type(error).__name__)
+    get_query_metrics().rejected(POOL_EXHAUSTED)
+    get_admission().count_rejection("pool_exhausted")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "rejected",
+            "reason": POOL_EXHAUSTED,
+            "detail": POOL_EXHAUSTED,
+            "retry_after_seconds": retry_after,
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
@@ -25,6 +49,7 @@ def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     app.include_router(admin_router)
     app.include_router(audit_router)
     app.include_router(delegated_router)
+    app.add_exception_handler(sa_exc.TimeoutError, _pool_exhausted)
 
     cache = revocation.get_cache()
 
