@@ -1,4 +1,4 @@
-"""HTTP surface of the extension: ``/admin/ext/*`` (admin scope) and ``/ext/delegated/*`` (entry)."""
+"""HTTP surface of the extension: sync and dry-run (admin scope), delegated queries (entry)."""
 
 from typing import Annotated, Any
 
