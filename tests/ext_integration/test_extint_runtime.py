@@ -18,7 +18,7 @@ def running_sleeps() -> int:
         with conn.cursor() as c:
             c.execute(
                 "SELECT COUNT(*) FROM information_schema.processlist "
-                "WHERE info LIKE '%sleep(%' AND info NOT LIKE '%processlist%'"
+                "WHERE info LIKE '%shop.big%' AND info NOT LIKE '%processlist%'"
             )
             return int(c.fetchone()[0])
     finally:
@@ -39,6 +39,7 @@ def test_a_slow_query_is_cancelled_on_the_database(
     key = provision(
         gateway,
         mysql_seed,
+        with_big=True,
         limits={
             "maxConcurrency": 1,
             "queueSize": 1,
@@ -46,18 +47,66 @@ def test_a_slow_query_is_cancelled_on_the_database(
             "queryTimeoutSeconds": 1,
             "maxRows": 100,
         },
-        operations={"mode": "read_only"},
     )
     started = time.monotonic()
-    out = query(gateway, key, "SELECT id, sleep(20) AS s FROM shop.orders")
+    out = query(
+        gateway,
+        key,
+        "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",
+        names=("big",),
+    )
     elapsed = time.monotonic() - started
-    if out["status"] == "rejected":  # the guard does not allow sleep(); nothing to cancel
-        assert "sleep" in out["reason"] or "function" in out["reason"]
-        return
-    assert out["status"] == "error" and out["error"]["type"] == "query_timeout"
+    assert out["status"] == "error" and out["error"]["type"] == "query_timeout", out
     assert elapsed < 8
-    time.sleep(1)
+    for _ in range(10):
+        if running_sleeps() == 0:
+            break
+        time.sleep(0.5)
     assert running_sleeps() == 0  # KILL QUERY reached the server
+
+
+def test_revoking_a_credential_kills_a_running_query(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    key = provision(
+        gateway,
+        mysql_seed,
+        with_big=True,
+        limits={
+            "maxConcurrency": 1,
+            "queueSize": 1,
+            "queueTimeoutSeconds": 1,
+            "queryTimeoutSeconds": 30,
+            "maxRows": 100,
+        },
+    )
+    out: list[Any] = []
+
+    def slow() -> None:
+        out.append(
+            query(
+                gateway,
+                key,
+                "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",
+                names=("big",),
+            )
+        )
+
+    th = threading.Thread(target=slow)
+    th.start()
+    for _ in range(20):
+        if running_sleeps() > 0:
+            break
+        time.sleep(0.25)
+    assert running_sleeps() > 0
+    assert gateway.delete("credential", "gw:cred:c1").status_code == 204
+    th.join(timeout=15)
+    assert out and out[0]["status"] == "error" and out[0]["error"]["type"] == "query_cancelled"
+    for _ in range(10):
+        if running_sleeps() == 0:
+            break
+        time.sleep(0.5)
+    assert running_sleeps() == 0
 
 
 def test_queue_then_reject_when_full(gateway: Gateway, mysql_seed: dict[str, str]) -> None:

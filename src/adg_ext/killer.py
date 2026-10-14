@@ -2,7 +2,7 @@
 
 MySQL and StarRocks: find the connection whose running statement carries the request tag (the
 ``/* grant=..,req=.. */`` comment added by the pipeline) with ``SHOW FULL PROCESSLIST`` and
-``KILL QUERY`` it. ClickHouse: ``KILL QUERY WHERE query_id = ...`` (the id is the request id).
+``KILL QUERY`` it. ClickHouse: ``KILL QUERY WHERE query LIKE '%req=<id>%'`` (the same tag).
 The account only needs permission to kill its own queries.
 """
 
@@ -69,7 +69,10 @@ def _kill_clickhouse(config: dict[str, object], tag: str) -> bool:
         send_receive_timeout=5,
     )
     try:
-        client.command("KILL QUERY WHERE query_id = {qid:String} ASYNC", parameters={"qid": tag})
+        client.command(
+            "KILL QUERY WHERE query LIKE {pattern:String} AND query NOT LIKE 'KILL%' ASYNC",
+            parameters={"pattern": f"%req={tag}%"},
+        )
         return True
     finally:
         client.close()

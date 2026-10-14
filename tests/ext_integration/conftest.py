@@ -89,6 +89,12 @@ def mysql_seed(engines: None) -> dict[str, str]:
         ]
         c.executemany("INSERT INTO shop.orders VALUES (%s,%s,%s,%s,%s,%s)", rows)
         c.execute("INSERT INTO shop.dim VALUES (1,'a')")
+        c.execute("SET SESSION cte_max_recursion_depth = 5000")
+        c.execute("CREATE TABLE shop.big (id BIGINT PRIMARY KEY)")
+        c.execute(
+            "INSERT INTO shop.big SELECT n FROM (WITH RECURSIVE s(n) AS "
+            "(SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 3000) SELECT n FROM s) t"
+        )
         c.execute("DROP USER IF EXISTS 'gw_ro'@'%'")
         c.execute("CREATE USER 'gw_ro'@'%' IDENTIFIED BY 'ropw'")
         c.execute("GRANT SELECT ON shop.* TO 'gw_ro'@'%'")
@@ -154,3 +160,39 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
 
 
 ProvisionFn = Callable[..., str]
+
+
+@pytest.fixture(scope="session")
+def clickhouse_seed(engines: None) -> dict[str, str]:
+    import clickhouse_connect
+
+    client = None
+    for _ in range(30):
+        try:
+            client = clickhouse_connect.get_client(
+                host=CLICKHOUSE[0], port=CLICKHOUSE[1], username="root", password="rootpw"
+            )
+            break
+        except Exception:
+            time.sleep(1)
+    assert client is not None
+    client.command("DROP DATABASE IF EXISTS shop")
+    client.command("CREATE DATABASE shop")
+    client.command(
+        "CREATE TABLE shop.orders (id Int64, tenant_id Int64, phone String, amount Decimal(10,2),"
+        " ssn String, created_at DateTime) ENGINE = MergeTree ORDER BY id"
+    )
+    client.command(
+        "INSERT INTO shop.orders VALUES (1,7,'13800000001',10.50,'111','2026-10-01 10:00:00'),"
+        "(2,7,'13800000002',20.00,'222','2026-10-02 10:00:00'),"
+        "(3,8,'13900000003',30.00,'333','2026-10-03 10:00:00'),"
+        "(4,9,'13900000004',40.00,'444','2026-10-04 10:00:00')"
+    )
+    client.command("CREATE TABLE shop.big (id Int64) ENGINE = MergeTree ORDER BY id")
+    client.command("INSERT INTO shop.big SELECT number FROM numbers(3000)")
+    client.command("DROP USER IF EXISTS gw_ro")
+    client.command("CREATE USER gw_ro IDENTIFIED BY 'ropw'")
+    client.command("GRANT SELECT ON shop.* TO gw_ro")
+    client.command("GRANT SELECT ON system.* TO gw_ro")
+    client.close()
+    return {"user": "gw_ro", "password": "ropw"}

@@ -142,7 +142,6 @@ class ClickHouseConnector:
 
     def execute_query(self, config: dict[str, object], sql: str, limit: int) -> QueryResult:
         timeout = config.get("_ext_timeout_seconds")
-        tag = config.get("_ext_query_id")
         settings: dict[str, object] = {
             "readonly": 1,
             "max_result_rows": int(limit),
@@ -152,7 +151,7 @@ class ClickHouseConnector:
             settings["max_execution_time"] = int(str(timeout))
         client = self._client(config, {})
         try:
-            result = client.query(sql, settings=settings, query_id=str(tag) if tag else None)
+            result = client.query(sql, settings=settings)
             names = list(result.column_names)
             types = [t.name for t in result.column_types]
             rows = [

@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from tests.ext_integration.conftest import MYSQL, Gateway
+from tests.ext_integration.conftest import CLICKHOUSE, MYSQL, Gateway
 
 
 def sha(text: str) -> str:
@@ -20,6 +20,8 @@ def provision(
     operations: dict[str, Any] | None = None,
     filter_where: str | None = "tenant_id = {{tenant_id}}",
     mask: dict[str, str] | None = None,
+    with_big: bool = False,
+    engine: str = "mysql",
 ) -> str:
     """Sync datasource → role → row filter → user → credential; return the plaintext key."""
 
@@ -35,10 +37,10 @@ def provision(
             ds,
             {
                 "label": "shop",
-                "engine": "mysql",
-                "dialect": "mysql",
-                "host": MYSQL[0],
-                "port": MYSQL[1],
+                "engine": engine,
+                "dialect": engine,
+                "host": (MYSQL if engine == "mysql" else CLICKHOUSE)[0],
+                "port": (MYSQL if engine == "mysql" else CLICKHOUSE)[1],
                 "database": "shop",
                 "username": creds["user"],
                 "password": creds["password"],
@@ -61,7 +63,21 @@ def provision(
                     "allow": ["id", "tenant_id", "phone", "amount", "created_at"],
                     "deny": ["ssn"],
                     "mask": {"phone": "partial"} if mask is None else mask,
-                }
+                },
+                *(
+                    [
+                        {
+                            "datasource": ds,
+                            "database": "shop",
+                            "table": "big",
+                            "allow": ["id"],
+                            "deny": [],
+                            "mask": {},
+                        }
+                    ]
+                    if with_big
+                    else []
+                ),
             ],
             "operations": operations or {"mode": "read_only"},
             "limits": limits
@@ -120,15 +136,17 @@ def provision(
     return key
 
 
-def target(gw: Gateway, key: str) -> tuple[str, list[str]]:
+def target(gw: Gateway, key: str, names: tuple[str, ...] = ("orders",)) -> tuple[str, list[str]]:
     listing = gw.tool(key, "list_datasources").json()
     datasource_id = listing["datasources"][0]["id"]
     resources = gw.tool(key, "list_resources", datasource_id=datasource_id).json()
-    return datasource_id, [r["id"] for r in resources["resources"] if r["name"] == "orders"]
+    return datasource_id, [r["id"] for r in resources["resources"] if r["name"] in names]
 
 
-def query(gw: Gateway, key: str, sql: str, limit: int = 100) -> dict[str, Any]:
-    ds, ids = target(gw, key)
+def query(
+    gw: Gateway, key: str, sql: str, limit: int = 100, names: tuple[str, ...] = ("orders",)
+) -> dict[str, Any]:
+    ds, ids = target(gw, key, names)
     r = gw.tool(key, "execute_query", datasource_id=ds, resource_ids=ids, query=sql, limit=limit)
     assert r.status_code == 200, r.text
     return r.json()
