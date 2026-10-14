@@ -25,7 +25,7 @@ from adg.control_plane.db import create_engine_from_url, create_session_factory
 from adg.control_plane.models import Base
 from adg.control_plane.services.api_key_service import create_api_key
 from adg.shared.security import hash_api_key
-from adg_ext import pipeline, revocation
+from adg_ext import kdf_cache, pipeline, revocation
 from adg_ext.config import get_ext_settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -141,6 +141,7 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
     get_ext_settings.cache_clear()
     pipeline.reset_admission()
     revocation.reset_cache()
+    kdf_cache.reset_kdf_cache()
     engine = create_engine_from_url(f"sqlite:///{tmp_path / 'cp.db'}")
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
@@ -158,6 +159,7 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
     get_ext_settings.cache_clear()
     pipeline.reset_admission()
     revocation.reset_cache()
+    kdf_cache.reset_kdf_cache()
     reset_auth_rate_limiter()  # refused-key requests must not lock out tests that run later
 
 

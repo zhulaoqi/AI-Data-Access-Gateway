@@ -9,6 +9,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from adg_ext import kdf_cache as ext_kdf
+
 FERNET_ENVELOPE_KIND: Final[str] = "encrypted_secret"
 FERNET_ENVELOPE_VERSION: Final[int] = 2
 FERNET_KDF_NAME: Final[str] = "pbkdf2-hmac-sha256"
@@ -117,7 +119,14 @@ def _decrypt_v2_envelope(envelope: Mapping[str, object], *, secret: str) -> byte
         raise InvalidToken() from error
     if len(salt) != FERNET_SALT_BYTES:
         raise InvalidToken()
-    key = derive_pbkdf2_fernet_key(secret=secret, salt=salt, iterations=iterations)
+    # adg_ext: memoised PBKDF2 output (bounded, expiring, never lowers the iteration count; the
+    # Fernet token is still fully verified below). Plain derivation when the extension is off.
+    key = ext_kdf.derive_key(
+        secret=secret,
+        salt=salt,
+        iterations=iterations,
+        compute=derive_pbkdf2_fernet_key,
+    )
     return Fernet(key).decrypt(ciphertext.encode())
 
 
