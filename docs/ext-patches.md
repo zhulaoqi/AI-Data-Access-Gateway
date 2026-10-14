@@ -74,6 +74,34 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 验证：`uv sync --frozen --no-dev --extra all` 到独立环境后 `import clickhouse_connect` 与
 `adg_ext.clickhouse` 可用。未改 `pyproject.toml`，没有新增 `ext` 组（沿用既有的 `clickhouse`/`all`）。
 
+## 2.1.3 行过滤派生表只列允许列（联调缺陷 N-2，`rowfilter.inject` / `analyze._predicate`）
+
+**现象**：MySQL 数据源上，授权只要带行过滤，任何查询都失败（`connector_operation_error`）。**根因**：行过滤把受限表
+改写为 `(SELECT * FROM t WHERE <filter>) AS t`，而管理服务给库账号的是**列级** `SELECT`（最小权限）；MySQL 对
+`SELECT *` 要求全部列权限，库端报 1142/1143。ClickHouse 恰好会把 `*` 收窄为账号可访问的列，所以不受影响。
+
+**修复**：派生表改为显式列出该授权的**允许列**（`allow` 去掉 `deny`，按名字排序，标识符一律加引号）：
+`(SELECT `a`, `b` FROM t WHERE <filter>) AS t`。细节：
+
+- 目录（`ResourceField`）已知且非空时，只列目录里存在的允许列（库里已删除的列不会拖垮整张表）；目录未知则列出全部允许列。
+- **行过滤读取的列必须是允许列**（`allow` 且不在 `deny`）。账号只对允许列有 `SELECT`，过滤表达式读取其他列在库端必然
+  失败；现在在改写阶段直接拒绝：`row_filter_column_not_permitted:<col>`（`permission_rejected`）。**不会**放开列权限，
+  **不会**丢掉或忽略过滤。允许列为空时拒绝 `row_filter_no_permitted_columns`。多个角色（过滤以 OR 合并）逐个检查。
+  列名比较不区分大小写。
+- `verify` 的二次校验同步收紧：包装 SELECT 的投影必须**恰好**等于该授权的允许列（不是 `*`、不多列、不少列、不带表前缀、
+  不是表达式），否则 `row_filter_verification_failed`。`Binding.columns=None` 仍表示旧的 `*` 投影，仅供不建模列范围的单测。
+- 派生表本身不暴露任何允许列之外的物理列，因此「别名遮蔽」（`id AS ssn`）与「子查询绕过」都碰不到未授权列。
+- **用户语句里的 `SELECT *` / `t.*` 仍然被拒绝**（`wildcard_projection_not_allowed`，带 `allowed_columns` 提示）：
+  这是既有的、回归样本（`SELECT * FROM shop.orders` 等）强制要求的行为，脱敏也依赖投影位置，所以没有改为「展开为允许列」。
+  即使将来放开，派生表也只会返回允许列。
+- 没有修改任何上游文件；只改 `adg_ext/rowfilter.py`、`adg_ext/analyze.py`。
+
+测试：`tests/ext_integration/test_extint_rowfilter_columns.py`（真实 MySQL 8.4 / ClickHouse，**列级授权账号 + 行过滤**；
+MySQL 用例在改动前稳定复现 `status=error`，并含「库端确实拒绝 `SELECT *`」的前提断言；覆盖别名、JOIN、子查询、CTE、
+脱敏、未授权列、过滤读取未授权列）、`tests/ext/test_ext_analyze.py`、`tests/ext/test_ext_rowfilter.py`、回归样本
+`tests/regression/test_ext_bypass_regression.py`（新增 `ROWFILTER_DENY` 17 条 × 两个方言与 `ROWFILTER_ALLOW` 11 条 × 两个方言；
+原 122 个样本不变，仅把「包装层必须是 `select * from`」的断言改为「包装层是不含 `*` 的列清单」）。
+
 ## 2.2 Prometheus 指标（`/admin/ext/metrics/prometheus`）
 
 `GET /admin/ext/metrics/prometheus`，文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）。复用
@@ -126,6 +154,7 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 ## 3. 安全不变量
 
 - 行过滤基于解析后的 AST 注入，参数为带类型的字面量；注入后会二次 `verify`，任何不确定均拒绝（fail-closed）。
+- 行过滤派生表只投影允许列，过滤表达式只能读允许列（2.1.3）；库账号的列级授权必须覆盖 `allow` 去掉 `deny` 的全部列。
 - 无法重新解析的改写结果、`LIMIT … BY`、`WITH ROLLUP/TOTALS`、`INTO OUTFILE`、表函数、系统库等均被拒绝。
 - 审计在执行前提交；写入失败则拒绝执行（`audit_unavailable`）。
 - 日志与响应不包含管理 Key、明文凭据、数据库密码；Prometheus 标签不含用户、SQL、密钥（见 2.2）。
@@ -138,4 +167,7 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 - 未实现 StarRocks resource group classifier。
 - 字符串字面量中的 `:name` 会被 `text()` 当作绑定参数，结果是失败关闭。
 - 有效行数上限受 `runtime_query_max_limit`（默认 1000）约束。
+- 行过滤派生表假定库账号对**全部**允许列有 `SELECT`（管理服务按 `allow` 授权）。若库里实际授权比 `allow` 窄且目录又不反映
+  （MySQL 的目录来自管理账号之外的扫描，可能列出账号读不了的列），该表上带行过滤的查询会在库端失败；需要管理服务保持授权与 `allow` 一致。
+- 行过滤读取的列必须在 `allow` 里（且不在 `deny`）；把过滤列设为「只用于过滤、不对外开放」目前不支持，会被明确拒绝。
 - 审计查询的 `table`、`status` 过滤使用 `LIKE`，不走索引，依赖时间窗口先行（≤93 天）与 `offset` 上限控制成本。

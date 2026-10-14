@@ -3,8 +3,15 @@
 A template is a predicate over the table's own columns with ``{{param}}`` placeholders, for example
 ``tenant_id = {{tenant_id}} AND region IN ({{regions}})``. It is parsed (never string-substituted),
 checked against a small predicate grammar, rendered with typed literals, and injected by replacing
-every physical reference to the table with ``(SELECT * FROM <table> WHERE <predicate>) AS <alias>``.
-The result is verified again before it may reach a connector; anything uncertain is rejected.
+every physical reference to the table with
+``(SELECT <permitted columns> FROM <table> WHERE <predicate>) AS <alias>``.
+
+The derived table lists the grant's *permitted columns* explicitly instead of ``*`` (N-2): the
+datasource account only holds column-level ``SELECT``, MySQL refuses ``SELECT *`` for such an
+account, and a ``*`` would also be the one place where a column the grant does not cover could
+leak into the statement. The columns the predicate itself reads must be permitted columns too
+(``Binding.columns`` is checked against them by the caller). The result is verified again before
+it may reach a connector; anything uncertain is rejected.
 """
 
 from collections.abc import Callable, Iterable
@@ -136,9 +143,14 @@ def render(template: FilterTemplate, supplied: dict[str, object]) -> exp.Express
 
 @dataclass(frozen=True)
 class Binding:
-    """Rendered predicates that apply to one physical table (conjunction)."""
+    """Rendered predicates that apply to one physical table (conjunction).
+
+    ``columns`` are the permitted columns the derived table projects (in this order). ``None``
+    keeps the legacy ``SELECT *`` projection (only unit tests that do not model column scope).
+    """
 
     predicates: tuple[exp.Expression, ...]
+    columns: tuple[str, ...] | None = None
 
     def combined(self) -> exp.Expression:
         out = self.predicates[0].copy()
@@ -185,8 +197,13 @@ def inject(statement: exp.Expression, lookup: Lookup, *, dialect: str | None) ->
         inner_table = table.copy()
         inner_table.set("alias", None)
         inner: exp.Expression = exp.Final(this=inner_table) if final is not None else inner_table
+        projection: list[exp.Expression] = (
+            [exp.Star()]
+            if binding.columns is None
+            else [exp.column(exp.to_identifier(c, quoted=True)) for c in binding.columns]
+        )
         wrapper = exp.Subquery(
-            this=exp.select("*").from_(inner).where(binding.combined()),
+            this=exp.select(*projection).from_(inner).where(binding.combined()),
             alias=exp.TableAlias(this=exp.to_identifier(alias)),
         )
         (final if final is not None else table).replace(wrapper)
@@ -196,6 +213,33 @@ def inject(statement: exp.Expression, lookup: Lookup, *, dialect: str | None) ->
 def _from_of(select: exp.Select) -> exp.Expression | None:
     source = select.args.get("from_") or select.args.get("from")
     return source.this if source is not None else None
+
+
+def _projection_matches(select: exp.Select, binding: Binding) -> bool:
+    """The wrapper projects exactly the permitted columns (or ``*`` for a column-less binding)."""
+
+    if binding.columns is None:
+        return len(select.expressions) == 1 and isinstance(select.expressions[0], exp.Star)
+    if len(select.expressions) != len(binding.columns):
+        return False
+    for projection, name in zip(select.expressions, binding.columns, strict=True):
+        if not isinstance(projection, exp.Column) or isinstance(projection.this, exp.Star):
+            return False
+        if projection.args.get("table") or projection.args.get("db"):
+            return False
+        if projection.name != name:
+            return False
+    return True
+
+
+def predicate_columns(predicate: exp.Expression) -> list[str]:
+    """Column names a rendered predicate reads (placeholders are already literals), in order."""
+
+    names: list[str] = []
+    for column in predicate.find_all(exp.Column):
+        if column.name not in names:
+            names.append(column.name)
+    return names
 
 
 def verify(sql: str, lookup: Lookup, *, dialect: str | None) -> None:
@@ -223,7 +267,7 @@ def verify(sql: str, lookup: Lookup, *, dialect: str | None) -> None:
             dialect=dialect
         ):
             raise ExtRejection("row_filter_verification_failed")
-        if len(select.expressions) != 1 or not isinstance(select.expressions[0], exp.Star):
+        if not _projection_matches(select, binding):
             raise ExtRejection("row_filter_verification_failed")
         if select.args.get("joins"):
             raise ExtRejection("row_filter_verification_failed")

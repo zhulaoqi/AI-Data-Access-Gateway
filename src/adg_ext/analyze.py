@@ -14,7 +14,15 @@ from sqlglot import exp
 from adg_ext.errors import ExtRejection
 from adg_ext.guard import GuardVerdict
 from adg_ext.params import ParamSpec
-from adg_ext.rowfilter import Binding, FilterTemplate, compile_template, inject, render, verify
+from adg_ext.rowfilter import (
+    Binding,
+    FilterTemplate,
+    compile_template,
+    inject,
+    predicate_columns,
+    render,
+    verify,
+)
 
 
 @dataclass
@@ -55,6 +63,20 @@ class TableView:
 
     def permitted_columns(self) -> list[str]:
         return sorted(c for c in self.allow if self.permits(c))
+
+    def projection_columns(self) -> list[str]:
+        """What a row-filter derived table may project: permitted columns that exist.
+
+        The datasource account only holds column-level ``SELECT`` on the permitted columns, so the
+        derived table must name them (``SELECT *`` needs every column). When the catalog is known
+        it also drops permitted names that do not exist (a column dropped since the grant was
+        written) because naming a missing column would fail every query on the table.
+        """
+
+        names = self.permitted_columns()
+        if self.columns:
+            names = [c for c in names if c.lower() in self.columns]
+        return list(dict.fromkeys(names))
 
 
 @dataclass
@@ -124,10 +146,22 @@ def _predicate(view: TableView, params: dict[str, object], dialect: str | None) 
             definition.where, definition.params, dialect=dialect
         )
         predicates.append(render(template, params))
+    # The derived table projects the permitted columns only, and the database account holds
+    # column-level grants for exactly those: a predicate that reads any other column could not be
+    # evaluated (a database error at best). Refuse it with a precise reason instead of dropping or
+    # loosening the filter, and never widen the grant to make it work.
+    columns = view.projection_columns()
+    if not columns:
+        raise ExtRejection("row_filter_no_permitted_columns")
+    readable = {c.lower() for c in view.permitted_columns()}
+    for predicate in predicates:
+        for name in predicate_columns(predicate):
+            if name.lower() not in readable:
+                raise ExtRejection("row_filter_column_not_permitted", detail=name)
     combined = predicates[0]
     for extra in predicates[1:]:
         combined = exp.Or(this=exp.Paren(this=combined), expression=exp.Paren(this=extra))
-    return Binding((combined,))
+    return Binding((combined,), tuple(columns))
 
 
 def rewrite(

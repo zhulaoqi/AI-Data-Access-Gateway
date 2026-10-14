@@ -215,3 +215,52 @@ def test_verification_catches_an_unwrapped_reference() -> None:
         lookup,
         dialect="mysql",
     )
+
+
+# ---- N-2: the wrapper projects permitted columns, not `*` ---------------------------------------
+
+
+def column_binding(columns: tuple[str, ...], dialect: str = "mysql") -> Binding:
+    base = binding("tenant_id = {{tenant_id}}", {"tenant_id": 7}, dialect)
+    return Binding(base.predicates, columns)
+
+
+def test_wrapper_lists_the_given_columns_quoted_and_never_star() -> None:
+    b = column_binding(("id", "tenant_id", "order"))
+    out = run("select o.id from orders o", "orders", b)
+    assert out == (
+        "SELECT o.id FROM (SELECT `id`, `tenant_id`, `order` FROM orders WHERE tenant_id = 7) AS o"
+    )
+    ch = column_binding(("id", "tenant_id"), "clickhouse")
+    out = run("select id from orders final", "orders", ch, "clickhouse")
+    assert "*" not in out and "FROM orders FINAL WHERE tenant_id = 7" in out
+
+
+def test_verification_checks_the_projection_of_the_wrapper() -> None:
+    b = column_binding(("id", "tenant_id"))
+    lookup = lookup_for("orders", b)
+    verify(
+        "select id from (select `id`, `tenant_id` from orders where tenant_id = 7) as orders",
+        lookup,
+        dialect="mysql",
+    )
+    for projection in (
+        "*",
+        "id",
+        "id, tenant_id, ssn",
+        "tenant_id, id",
+        "id, tenant_id + 1",
+        "id, o.tenant_id",
+    ):
+        with pytest.raises(ExtRejection):
+            verify(
+                f"select id from (select {projection} from orders where tenant_id = 7) as orders",
+                lookup,
+                dialect="mysql",
+            )
+    with pytest.raises(ExtRejection):  # a `*` wrapper is not ours once columns are required
+        verify(
+            "select id from (select * from orders where tenant_id = 7) as orders",
+            lookup,
+            dialect="mysql",
+        )

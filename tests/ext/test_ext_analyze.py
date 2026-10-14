@@ -30,7 +30,7 @@ def test_allowed_query_gets_the_row_filter_and_keeps_limit() -> None:
     r = run("SELECT id, amount FROM shop.orders WHERE amount > 10")
     assert r.allowed, r.reasons
     assert "tenant_id = 7" in r.sql
-    assert r.sql.count("tenant_id") == 1
+    assert r.sql.count("tenant_id = 7") == 1
     assert r.limit == 100
 
 
@@ -183,3 +183,110 @@ def test_column_of_an_unrestricted_table_is_not_mistaken_for_an_unlisted_one() -
         views=[ORDERS_GRANTED_ONLY, plain],
     )
     assert bad.reasons == ["column_not_allowed:secret"]
+
+
+# ---- N-2: the derived table lists permitted columns, never ``*`` --------------------------------
+
+
+def test_derived_table_projects_exactly_the_permitted_columns_in_every_dialect() -> None:
+    for dialect in ("mysql", "clickhouse"):
+        r = run("SELECT id FROM shop.orders", dialect=dialect)
+        assert r.allowed, r.reasons
+        inner = r.sql[r.sql.index("(SELECT") : r.sql.index(") AS orders")].lower()
+        assert "*" not in inner
+        assert "ssn" not in r.sql.lower()
+        for column in ("amount", "created_at", "id", "phone", "tenant_id"):
+            assert column in inner, (dialect, column)
+
+
+def test_derived_table_skips_permitted_columns_missing_from_the_catalog() -> None:
+    view = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        columns=frozenset({"id", "tenant_id"}),  # `phone`... were dropped / not visible
+        allow=frozenset({"id", "tenant_id", "phone", "amount"}),
+        filters=ORDERS.filters,
+    )
+    r = run("SELECT id FROM shop.orders", views=[view])
+    assert r.allowed, r.reasons
+    inner = r.sql[r.sql.index("(SELECT") : r.sql.index(") AS orders")].lower()
+    assert "phone" not in inner and "amount" not in inner and "tenant_id" in inner
+
+
+def test_unknown_catalog_uses_every_permitted_column() -> None:
+    view = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        allow=frozenset({"id", "tenant_id"}),
+        filters=ORDERS.filters,
+    )
+    r = run("SELECT id FROM shop.orders", views=[view])
+    assert r.allowed and "SELECT `id`, `tenant_id` FROM" in r.sql
+
+
+@pytest.mark.parametrize("dialect", ["mysql", "clickhouse"])
+def test_filter_reading_a_denied_column_is_rejected_with_a_clear_reason(dialect: str) -> None:
+    view = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        columns=ORDERS.columns,
+        allow=ORDERS.allow,
+        deny=frozenset({"ssn"}),
+        filters=[FilterDef("tenant_id = {{tenant_id}} AND ssn <> '0'", ORDERS.filters[0].params)],  # type: ignore[union-attr]
+    )
+    r = run("SELECT id FROM shop.orders", dialect=dialect, views=[view])
+    assert not r.allowed and r.sql is None
+    assert r.reasons == ["row_filter_column_not_permitted:ssn"]
+
+
+def test_filter_reading_a_column_outside_allow_is_rejected_not_dropped() -> None:
+    view = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        columns=ORDERS.columns,
+        allow=frozenset({"id", "amount"}),  # tenant_id is not allowed, yet the filter needs it
+        filters=ORDERS.filters,
+    )
+    r = run("SELECT id FROM shop.orders", views=[view])
+    assert r.reasons == ["row_filter_column_not_permitted:tenant_id"]
+
+
+def test_filter_column_check_is_case_insensitive_and_covers_every_role() -> None:
+    ok = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        allow=frozenset({"id", "Tenant_ID"}),
+        filters=[FilterDef("TENANT_ID = 7", ())],
+    )
+    assert run("SELECT id FROM shop.orders", views=[ok]).allowed
+    bad = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        allow=frozenset({"id", "tenant_id"}),
+        filters=[FilterDef("tenant_id = 7", ()), FilterDef("region = 'x'", ())],
+    )
+    assert run("SELECT id FROM shop.orders", views=[bad]).reasons == [
+        "row_filter_column_not_permitted:region"
+    ]
+
+
+def test_filter_with_no_permitted_column_at_all_is_rejected() -> None:
+    view = TableView(
+        path="shop.shop.orders",
+        restricted=True,
+        columns=ORDERS.columns,
+        allow=frozenset({"ssn"}),
+        deny=frozenset({"ssn"}),
+        filters=[FilterDef("1 = 1", ())],
+    )
+    r = run("SELECT 1 AS one FROM shop.orders", views=[view])
+    assert r.reasons == ["row_filter_no_permitted_columns"]
+
+
+def test_alias_shadowing_a_denied_column_cannot_reach_the_physical_column() -> None:
+    # `id AS ssn` is a legal alias; the derived table still never exposes the physical `ssn`
+    for dialect in ("mysql", "clickhouse"):
+        r = run("SELECT id AS ssn FROM shop.orders", dialect=dialect)
+        if r.allowed:
+            inner = r.sql[r.sql.index("(SELECT") : r.sql.index(") AS orders")].lower()
+            assert "ssn" not in inner
