@@ -1,8 +1,6 @@
 import hashlib
 from typing import Any
 
-import pytest
-
 from tests.ext_integration.conftest import CLICKHOUSE, MYSQL, Gateway
 
 

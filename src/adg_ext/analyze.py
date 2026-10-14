@@ -147,7 +147,12 @@ def rewrite(
         if restricted and any(r.startswith("wildcard") for r in out.reasons):
             out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
         return out
-    tree = cast(exp.Expression, sqlglot.parse_one(normalized, read=dialect))
+    try:
+        tree = cast(exp.Expression, sqlglot.parse_one(normalized, read=dialect))
+    except sqlglot.errors.SqlglotError:
+        # e.g. LIMIT appended after WITH ROLLUP: it cannot be inspected, so it is refused
+        out.reasons.append("rewrite_parse_failed")
+        return out
 
     if restricted and _wildcards(tree):
         out.reasons.append("wildcard_projection_not_allowed")

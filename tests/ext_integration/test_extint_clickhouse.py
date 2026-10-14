@@ -54,7 +54,7 @@ def test_clickhouse_timeout_is_enforced(gateway: Gateway, clickhouse_seed: dict[
     out = query(
         gateway,
         key,
-        "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",
+        "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",  # noqa: E501
         names=("big",),
     )
     assert out["status"] == "error", out

@@ -126,6 +126,9 @@ def _structural_reasons(statement: exp.Expression) -> list[str]:
             add("pivot_not_allowed")
         elif isinstance(node, exp.Hint):
             add("hint_not_allowed")
+        elif isinstance(node, exp.Limit) and node.args.get("expressions"):
+            # ClickHouse `LIMIT n BY col`: the upstream limit rewrite would silently drop `BY`
+            add("limit_by_not_allowed")
         elif isinstance(node, (exp.Parameter, exp.SessionParameter, exp.Placeholder)):
             add("variable_not_allowed")
         elif isinstance(node, _TABLE_FUNCTION_NODES):

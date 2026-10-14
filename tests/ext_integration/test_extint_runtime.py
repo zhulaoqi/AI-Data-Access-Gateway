@@ -5,11 +5,11 @@ import time
 from typing import Any
 
 import pymysql
+from tests.ext_integration.conftest import MYSQL, Gateway, mysql_conn
+from tests.ext_integration.test_extint_mysql import provision, query, sha, target
 
 from adg.control_plane.services.api_key_service import create_api_key
 from adg_ext.pipeline import get_admission
-from tests.ext_integration.conftest import MYSQL, Gateway, mysql_conn
-from tests.ext_integration.test_extint_mysql import provision, query, sha, target
 
 
 def running_sleeps() -> int:
@@ -52,7 +52,7 @@ def test_a_slow_query_is_cancelled_on_the_database(
     out = query(
         gateway,
         key,
-        "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",
+        "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",  # noqa: E501
         names=("big",),
     )
     elapsed = time.monotonic() - started
@@ -87,7 +87,7 @@ def test_revoking_a_credential_kills_a_running_query(
             query(
                 gateway,
                 key,
-                "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",
+                "SELECT sum(a.id + b.id + c.id + d.id) AS n FROM shop.big a, shop.big b, shop.big c, shop.big d",  # noqa: E501
                 names=("big",),
             )
         )
@@ -331,3 +331,71 @@ def test_metrics_are_exposed(gateway: Gateway, mysql_seed: dict[str, str]) -> No
 
 
 _ = (pymysql, MYSQL)
+
+
+def test_audit_failure_refuses_execution(
+    gateway: Gateway, mysql_seed: dict[str, str], monkeypatch: Any
+) -> None:
+    from adg.audit.service import AuditService
+    from adg_ext.mysql_scoped import ScopedMySqlConnector
+
+    key = provision(gateway, mysql_seed)
+    calls: list[str] = []
+    real_execute = ScopedMySqlConnector.execute_query
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append("executed")
+        return real_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(ScopedMySqlConnector, "execute_query", counting)
+    real_record = AuditService.record_event
+
+    def broken(self: Any, **kwargs: Any) -> Any:
+        if (kwargs.get("metadata") or {}).get("phase") == "started":
+            kwargs["event_type"] = None  # NOT NULL: the pre-execution audit write fails
+        return real_record(self, **kwargs)
+
+    monkeypatch.setattr(AuditService, "record_event", broken)
+    out = query(gateway, key, "SELECT id FROM shop.orders")
+    assert out == {"status": "rejected", "reason": "audit_unavailable"}
+    assert calls == []
+
+
+def test_circuit_breaker_opens_after_repeated_datasource_failures(
+    gateway: Gateway, mysql_seed: dict[str, str], monkeypatch: Any
+) -> None:
+    from adg.connectors.errors import ConnectorOperationError
+    from adg_ext.mysql_scoped import ScopedMySqlConnector
+
+    key = provision(gateway, mysql_seed)
+    calls: list[int] = []
+
+    def down(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        raise ConnectorOperationError("server gone") from ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(ScopedMySqlConnector, "execute_query", down)
+    for _ in range(5):
+        out = query(gateway, key, "SELECT id FROM shop.orders")
+        assert out["error"]["type"] == "datasource_unavailable"
+    fast = query(gateway, key, "SELECT id FROM shop.orders")
+    assert fast == {"status": "rejected", "reason": "admission_circuit_open"}
+    assert len(calls) == 5  # the sixth request never reached the datasource
+    assert gateway.admin_get("/admin/ext/metrics").json()["breakers"]
+
+
+def test_a_bad_query_does_not_trip_the_breaker(
+    gateway: Gateway, mysql_seed: dict[str, str], monkeypatch: Any
+) -> None:
+    from adg.connectors.errors import ConnectorOperationError
+    from adg_ext.mysql_scoped import ScopedMySqlConnector
+
+    key = provision(gateway, mysql_seed)
+
+    def syntax(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise ConnectorOperationError("(1064) You have an error in your SQL syntax")
+
+    monkeypatch.setattr(ScopedMySqlConnector, "execute_query", syntax)
+    for _ in range(8):
+        out = query(gateway, key, "SELECT id FROM shop.orders")
+        assert out["error"]["type"] == "connector_operation_error"

@@ -180,13 +180,16 @@ def inject(statement: exp.Expression, lookup: Lookup, *, dialect: str | None) ->
             raise ExtRejection("row_filter_qualified_column_unsupported")
     for table, binding in targets:
         alias = table.alias or table.name
-        inner = table.copy()
-        inner.set("alias", None)
+        # ClickHouse's `FINAL` modifies the table reference and must stay on the inner table
+        final = table.parent if isinstance(table.parent, exp.Final) else None
+        inner_table = table.copy()
+        inner_table.set("alias", None)
+        inner: exp.Expression = exp.Final(this=inner_table) if final is not None else inner_table
         wrapper = exp.Subquery(
             this=exp.select("*").from_(inner).where(binding.combined()),
             alias=exp.TableAlias(this=exp.to_identifier(alias)),
         )
-        table.replace(wrapper)
+        (final if final is not None else table).replace(wrapper)
     return tree
 
 
@@ -206,9 +209,12 @@ def verify(sql: str, lookup: Lookup, *, dialect: str | None) -> None:
         binding = lookup(table.db or None, table.name)
         if binding is None:
             continue
-        holder = table.parent  # From or Join
+        node: exp.Expression = table
+        if isinstance(table.parent, exp.Final):
+            node = table.parent
+        holder = node.parent  # From or Join
         select = holder.parent if holder is not None else None
-        if not isinstance(select, exp.Select) or _from_of(select) is not table:
+        if not isinstance(select, exp.Select) or _from_of(select) is not node:
             raise ExtRejection("row_filter_verification_failed")
         if not isinstance(select.parent, exp.Subquery):
             raise ExtRejection("row_filter_verification_failed")
