@@ -14,7 +14,8 @@ from adg.app.dependencies import (
 )
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
-from adg_ext import audit_query
+from adg_ext import audit_query, revocation
+from adg_ext import metrics as metrics_text
 from adg_ext.config import get_ext_settings
 from adg_ext.delegated import DelegatedError, run_delegated
 from adg_ext.dryrun import dry_run
@@ -98,6 +99,23 @@ def delete_object(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@admin_router.post("/sync/{object_type}/{name}/reinstate")
+def reinstate_object(
+    object_type: str,
+    name: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> dict[str, bool]:
+    """Lift the tombstone of a revoked credential / deleted user so a new PUT is accepted."""
+
+    try:
+        lifted = SyncService(session).reinstate(object_type, name)
+        session.commit()
+    except ExtSyncError as error:
+        session.rollback()
+        raise _fail(error) from error
+    return {"reinstated": lifted}
+
+
 @admin_router.get("/sync/{object_type}")
 def list_objects(
     object_type: str,
@@ -119,6 +137,16 @@ def post_dry_run(body: dict[str, Any]) -> dict[str, Any]:
 @admin_router.get("/metrics")
 def metrics() -> dict[str, object]:
     return get_admission().snapshot()
+
+
+@admin_router.get("/metrics/prometheus")
+def metrics_prometheus() -> Response:
+    """Prometheus text exposition (0.0.4); admin scope and ``ADG_EXT_ADMIN_ALLOWED_CIDRS`` apply."""
+
+    body = metrics_text.render(
+        get_admission(), metrics_text.get_query_metrics(), revocation.get_cache()
+    )
+    return Response(content=body, media_type=metrics_text.CONTENT_TYPE)
 
 
 @delegated_router.post("/query")

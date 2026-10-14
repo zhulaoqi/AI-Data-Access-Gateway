@@ -9,11 +9,13 @@ ApiKey (``runtime`` scope, externally supplied SHA-256 hash).
 """
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
@@ -37,6 +39,8 @@ from adg_ext.models import (
 )
 from adg_ext.params import ParamSpec
 from adg_ext.rowfilter import compile_template
+
+logger = logging.getLogger(__name__)
 
 PREFIX = "gw:"
 TYPES = ("datasource_account", "role", "row_filter", "user", "credential")
@@ -111,6 +115,41 @@ class SyncService:
         getattr(self, f"_delete_{object_type}")(name, existing)
         self._s.delete(existing)
         self._s.flush()
+
+    def reinstate(self, object_type: str, name: str) -> bool:
+        """Lift the revocation tombstone of a user or credential (explicit, admin only).
+
+        A revoked credential or a deleted (disabled) user is a tombstone: replaying the same
+        object through ``put`` is refused (``credential_revoked`` / ``user_revoked``). Reinstating
+        only makes a *new* PUT possible; it does not restore any authorization by itself: the
+        user comes back active but without a role, a retired key hash can never authenticate.
+        """
+
+        if object_type not in ("user", "credential"):
+            raise ExtSyncError(422, "only user and credential tombstones can be lifted")
+        self._check(object_type, name)
+        if self._find(object_type, name) is not None:
+            return False  # not revoked: it is a live synced object
+        if object_type == "user":
+            user = self._s.execute(
+                select(User).where(User.external_ref == name, User.status == "disabled")
+            ).scalar_one_or_none()
+            if user is None:
+                return False
+            user.status = "active"  # no role, no attributes: nothing is granted
+        else:
+            keys = list(
+                self._s.execute(
+                    select(ApiKey).where(ApiKey.name == name, ApiKey.status == "revoked")
+                ).scalars()
+            )
+            if not keys:
+                return False
+            for key in keys:
+                key.key_hash = f"retired:{key.id}"  # frees the unique hash, can never match
+        self._s.flush()
+        logger.info("tombstone lifted for %s %s", object_type, name)
+        return True
 
     def external_id_of(self, object_type: str, name: str) -> str | None:
         existing = self._find(object_type, name) if object_type in TYPES else None
@@ -392,6 +431,9 @@ class SyncService:
         if user is None:
             user = User(name=str(spec.get("principalName") or name), external_ref=name)
             self._s.add(user)
+        elif user.status != "active":
+            # a deleted (disabled) grant stays dead until the tombstone is lifted explicitly
+            raise ExtSyncError(409, "user_revoked")
         user.status = "active"
         self._s.flush()
         self._s.execute(delete(UserRole).where(UserRole.user_id == user.id))
@@ -427,6 +469,17 @@ class SyncService:
         record = (
             self._s.get(ApiKey, existing.external_id) if existing and existing.external_id else None
         )
+        if record is not None and record.status != "active":
+            # revoked (credential or user deleted, or revoked on the executor): never revive it
+            raise ExtSyncError(409, "credential_revoked")
+        clash = self._s.execute(
+            select(ApiKey).where(ApiKey.key_hash == key_hash)
+        ).scalar_one_or_none()
+        if clash is not None and (record is None or clash.id != record.id):
+            # the hash belongs to another key; a revoked one is the replay of a revoked credential
+            raise ExtSyncError(
+                409, "credential_revoked" if clash.status != "active" else "key_hash_conflict"
+            )
         try:
             if record is None:
                 record, _ = create_api_key(
@@ -446,6 +499,8 @@ class SyncService:
                 record.expires_at = expires_at
         except ValueError as error:
             raise ExtSyncError(422, str(error)) from error
+        except IntegrityError as error:  # lost a race on the unique key hash
+            raise ExtSyncError(409, "key_hash_conflict") from error
         self._s.flush()
         return record.id
 

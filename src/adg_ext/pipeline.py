@@ -30,6 +30,7 @@ from adg_ext.admission import Admission, AdmissionRejected, Ticket
 from adg_ext.analyze import FilterDef, TableView, rewrite
 from adg_ext.config import get_ext_settings
 from adg_ext.killer import kill_query
+from adg_ext.metrics import get_query_metrics, reset_query_metrics
 
 if TYPE_CHECKING:
     from adg.gateway_runtime.tools import GatewayRuntimeService
@@ -68,6 +69,7 @@ def reset_admission() -> None:
     global _admission
     with _admission_lock:
         _admission = None
+    reset_query_metrics()
 
 
 def is_infra_failure(error: BaseException) -> bool:
@@ -176,6 +178,7 @@ def run(
     settings = get_settings()
 
     def reject(kind: str, reason: str, hint: dict[str, object] | None = None) -> dict[str, Any]:
+        get_query_metrics().rejected(reason)
         svc._record_rejection(
             identity, api_key_id, kind, datasource_id, resource_ids, query, reason
         )
@@ -300,6 +303,7 @@ def _execute(
     limits = ctx.limits
 
     def rejected(kind: str, reason: str) -> dict[str, Any]:
+        get_query_metrics().rejected(reason)
         svc._record_rejection(
             identity, api_key_id, kind, datasource_id, actual_ids, original_query, reason
         )
@@ -325,6 +329,7 @@ def _execute(
     except AdmissionRejected as error:
         return rejected("permission_rejected", f"admission_{error.reason}")
 
+    final = "failed"  # the outcome label unless a branch below says otherwise
     try:
         tagged = f"/* grant={identity.user_id},req={query_id} */ {final_sql}"
         started_wall = time.monotonic()
@@ -354,6 +359,9 @@ def _execute(
         except Exception:
             logger.error("audit write failed; refusing to execute query %s", query_id)
             session.rollback()
+            get_query_metrics().audit_unavailable()
+            get_query_metrics().rejected("audit_unavailable")
+            final = ""
             return {"status": "rejected", "reason": "audit_unavailable"}
 
         outcome = _run_connector(svc, datasource, tagged, effective_limit, query_id, limits, ticket)
@@ -362,6 +370,7 @@ def _execute(
         metadata.update(phase="completed", duration_ms=duration_ms)
 
         if isinstance(outcome, str):  # an error type
+            final = _OUTCOME_OF_ERROR.get(outcome, "failed")
             event.decision = "error"
             event.reason = outcome
             metadata["error_type"] = outcome
@@ -395,6 +404,7 @@ def _execute(
         metadata.update(rows=len(rows), truncated=truncated, masked_columns=masked_columns)
         event.metadata_json = _dumps(metadata)
         _persist(session)
+        final = "completed"
         return {
             "query_id": query_id,
             "status": "success",
@@ -407,7 +417,11 @@ def _execute(
         }
     finally:
         ticket.release()
+        if final:
+            get_query_metrics().outcome(final)
 
+
+_OUTCOME_OF_ERROR = {"query_timeout": "timeout", "query_cancelled": "cancelled"}
 
 _ERROR_MESSAGES = {
     "query_timeout": "The query exceeded its time limit and was cancelled.",

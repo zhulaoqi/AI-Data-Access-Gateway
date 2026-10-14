@@ -13,6 +13,24 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from adg_ext.metrics import Histogram
+
+# Rejections that happened after (some) waiting; they feed the wait histogram so that a long tail
+# of queue timeouts is visible, whereas ``queue_full``/``circuit_open`` refuse instantly.
+_WAITED_REJECTIONS = frozenset({"queue_timeout", "datasource_busy", "revoked"})
+
+
+@dataclass(frozen=True)
+class MetricsView:
+    """A consistent copy of the controller state for the Prometheus exposition."""
+
+    queued: int
+    running: int
+    datasource_running: dict[str, int]
+    breakers: dict[str, str]
+    counters: dict[str, int]
+    wait_seconds_avg: float
+
 
 class AdmissionRejected(Exception):
     """The request was not admitted; ``reason`` is a stable code."""
@@ -148,11 +166,27 @@ class Admission:
         self._counters: dict[str, int] = {}
         self._wait_total = 0.0
         self._wait_count = 0
+        self.wait_histogram = Histogram()
 
     # ---- metrics ----------------------------------------------------------------------------
 
+    @property
+    def datasource_limit(self) -> int:
+        return self._datasource_limit
+
     def _count(self, name: str) -> None:
         self._counters[name] = self._counters.get(name, 0) + 1
+
+    def metrics_view(self) -> MetricsView:
+        with self._cond:
+            return MetricsView(
+                queued=sum(len(lane.queue) for lane in self._lanes.values()),
+                running=sum(lane.running for lane in self._lanes.values()),
+                datasource_running=dict(self._datasource_running),
+                breakers={k: b.state for k, b in self._breakers.items()},
+                counters=dict(self._counters),
+                wait_seconds_avg=(self._wait_total / self._wait_count) if self._wait_count else 0.0,
+            )
 
     def snapshot(self) -> dict[str, object]:
         with self._cond:
@@ -200,18 +234,21 @@ class Admission:
         deadline = started + max(0.0, queue_timeout)
         try:
             self._take_user_slot(user_key, max_concurrency, queue_size, deadline, tags)
-        except AdmissionRejected:
+        except AdmissionRejected as error:
             self.breaker(datasource_key).release_probe()
+            self._observe_rejected_wait(error, started)
             raise
         try:
             self._take_datasource_slot(datasource_key, deadline)
-        except AdmissionRejected:
+        except AdmissionRejected as error:
             with self._cond:
                 self._lanes[user_key].running -= 1
                 self._cond.notify_all()
             self.breaker(datasource_key).release_probe()
+            self._observe_rejected_wait(error, started)
             raise
         waited = self._clock() - started
+        self.wait_histogram.observe(waited)
         ticket = Ticket(self, user_key, datasource_key, waited, tags)
         with self._cond:
             self._lanes[user_key].tickets.add(ticket)
@@ -219,6 +256,10 @@ class Admission:
             self._wait_count += 1
             self._count("admitted")
         return ticket
+
+    def _observe_rejected_wait(self, error: AdmissionRejected, started: float) -> None:
+        if error.reason in _WAITED_REJECTIONS:
+            self.wait_histogram.observe(self._clock() - started)
 
     def _take_user_slot(
         self,

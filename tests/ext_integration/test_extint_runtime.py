@@ -399,3 +399,72 @@ def test_a_bad_query_does_not_trip_the_breaker(
     for _ in range(8):
         out = query(gateway, key, "SELECT id FROM shop.orders")
         assert out["error"]["type"] == "connector_operation_error"
+
+
+def _replay(gw: Gateway, kind: str, name: str) -> Any:
+    """Re-send the stored spec and hash of a (possibly deleted) object, like a retried sync."""
+
+    return gw.sync(kind, name, _SPECS[(kind, name)][0], hash_=_SPECS[(kind, name)][1])
+
+
+_SPECS: dict[tuple[str, str], tuple[dict[str, Any], str]] = {}
+
+
+def _remember(gw: Gateway, key: str) -> None:
+    _SPECS.clear()
+    _SPECS[("user", "gw:user:g1")] = (
+        {
+            "grantId": "g1",
+            "principalId": "pr1",
+            "principalName": "Alice",
+            "role": "gw:role:p1:v1",
+            "kind": "human",
+            "channels": ["mcp"],
+            "params": {"tenant_id": 7},
+            "expiresAt": 4_102_444_800_000,
+        },
+        "a" * 64,
+    )
+    _SPECS[("credential", "gw:cred:c1")] = (
+        {
+            "user": "gw:user:g1",
+            "channel": "mcp",
+            "keyHash": sha(key),
+            "keyPrefix": key[:8],
+            "expiresAt": 4_102_444_800_000,
+        },
+        "b" * 64,
+    )
+
+
+def test_k3_replaying_a_revoked_credential_is_a_stable_409(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    key = provision(gateway, mysql_seed)
+    _remember(gateway, key)
+    assert gateway.delete("credential", "gw:cred:c1").status_code == 204
+    for _ in range(2):
+        r = _replay(gateway, "credential", "gw:cred:c1")
+        assert r.status_code == 409 and r.json() == {"detail": "credential_revoked"}
+    assert gateway.tool(key, "list_datasources").status_code == 401  # still revoked
+
+
+def test_replaying_user_and_credential_after_a_delete_does_not_restore_access(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    """Drill S9b: the whole grant was revoked, then a retried sync replays both objects."""
+
+    key = provision(gateway, mysql_seed)
+    _remember(gateway, key)
+    assert gateway.delete("credential", "gw:cred:c1").status_code == 204
+    assert gateway.delete("user", "gw:user:g1").status_code == 204
+    user = _replay(gateway, "user", "gw:user:g1")
+    assert user.status_code == 409 and user.json() == {"detail": "user_revoked"}
+    assert _replay(gateway, "credential", "gw:cred:c1").status_code == 409
+    assert gateway.tool(key, "list_datasources").status_code in {401, 403}
+    # lifting the tombstones is explicit, and alone it grants nothing
+    reinstated = gateway.client.post(
+        "/admin/ext/sync/user/gw:user:g1/reinstate", headers={"X-ADG-API-Key": gateway.admin}
+    )
+    assert reinstated.json() == {"reinstated": True}
+    assert gateway.tool(key, "list_datasources").status_code in {401, 403}

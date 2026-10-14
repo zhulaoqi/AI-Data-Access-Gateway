@@ -40,6 +40,8 @@ class RevocationCache:
         self._hashes: set[str] = set()
         self._version: int | None = None
         self._next_due = 0.0
+        self._started = clock()
+        self._last_success: float | None = None
         self._lock = threading.Lock()
         self._refreshing = threading.Lock()
         self.on_new: Callable[[set[str]], None] | None = None
@@ -47,6 +49,13 @@ class RevocationCache:
     @property
     def enabled(self) -> bool:
         return bool(self._url)
+
+    def poll_age_seconds(self) -> float:
+        """Seconds since the last successful pull (since creation when there was none yet)."""
+
+        with self._lock:
+            reference = self._last_success if self._last_success is not None else self._started
+        return max(0.0, self._clock() - reference)
 
     def is_revoked(self, key_hash: str) -> bool:
         if not self.enabled:
@@ -92,6 +101,8 @@ class RevocationCache:
                     self._version = int(data["version"]) if "version" in data else self._version
                 if not data.get("hasMore"):
                     break
+            with self._lock:
+                self._last_success = self._clock()
             self._next_due = self._clock() + self._ttl
         except Exception as error:
             logger.warning("revocation refresh failed: %s", type(error).__name__)

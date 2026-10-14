@@ -47,12 +47,62 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 - 测试：`tests/ext/test_ext_audit_query.py`（SQLite）；`tests/ext_integration/test_extint_audit.py`
   （真实 MySQL 8.4 查询产生的审计行，并把同一套单测在 MySQL 控制面库上重跑，使用库 `adg_audit_cp`）。
 
+## 2.2 Prometheus 指标（`/admin/ext/metrics/prometheus`）
+
+`GET /admin/ext/metrics/prometheus`，文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）。复用
+`require_ext_admin`：只允许 `admin` 作用域密钥（`runtime`/`entry` 403，无密钥 401），并受
+`ADG_EXT_ADMIN_ALLOWED_CIDRS` 约束；`ADG_EXT_ENABLED=false` 时不挂载（404）。原 JSON 端点
+`GET /admin/ext/metrics` 保持不变（键与含义都不变）。纯标准库实现（`src/adg_ext/metrics.py`，环境里没有
+`prometheus_client`，未新增依赖）。
+
+| 指标 | 类型 | 标签 | 说明 |
+|---|---|---|---|
+| `adg_ext_query_total` | counter | `outcome` = `completed`/`failed`/`timeout`/`cancelled`/`rejected` | 受管查询按结果计数；五个取值启动即为 0。`rejected` 含 Guard、权限、准入、`audit_unavailable` 拒绝；`failed` 是放行后执行失败（数据源不可用、连接器错误等） |
+| `adg_ext_query_rejected_total` | counter | `reason` | 拒绝原因码取**第一个冒号之前**的部分（`column_not_allowed:ssn` → `column_not_allowed`）；一次拒绝含多个原因码时每个各计一次；原因须匹配 `[a-z][a-z0-9_]{0,63}`，否则记为 `other`；至多 64 个不同取值，溢出并入 `other` |
+| `adg_ext_admission_wait_seconds` | histogram | `le` | 排队等待分布，桶 5ms…60s；放行的请求与等待后被拒（`queue_timeout`/`datasource_busy`/`revoked`）的请求都计入，`queue_full`/`circuit_open` 瞬时拒绝不计 |
+| `adg_ext_admission_datasource_limit` | gauge | `datasource` | 数据源并发上限（`ADG_EXT_DATASOURCE_MAX_CONCURRENCY`，全局同一值），覆盖所有出现过运行或熔断状态的数据源 |
+| `adg_ext_audit_unavailable_total` | counter | — | 因审计写入失败而拒绝的请求数（同时计入 `rejected`） |
+| `adg_ext_revocation_poll_age_seconds` | gauge | — | 距上次**成功**拉取吊销名单的秒数（从未成功则为进程内缓存创建后的秒数）；未配置 `ADG_EXT_REVOCATION_URL` 时不输出 |
+
+另输出与 exporter 同名的准入指标，exporter 可整体下线：`adg_ext_admission_queued`、
+`adg_ext_admission_running`、`adg_ext_admission_datasource_running{datasource}`、
+`adg_ext_admission_breaker_state{datasource}`、`adg_ext_admission_admitted_total`、
+`adg_ext_admission_rejected_total{reason}`、`adg_ext_admission_wait_seconds_avg`。**没有** `adg_ext_up`、
+`adg_ext_scrape_*`（抓取是否成功由 Prometheus 自带的 `up` 表示）。
+
+标签只来自封闭或有界集合：不含用户、SQL、密钥、错误信息；`datasource` 是执行器数据源 ID。计数器是进程内的，
+重启归零（Prometheus 的 `increase`/`rate` 会处理）。测试：`tests/ext/test_ext_metrics.py`（格式、标签、
+基数、直方图、吊销名单新鲜度、端点权限与 CIDR）、`tests/ext_integration/test_extint_metrics.py`
+（真实 MySQL：成功/拒绝/超时/取消/失败/审计不可用/排队拒绝后计数增加）。
+
+## 2.3 吊销「墓碑」与重放（K-3）
+
+同步 API 把已吊销的对象当作墓碑，**不靠新表**，直接用吊销后仍保留的原生行：
+
+- 凭证：被删除（`DELETE`）、随用户删除或在执行器侧吊销的 `ApiKey` 行保留（`status=revoked`）。对同一 `keyHash`
+  重放 `PUT credential`、或对一个已吊销凭证的同步对象改内容再 `PUT`，一律返回 **409**，响应体
+  `{"detail":"credential_revoked"}`，不恢复授权（原先是唯一约束冲突导致的 HTTP 500）。`keyHash` 被另一个仍有效的
+  凭证占用时返回 409 `key_hash_conflict`。
+- 用户：`DELETE user` 把用户置为 `disabled`（并清掉角色与授权参数）。对其重放 `PUT user` 返回 409
+  `user_revoked`；因此「删除后重放 user + credential」不再恢复授权（此前 `PUT user` 会把用户重新置为 `active`）。
+- 显式解除：`POST /admin/ext/sync/{user|credential}/{name}/reinstate`（admin 范围）→ `{"reinstated": true|false}`，
+  幂等。用户：恢复为 `active` 但**不带角色**（什么都不授予，之后需正常 `PUT user`）；凭证：把已吊销行的 `key_hash`
+  改成不可匹配的 `retired:<id>`，释放唯一键，之后才能用同一摘要创建**新**凭证（管理服务吊销名单里的该摘要仍会让
+  认证失败）。
+- 哈希未变的 `PUT` 仍沿用幂等短路（返回 200、不执行任何处理），因此不会恢复授权，但也不会报 409。
+
+管理服务一侧的影响：对这些 409 按 `executor-admin.md` §5「其他 4xx → 该对象失败，指数退避重试」处理，会持续重试直到对象被
+管理服务自己删除；如需要「重新启用同一授权」，必须先调用 `reinstate`。测试：
+`tests/ext/test_ext_sync_tombstone.py`、`tests/ext_integration/test_extint_runtime.py`
+（`test_k3_*`、`test_replaying_user_and_credential_after_a_delete_*`）。
+
 ## 3. 安全不变量
 
 - 行过滤基于解析后的 AST 注入，参数为带类型的字面量；注入后会二次 `verify`，任何不确定均拒绝（fail-closed）。
 - 无法重新解析的改写结果、`LIMIT … BY`、`WITH ROLLUP/TOTALS`、`INTO OUTFILE`、表函数、系统库等均被拒绝。
 - 审计在执行前提交；写入失败则拒绝执行（`audit_unavailable`）。
-- 日志与响应不包含管理 Key、明文凭据、数据库密码。
+- 日志与响应不包含管理 Key、明文凭据、数据库密码；Prometheus 标签不含用户、SQL、密钥（见 2.2）。
+- 已吊销的凭证与已删除的用户不会被同步重放恢复，须显式 `reinstate`（见 2.3）。
 
 ## 4. 已知限制
 
