@@ -14,7 +14,7 @@ dependencies = [
   "alembic>=1.13.2",
   "cryptography>=42.0.0",
   "fastapi>=0.115.0",
-  "mcp>=1.27.0",
+  "mcp>=1.27.0,<2",
   "pydantic-settings>=2.4.0",
   "sqlalchemy>=2.0.32",
   "sqlglot>=25.24.5",
@@ -25,8 +25,9 @@ dependencies = [
 postgres = ["psycopg[binary]>=3.2.1"]
 mysql = ["pymysql>=1.1.1"]
 doris = ["pymysql>=1.1.1"]
+clickhouse = ["clickhouse-connect>=0.8.0"]
 redis = ["redis>=5.0.0"]
-all = ["psycopg[binary]>=3.2.1", "pymysql>=1.1.1", "redis>=5.0.0"]
+all = ["psycopg[binary]>=3.2.1", "pymysql>=1.1.1", "redis>=5.0.0", "clickhouse-connect>=0.8.0"]
 dev = [
   "httpx>=0.27.2",
   "mypy>=1.11.2",
@@ -40,7 +41,7 @@ adg-api = "adg.app.main:run"
 init-admin = "adg.control_plane.bootstrap:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/adg"]
+packages = ["src/adg", "src/adg_ext"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -59,3 +60,7 @@ python_version = "3.12"
 strict = true
 warn_unused_configs = true
 plugins = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/ext/*" = ["E501"]
+"tests/regression/*" = ["E501"]
