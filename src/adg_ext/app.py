@@ -13,7 +13,7 @@ from adg_ext.clickhouse import ClickHouseConnector
 from adg_ext.config import get_ext_settings
 from adg_ext.mysql_scoped import ScopedMySqlConnector
 from adg_ext.pipeline import get_admission
-from adg_ext.router import admin_router, delegated_router
+from adg_ext.router import admin_router, audit_router, delegated_router
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     registry.register("clickhouse", ClickHouseConnector)
     registry.register("mysql", ScopedMySqlConnector)
     app.include_router(admin_router)
+    app.include_router(audit_router)
     app.include_router(delegated_router)
 
     cache = revocation.get_cache()

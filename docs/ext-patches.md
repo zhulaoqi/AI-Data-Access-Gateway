@@ -1,7 +1,7 @@
 # SQL Gateway 扩展补丁（`adg_ext`）说明
 
 本 fork 在上游 ADG 之上叠加 SQL Gateway 所需的能力（行级过滤、方言感知校验、准入控制、
-ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询）。所有新增逻辑都在
+ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询、审计查询）。所有新增逻辑都在
 `src/adg_ext/` 内，对上游源码只有最小的“钩子”修改。总开关：`ADG_EXT_ENABLED`（默认 `false`；
 关闭时行为与上游一致，上游测试套件全量通过）。环境变量前缀 `ADG_EXT_`。
 
@@ -21,6 +21,9 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 | `src/adg/sql_guard/guard.py` | `SqlGuard(dialect=…)` | 按方言解析/生成 SQL |
 | `tests/integration/test_migrations.py` | 迁移链期望值 | 新增一条迁移 |
 
+新增的审计查询（PA-7）没有改动任何上游文件：`src/adg_ext/audit_query.py` 与 `router.py` 里的
+`audit_router`（`/ext/audit/*`），由 `adg_ext.app.install` 挂载，因此扩展关闭时不暴露。
+
 ## 2. 同步上游的步骤
 
 1. `git fetch upstream && git checkout sqlgw/main && git merge upstream/main`（或 rebase）。
@@ -30,6 +33,19 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 4. `.venv/bin/ruff check|format` 与 `.venv/bin/mypy` 只作用于 `src/adg_ext`、`tests/ext*`，
    不要格式化上游目录。
 5. 升级 `sqlglot`/`mcp` 时必须重新跑 B 系列回归（`tests/regression/test_ext_bypass_regression.py`）。
+
+## 2.1 审计查询接口（PA-7）
+
+`GET /ext/audit/events`、`GET /ext/audit/events/{id}`、`GET /ext/audit/stats`，`admin` 作用域（复用
+`require_ext_admin`：`runtime`/`entry` 密钥 403，并受 `ADG_EXT_ADMIN_ALLOWED_CIDRS` 约束）。契约、字段与错误码见
+`sql-gateway/api/executor-admin.md` §9。实现要点：
+
+- 全部过滤在 SQL 层完成；`table`、`reason`、`status` 的 `LIKE` 只用转义后的输入（转义符 `!`，`%`、`_` 与转义符本身都被转义）。
+- `grantIds` 以授权 ID 传入，经 `User.external_ref = gw:user:<id>` 映射到审计的 `user_id`；响应 `grantId` 反向映射。
+- 时间窗口默认最近 24 小时、最长 93 天；`limit` 默认 50、上限 200；`offset` 上限 10000；越界返回 422。
+- 列表永不含 SQL；详情含 `sqlText`/`rewrittenSql`/`accessedFields`，每次成功读取经 `AuditService.record_sql_view` 写 `audit_sql_view`。
+- 测试：`tests/ext/test_ext_audit_query.py`（SQLite）；`tests/ext_integration/test_extint_audit.py`
+  （真实 MySQL 8.4 查询产生的审计行，并把同一套单测在 MySQL 控制面库上重跑，使用库 `adg_audit_cp`）。
 
 ## 3. 安全不变量
 
@@ -45,3 +61,4 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 - 未实现 StarRocks resource group classifier。
 - 字符串字面量中的 `:name` 会被 `text()` 当作绑定参数，结果是失败关闭。
 - 有效行数上限受 `runtime_query_max_limit`（默认 1000）约束。
+- 审计查询的 `table`、`status` 过滤使用 `LIKE`，不走索引，依赖时间窗口先行（≤93 天）与 `offset` 上限控制成本。

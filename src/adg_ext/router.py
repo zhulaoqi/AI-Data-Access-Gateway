@@ -1,4 +1,4 @@
-"""HTTP surface of the extension: sync and dry-run (admin scope), delegated queries (entry)."""
+"""HTTP surface of the extension: sync, dry-run and audit queries (admin), delegated (entry)."""
 
 from typing import Annotated, Any
 
@@ -14,6 +14,7 @@ from adg.app.dependencies import (
 )
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
+from adg_ext import audit_query
 from adg_ext.config import get_ext_settings
 from adg_ext.delegated import DelegatedError, run_delegated
 from adg_ext.dryrun import dry_run
@@ -51,6 +52,9 @@ admin_router = APIRouter(
     prefix="/admin/ext", tags=["ext"], dependencies=[Depends(require_ext_admin)]
 )
 delegated_router = APIRouter(prefix="/ext/delegated", tags=["ext"])
+audit_router = APIRouter(
+    prefix="/ext/audit", tags=["ext"], dependencies=[Depends(require_ext_admin)]
+)
 
 
 def _fail(error: ExtSyncError) -> HTTPException:
@@ -136,3 +140,66 @@ def cancel_delegated_query(
 ) -> dict[str, int]:
     del key
     return {"cancelled": get_admission().revoke(f"req:{request_id}")}
+
+
+def _audit_fail(error: audit_query.AuditQueryError) -> HTTPException:
+    return HTTPException(status_code=error.status, detail=error.reason)
+
+
+@audit_router.get("/events")
+def list_audit_events(
+    session: Annotated[Session, Depends(get_session)],
+    grant_ids: Annotated[list[str] | None, Query(alias="grantIds")] = None,
+    from_: Annotated[str | None, Query(alias="from")] = None,
+    to: Annotated[str | None, Query()] = None,
+    decision: Annotated[str | None, Query()] = None,
+    status_: Annotated[str | None, Query(alias="status")] = None,
+    table: Annotated[str | None, Query()] = None,
+    reason: Annotated[str | None, Query()] = None,
+    query_id: Annotated[str | None, Query(alias="queryId")] = None,
+    event_type: Annotated[str | None, Query(alias="eventType")] = None,
+    datasource_id: Annotated[str | None, Query(alias="datasourceId")] = None,
+    limit: Annotated[int | None, Query()] = None,
+    offset: Annotated[int, Query()] = 0,
+) -> dict[str, Any]:
+    try:
+        page_limit, page_offset = audit_query.check_page(limit, offset)
+        filters = audit_query.build_filters(
+            start=from_,
+            end=to,
+            grant_ids=grant_ids,
+            datasource_id=datasource_id,
+            decision=decision,
+            status=status_,
+            table=table,
+            reason=reason,
+            query_id=query_id,
+            event_type=event_type,
+        )
+        return audit_query.list_events(session, filters, page_limit, page_offset)
+    except audit_query.AuditQueryError as error:
+        raise _audit_fail(error) from error
+
+
+@audit_router.get("/events/{event_id}")
+def get_audit_event(
+    event_id: str,
+    key: Annotated[AuthenticatedApiKey, Depends(require_ext_admin)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict[str, Any]:
+    try:
+        return audit_query.event_detail(session, event_id, api_key_id=key.id, user_id=key.user_id)
+    except audit_query.AuditQueryError as error:
+        raise _audit_fail(error) from error
+
+
+@audit_router.get("/stats")
+def audit_stats(
+    session: Annotated[Session, Depends(get_session)],
+    from_: Annotated[str | None, Query(alias="from")] = None,
+    to: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
+    try:
+        return audit_query.stats(session, from_, to)
+    except audit_query.AuditQueryError as error:
+        raise _audit_fail(error) from error

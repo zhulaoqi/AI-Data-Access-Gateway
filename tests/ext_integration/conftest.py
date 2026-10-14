@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from adg.app.auth_rate_limit import reset_auth_rate_limiter
 from adg.app.main import create_app
 from adg.app.settings import get_settings
 from adg.connectors.registry import get_connector_registry
@@ -157,6 +158,7 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
     get_ext_settings.cache_clear()
     pipeline.reset_admission()
     revocation.reset_cache()
+    reset_auth_rate_limiter()  # refused-key requests must not lock out tests that run later
 
 
 ProvisionFn = Callable[..., str]

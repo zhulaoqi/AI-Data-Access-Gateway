@@ -11,3 +11,6 @@ def test_nothing_of_the_extension_is_exposed_when_disabled(
     assert client.post("/admin/ext/dry-run", json={}).status_code == 404
     assert client.get("/admin/ext/sync/role").status_code == 404
     assert client.post("/ext/delegated/query", json={}).status_code == 404
+    assert client.get("/ext/audit/events").status_code == 404
+    assert client.get("/ext/audit/events/x").status_code == 404
+    assert client.get("/ext/audit/stats").status_code == 404
