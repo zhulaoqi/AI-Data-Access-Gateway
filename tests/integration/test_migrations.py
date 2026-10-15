@@ -171,6 +171,7 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202606090001_datasource_descriptions.py",
         "202606110001_resource_policy_datasource_scope.py",
         "202610140001_ext_tables.py",
+        "202610150001_widen_audit_query_id_and_ext_columns.py",
     ]
 
     revisions: dict[str, tuple[str, str | None]] = {}
@@ -202,4 +203,8 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
             "202606090001",
         ),
         "202610140001_ext_tables.py": ("202610140001", "202606110001"),
+        "202610150001_widen_audit_query_id_and_ext_columns.py": (
+            "202610150001",
+            "202610140001",
+        ),
     }

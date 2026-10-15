@@ -132,8 +132,11 @@ class Gateway:
         return self.client.post(f"/api/tools/{name}", json=payload, headers={"X-ADG-API-Key": key})
 
 
-@pytest.fixture
-def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> Iterator[Gateway]:
+def _gateway(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, *, create_schema: bool = True
+) -> Iterator[Gateway]:
+    """An ADG app with the extension enabled on ``engine`` (schema already there or created)."""
+
     monkeypatch.setenv("ADG_EXT_ENABLED", "true")
     monkeypatch.setenv("ADG_DATASOURCE_NETWORK_ALLOWLIST", "127.0.0.1")
     monkeypatch.setenv("ADG_RUNTIME_QUERY_MAX_LIMIT", "1000")
@@ -142,8 +145,8 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
     pipeline.reset_admission()
     revocation.reset_cache()
     kdf_cache.reset_kdf_cache()
-    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'cp.db'}")
-    Base.metadata.create_all(engine)
+    if create_schema:
+        Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     admin = "adg_admin_test_key"
     with factory() as session:
@@ -161,6 +164,59 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> I
     revocation.reset_cache()
     kdf_cache.reset_kdf_cache()
     reset_auth_rate_limiter()  # refused-key requests must not lock out tests that run later
+
+
+@pytest.fixture
+def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engines: None) -> Iterator[Gateway]:
+    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'cp.db'}")
+    yield from _gateway(engine, monkeypatch)
+
+
+MYSQL_CONTROL_DB = "adg_cp_e2e"
+MYSQL_CONTROL_URL = (
+    f"mysql+pymysql://root:rootpw@{MYSQL[0]}:{MYSQL[1]}/{MYSQL_CONTROL_DB}?charset=utf8mb4"
+)
+
+
+def fresh_mysql_database(name: str) -> None:
+    """Drop and recreate one control-plane database on the shared MySQL container."""
+
+    conn = mysql_conn()
+    with conn.cursor() as c:
+        c.execute(f"DROP DATABASE IF EXISTS `{name}`")
+        c.execute(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4")
+    conn.close()
+
+
+def alembic_upgrade(url: str, revision: str = "head") -> None:
+    """Run the real migration chain (what the Helm chart and production run) against ``url``."""
+
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config()  # no ini file: env.py would call fileConfig() and silence every other logger
+    config.set_main_option("script_location", str(ROOT / "src/adg/control_plane/migrations"))
+    config.set_main_option("sqlalchemy.url", url)
+    get_settings.cache_clear()
+    command.upgrade(config, revision)
+
+
+@pytest.fixture
+def gateway_mysql(monkeypatch: pytest.MonkeyPatch, engines: None) -> Iterator[Gateway]:
+    """The gateway with a **MySQL control plane** whose schema comes from ``alembic upgrade head``.
+
+    This is the production shape (the Helm chart's only mode): strict SQL mode, utf8mb4, the
+    migrated column widths. SQLite does not enforce ``String(n)``, so only this fixture catches an
+    identifier that is longer than its column.
+    """
+
+    fresh_mysql_database(MYSQL_CONTROL_DB)
+    alembic_upgrade(MYSQL_CONTROL_URL)
+    engine = create_engine_from_url(MYSQL_CONTROL_URL)
+    try:
+        yield from _gateway(engine, monkeypatch, create_schema=False)
+    finally:
+        engine.dispose()
 
 
 ProvisionFn = Callable[..., str]

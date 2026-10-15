@@ -22,7 +22,9 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 | `src/adg/control_plane/models/__init__.py` | 导入 `adg_ext.models` | `ext_*` 表共用元数据 |
 | `src/adg/control_plane/migrations/versions/202610140001_ext_tables.py` | 新增迁移 | `ext_*` 表（关闭补丁时也无害） |
 | `src/adg/sql_guard/guard.py` | `SqlGuard(dialect=…)` | 按方言解析/生成 SQL |
-| `tests/integration/test_migrations.py` | 迁移链期望值 | 新增一条迁移 |
+| `src/adg/control_plane/migrations/versions/202610150001_widen_audit_query_id_and_ext_columns.py` | 新增迁移 | `audit_events.query_id` 36→64 等（2.7） |
+| `src/adg/audit/models.py` | `query_id` 改为 `String(64)`；`sql_text`/`metadata_json`/`resource_ids_json` 在 MySQL 上用 MEDIUMTEXT（`LargeText`） | 与迁移一致，`create_all` 路径同样生效（2.7） |
+| `tests/integration/test_migrations.py` | 迁移链期望值 | 新增两条迁移 |
 
 新增的审计查询（PA-7）没有改动任何上游文件：`src/adg_ext/audit_query.py` 与 `router.py` 里的
 `audit_router`（`/ext/audit/*`），由 `adg_ext.app.install` 挂载，因此扩展关闭时不暴露。
@@ -253,6 +255,69 @@ PBKDF2**：API Key 是 `SHA-256(key)` 的索引查找，委托路径只做 `ext_
 `maybe`）会让启动失败，而不是静默打开。开发环境需要时设为 `true`。`ADG_EXT_ENABLED=false` 时保持上游行为（页面可用）。
 入口代理的路径白名单仍然是第二道防线（部署侧不应因此放松）。测试：`tests/ext/test_ext_docs.py`。
 
+## 2.7 MySQL 控制库：列长度（`audit_events.query_id` 缺陷）与长度检查清单
+
+**根因。** 审计表 `audit_events.query_id` 是 `String(36)`，而查询 ID 是 `qry_<uuid4>`（**40 字符**，`pipeline.py` 与上游
+`tools.py` 都这样生成）。SQLite 不校验 `String(n)`，所有现有测试都跑在 SQLite 控制库上，所以没暴露；MySQL（严格模式，
+Helm Chart 与生产的唯一模式）对 `INSERT` 返回 `Data too long for column 'query_id'`，放行后的「开始」审计行写不进去，
+审计 fail-closed 把每条查询拒绝为 `audit_unavailable`（入口侧表现为 `audit_unavailable`）。
+
+**修复（迁移 `202610150001`，接在 `202610140001` 之后）。** `batch_alter_table` 只放大，已有数据不动：
+
+| 列 | 之前 | 之后 | 说明 |
+|---|---|---|---|
+| `audit_events.query_id` | `VARCHAR(36)` | `VARCHAR(64)` | 与 `decrypt_contexts.query_id` 同宽；索引 `ix_audit_events_query_id` 保留 |
+| `ext_sync_objects.external_id` | `VARCHAR(64)` | `VARCHAR(256)` | row_filter 的外部 ID 就是对象名 |
+| MySQL 专属：`audit_events.{resource_ids_json, sql_text, metadata_json}`、`ext_sync_objects.spec_json`、`ext_role_tables.{allow,deny,mask}_json`、`ext_row_filter_policies.{where_text, params_json}`、`ext_user_attributes.params_json` | `TEXT`（64 KB） | `MEDIUMTEXT`（16 MB） | 随语句/同步规格增长：审计行把 SQL 记两遍（原文 + 改写）；大角色规格（数百张表）轻易超过 64 KB |
+
+- SQLite 没有 `ALTER COLUMN`，alembic 批处理模式重建表（索引与唯一约束随反射重建）；MySQL 直接 `MODIFY`。
+  MEDIUMTEXT 只在 MySQL 上执行（其它方言 TEXT 无上限问题）。模型同步修改（`adg.audit.models.LargeText`），所以
+  `Base.metadata.create_all`（上游测试/开发）与 `alembic upgrade head`（生产）得到同一份结构，有测试逐表逐列比对。
+- 升级路径：空库 → head；旧版本（`202604260001`、`202610140001`）带数据 → head（行与索引保留）；`downgrade -1` 后再 `upgrade head`；
+  重复 `upgrade head` 是空操作。`downgrade` 会把列收回去，MySQL 严格模式下若已有更长的值会报错拒绝（不静默截断）。
+- **运维**：utf8mb4 下 `VARCHAR` 超过 255 字节（64×4=256）要改长度前缀，MySQL 对 `audit_events` 只能 `ALGORITHM=COPY`（建表拷贝，期间
+  阻塞写入）。缺陷存在期间 MySQL 上不会有任何带 `query_id` 的行，表通常很小；Helm Chart 在 initContainer 里跑
+  `alembic upgrade head`（滚动升级时旧 Pod 仍在服务），大表应先单独跑一次迁移。执行器镜像必须重建（迁移与模型都在镜像里）。
+  kind 验证时手工执行过的 `ALTER TABLE audit_events MODIFY query_id VARCHAR(64) NULL` 与本迁移等价：之后再跑迁移是空操作（有测试）。
+- **索引**：`query_id` 只做精确匹配（`=`，没有 `LIKE`），索引是整列索引：64×4=256 字节，远低于 InnoDB 的 3072 字节上限，
+  不需要前缀索引；测试用 `EXPLAIN` 确认 `queryId` 过滤走 `ix_audit_events_query_id`。`requestId`/`channel` 仍是元数据 `LIKE`（见 2.1）。
+
+**同类问题的全面检查（逐列对照实际生成值）。** 方法：遍历所有模型（上游 + `ext_*`）的字符串列，与代码实际能写入的最长值对照；
+结论落在「入口校验」或「放大列」，测试里用代码自己的常量（`sync.MAX_NAME` 等）构造最长值，常量与列宽脱节会失败。
+
+| 表.列（宽度） | 实际会写入的值 | 结论 |
+|---|---|---|
+| `audit_events.query_id`（36→64） | `qry_<uuid4>` = 40 | **修复（迁移）** |
+| `audit_events.id/api_key_id/datasource_id`（36）、`user_id`（200） | uuidv7 = 36 | 足够 |
+| `audit_events.event_type`（64）、`decision`（32） | `query_execution`、`permission_rejected` 等 ≤ 19；`allowed/denied/error/rejected` | 足够 |
+| `audit_events.sql_text/metadata_json/resource_ids_json`（TEXT 64 KB） | 语句 + 改写语句 + 字段列表，随语句增长 | **MySQL 改 MEDIUMTEXT**（测试写入 >100 KB 的语句） |
+| `decrypt_contexts.query_id`（64） | 40 | 足够（上游已是 64） |
+| `users.external_ref`（200，唯一） | `gw:user:<grantId>` ≤ `MAX_NAME` | **入口校验**：`MAX_NAME` 由 256 改为 200，超出 400（见下） |
+| `users.name`（200） | `principalName`（任意长） | **代码截断**到 200（仅展示） |
+| `roles.name`（200，唯一）、`datasources.name`（200）、`api_keys.name`（200） | `gw:role:…`、`gw:ds:…`、`gw:cred:…` ≤ `MAX_NAME` | **入口校验**同上 |
+| `api_keys.key_hash`（128） | SHA-256 = 64；墓碑 `retired:<id>` = 44 | 足够 |
+| `roles.description`、`datasources.description`（TEXT） | `profileName`、`label`（任意长） | **代码截断**到 4000（`MAX_DESCRIPTION`） |
+| `resources.name/display_name`（200）、`path`（512） | 扫描到的库/表名；`db.table` | **`fit_snapshot`**：放不下的条目不入目录（不可查询，日志告警）；MySQL/Doris ≤ 64，只会出现在 ClickHouse |
+| `resource_fields.name`（200）、`data_type`（200） | 列名；ClickHouse `Enum8(…)`/`Tuple(…)` 可很长 | 列名过长的列不入目录；`data_type` 截断到 200（仅展示） |
+| `resources.description`、`resource_fields.description`（TEXT） | 库内注释 | 截断到 4000 |
+| `masking_policies.field_name`（200）、`subject_id`（200） | 必须是已扫描列名（≤200）；`role.id` = 36 | 足够 |
+| `resource_policies.subject_id/subject_type/action`（200/32/64） | `role.id`、`role`、`read` | 足够 |
+| `ext_sync_objects.name`（256）、`object_type`（32）、`hash`（64） | ≤ 200；`TYPES` 最长 18；校验为 64 | 足够 |
+| `ext_sync_objects.external_id`（64→256） | row_filter：对象名（≤200）；其余 id = 36 | **修复（迁移）** |
+| `ext_sync_objects.spec_json`、`ext_role_tables.*_json`、`ext_row_filter_policies.*`、`ext_user_attributes.params_json`（TEXT） | 整份规格、允许/禁止列表、模板 | **MySQL 改 MEDIUMTEXT** |
+| `ext_*` 里的外键 id 列（36） | uuidv7 | 足够 |
+| `request_id`（元数据 JSON，不是列；`delegated.MAX_REQUEST_ID` = 200） | ≤ 200 | 随 `metadata_json` 一起进 MEDIUMTEXT；测试用 200 字符的 `requestId` 走完整委托查询 |
+| 上游其它表（`org_nodes`、`tags`、`*_tags`、`field_policies`） | 只由上游管理接口写入，扩展不写 | 未改动 |
+
+- **不改的上游列**：为了不扩大冲突面，没有加宽 `users.external_ref` 等上游列，而是在入口把上限收到 200。这是对外契约的收紧
+  （见 `sql-gateway/api/executor-admin.md` §4 的字段长度说明）：此前 201–256 字符的名字在这些类型上本来就会在库里失败。
+- **仍可能超长、但不现实的值**：`datasources.config_json`（加密后的 host/账号/口令，TEXT）若总计 >64 KB；`audit_events.reason`（错误码，TEXT）。
+- **测试**（`tests/ext_integration`，真实 MySQL 8.4）：
+  `test_extint_mysql_controlplane.py`（运行时 + 委托查询 + 拒绝路径，控制库为 MySQL，结构由 `alembic upgrade head` 建；
+  修复前稳定得到 `audit_unavailable`）、`test_extint_column_lengths.py`（最长值逐列写入、alembic/`create_all` 两种建表结构一致、
+  >64 KB 语句的审计行、200 字符名字走完整同步与委托查询、索引与 `EXPLAIN`）、`test_extint_migrations.py`（SQLite 与 MySQL 上的升级路径；
+  旧结构上 40 字符 `query_id` 确实被 MySQL 拒绝）；`tests/ext/test_ext_sync_limits.py`（名字上限、`fit_snapshot`）。
+
 ## 3. 安全不变量
 
 - 行过滤基于解析后的 AST 注入，参数为带类型的字面量；注入后会二次 `verify`，任何不确定均拒绝（fail-closed）。
@@ -281,3 +346,9 @@ PBKDF2**：API Key 是 `SHA-256(key)` 的索引查找，委托路径只做 `ext_
 - PBKDF2 缓存按进程；每个新进程每个数据源账号首次查询仍付一次派生。
 - 同一数据库账号被多个数据源共用时，它们共享运行时连接池（缓存键是连接 URL），有效并发上限按单个数据源计算，不按池的使用者数。
 - 审计查询的 `table`、`status` 过滤使用 `LIKE`，不走索引，依赖时间窗口先行（≤93 天）与 `offset` 上限控制成本。
+- MySQL 控制库的 `audit_events.created_at` 是秒精度（`DATETIME`）：MySQL 对小数秒**四舍五入**，后半秒写入的行会存成「下一秒」，
+  即晚于默认窗口终点（`now`）。因此紧接着查询之后、不带 `to` 的审计列表可能暂时看不到它（下一秒起可见）。`to` 取稍晚的时间即可，
+  对账按 `requestId` 重试一次也行；集成测试里显式传了 `to`。
+- 迁移里对 `audit_events` 的改列在 MySQL 上是整表拷贝（2.7），大表应在低峰、放流量前执行。
+- 控制库为 PostgreSQL 的路径使用同一迁移（`batch_alter_table`），**未在真实 PostgreSQL 上验证**。
+- 基线迁移给 `datasource_tags`/`resource_tags` 多建了一个 UNIQUE 索引而模型没有（上游既有差异，与扩展无关），结构一致性测试对这两张表只要求「迁移 ⊇ 模型」。

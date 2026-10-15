@@ -55,7 +55,85 @@ _MASK_STRATEGIES = {
     "partial": ("partial", {"prefix": 2, "suffix": 2, "fill": "*"}),
     "null": ("null", {}),
 }
-MAX_NAME = 256
+# Object names land in the native columns ``datasources.name``, ``roles.name``,
+# ``users.external_ref`` and ``api_keys.name`` (all ``String(200)``); a longer name used to fail
+# deep in the database ("Data too long" on MySQL), now it is refused up front with a 400.
+MAX_NAME = 200
+MAX_IDENT = 200  # resources.name / display_name, resource_fields.name / data_type
+MAX_PATH = 512  # resources.path
+MAX_DESCRIPTION = 4000  # free text kept as a display label (TEXT is 64 KB on MySQL)
+
+
+def _fit_description(payload: dict[str, Any]) -> dict[str, Any]:
+    description = payload.get("description")
+    if isinstance(description, str) and len(description) > MAX_DESCRIPTION:
+        return {**payload, "description": description[:MAX_DESCRIPTION]}
+    return dict(payload)
+
+
+def fit_snapshot(snapshot: Any, datasource: str) -> dict[str, Any]:
+    """Make a scanned catalog fit the control-plane columns instead of failing the whole sync.
+
+    A column ``data_type`` (a ClickHouse ``Enum``/``Tuple`` can be very long) is only displayed, so
+    it is truncated. A database, schema, table or column whose name (or table path) is longer than
+    its column cannot be stored; it is left out of the catalog, which makes it unqueryable (fail
+    closed), and the omission is logged. MySQL/Doris identifiers are at most 64 characters, so
+    this only ever concerns ClickHouse.
+    """
+
+    dropped: list[str] = []
+
+    def fits(name: str, path: str) -> bool:
+        return len(name) <= MAX_IDENT and len(path) <= MAX_PATH
+
+    def relations(container: dict[str, Any], parent_path: str) -> dict[str, Any]:
+        out = _fit_description(container)
+        for key in ("tables", "views"):
+            kept: list[dict[str, Any]] = []
+            for relation in container.get(key) or []:
+                name = str(relation["name"])
+                path = f"{parent_path}.{name}"
+                if not fits(name, path):
+                    dropped.append(path[:80])
+                    continue
+                columns: list[dict[str, Any]] = []
+                for column in relation.get("columns") or []:
+                    if len(str(column["name"])) > MAX_IDENT:
+                        dropped.append(f"{path}.{str(column['name'])[:40]}")
+                        continue
+                    data_type = str(column.get("data_type", ""))[:MAX_IDENT]
+                    columns.append({**_fit_description(column), "data_type": data_type})
+                kept.append({**_fit_description(relation), "columns": columns})
+            if key in container:
+                out[key] = kept
+        return out
+
+    databases: list[dict[str, Any]] = []
+    for database in snapshot.get("databases") or []:
+        db_name = str(database["name"])
+        if not fits(db_name, db_name):
+            dropped.append(db_name[:80])
+            continue
+        fitted = relations(database, db_name)
+        if "schemas" in database:
+            schemas: list[dict[str, Any]] = []
+            for schema in database.get("schemas") or []:
+                schema_path = f"{db_name}.{schema['name']}"
+                if not fits(str(schema["name"]), schema_path):
+                    dropped.append(schema_path[:80])
+                    continue
+                schemas.append(relations(schema, schema_path))
+            fitted["schemas"] = schemas
+        databases.append(fitted)
+    if dropped:
+        logger.warning(
+            "datasource %s: %d catalog entries exceed the control-plane column widths and are "
+            "not exposed (first: %s)",
+            datasource,
+            len(dropped),
+            dropped[0],
+        )
+    return {**snapshot, "databases": databases}
 
 
 class ExtSyncError(Exception):
@@ -174,7 +252,9 @@ class SyncService:
         if object_type not in TYPES:
             raise ExtSyncError(404, "unknown object type")
         if not name.startswith(PREFIX) or len(name) > MAX_NAME:
-            raise ExtSyncError(400, "object names must start with gw:")
+            raise ExtSyncError(
+                400, f"object names must start with gw: and be at most {MAX_NAME} characters"
+            )
 
     def _find(self, object_type: str, name: str) -> ExtSyncObject | None:
         return self._s.execute(
@@ -215,13 +295,13 @@ class SyncService:
                 name=name,
                 connector_type=connector_type,
                 config=config,
-                description=str(spec.get("label") or ""),
+                description=str(spec.get("label") or "")[:MAX_DESCRIPTION],
             )
         else:
             service.update_datasource(
                 datasource_id=datasource.id,
                 name=name,
-                description=str(spec.get("label") or ""),
+                description=str(spec.get("label") or "")[:MAX_DESCRIPTION],
                 description_provided=True,
                 status="active",
                 config=config,
@@ -231,7 +311,9 @@ class SyncService:
         try:
             connector = self._registry.create(connector_type)
             snapshot = connector.scan_metadata(datasource.config())
-            MetadataScanService(self._s).replace_snapshot(datasource=datasource, snapshot=snapshot)
+            MetadataScanService(self._s).replace_snapshot(
+                datasource=datasource, snapshot=fit_snapshot(snapshot, name)
+            )
         except (ConnectorDependencyError, ConnectorOperationError) as error:
             raise ExtSyncError(409, f"cannot scan datasource {name}: {error}") from error
         return datasource.id
@@ -280,7 +362,8 @@ class SyncService:
     def _put_role(self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None) -> str:
         role = self._s.execute(select(Role).where(Role.name == name)).scalar_one_or_none()
         if role is None:
-            role = Role(name=name, description=str(spec.get("profileName") or ""), status="active")
+            description = str(spec.get("profileName") or "")[:MAX_DESCRIPTION]
+            role = Role(name=name, description=description, status="active")
             self._s.add(role)
             self._s.flush()
         role.status = "active"
@@ -429,7 +512,8 @@ class SyncService:
         role_id = self._external_id("role", str(spec.get("role", "")), "role")
         user = self._s.execute(select(User).where(User.external_ref == name)).scalar_one_or_none()
         if user is None:
-            user = User(name=str(spec.get("principalName") or name), external_ref=name)
+            display = str(spec.get("principalName") or name)[:MAX_IDENT]  # cosmetic: users.name
+            user = User(name=display, external_ref=name)
             self._s.add(user)
         elif user.status != "active":
             # a deleted (disabled) grant stays dead until the tombstone is lifted explicitly

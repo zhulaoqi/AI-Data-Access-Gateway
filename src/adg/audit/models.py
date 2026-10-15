@@ -3,10 +3,16 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import DateTime, String, Text
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from adg.control_plane.models.base import Base
 from adg.shared.ids import uuidv7
+
+
+# MySQL TEXT holds 64 KB; a statement is recorded twice (original and rewritten) in the metadata,
+# so the columns that grow with the statement are MEDIUMTEXT (16 MB) there. Other dialects: TEXT.
+LargeText = Text().with_variant(mysql.MEDIUMTEXT(), "mysql")
 
 
 class AuditEvent(Base):
@@ -19,12 +25,13 @@ class AuditEvent(Base):
     api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     datasource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    resource_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    query_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    sql_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resource_ids_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="[]")
+    # `qry_<uuid4>` is 40 characters (was String(36): MySQL refused the row with "Data too long")
+    query_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    sql_text: Mapped[str | None] = mapped_column(LargeText, nullable=True)
     decision: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    metadata_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

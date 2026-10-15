@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
+from adg.audit.models import LargeText
 from adg.control_plane.models.base import Base
 from adg.shared.ids import uuidv7
 
@@ -23,9 +24,10 @@ class ExtSyncObject(Base):
     object_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    spec_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    spec_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
     # id of the native ADG object the spec was materialized into (datasource, role, user, key)
-    external_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # (or the object name itself for a row filter, which is up to 200 characters)
+    external_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now, onupdate=_now
     )
@@ -50,9 +52,9 @@ class ExtRoleTable(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuidv7)
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), nullable=False, index=True)
     resource_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    allow_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    deny_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    mask_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    allow_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="[]")
+    deny_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="[]")
+    mask_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
 
 
 class ExtRowFilterPolicy(Base):
@@ -64,8 +66,8 @@ class ExtRowFilterPolicy(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuidv7)
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), nullable=False, index=True)
     resource_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    where_text: Mapped[str] = mapped_column(Text, nullable=False)
-    params_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    where_text: Mapped[str] = mapped_column(LargeText, nullable=False)
+    params_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="[]")
 
 
 class ExtUserAttribute(Base):
@@ -74,4 +76,4 @@ class ExtUserAttribute(Base):
     __tablename__ = "ext_user_attributes"
 
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
-    params_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    params_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
