@@ -14,7 +14,7 @@ from adg.app.dependencies import (
 )
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
-from adg_ext import audit_query, revocation
+from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
 from adg_ext.config import get_ext_settings
 from adg_ext.delegated import DelegatedError, run_delegated
@@ -144,9 +144,23 @@ def metrics_prometheus() -> Response:
     """Prometheus text exposition (0.0.4); admin scope and ``ADG_EXT_ADMIN_ALLOWED_CIDRS`` apply."""
 
     body = metrics_text.render(
-        get_admission(), metrics_text.get_query_metrics(), revocation.get_cache()
+        get_admission(),
+        metrics_text.get_query_metrics(),
+        revocation.get_cache(),
+        blocklist.get_cache(),
     )
     return Response(content=body, media_type=metrics_text.CONTENT_TYPE)
+
+
+@admin_router.post("/blocklist/refresh")
+def refresh_blocklist(force: Annotated[bool, Query()] = False) -> dict[str, object]:
+    """Pull the blocklist now (``force`` accepts a snapshot the shrink guard would refuse)."""
+
+    cache = blocklist.get_cache()
+    if not cache.enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="blocklist_disabled")
+    updated = cache.refresh(force=force)
+    return {"updated": updated, "version": cache.version, "entries": cache.size()}
 
 
 @delegated_router.post("/query")
@@ -233,5 +247,19 @@ def audit_stats(
 ) -> dict[str, Any]:
     try:
         return audit_query.stats(session, from_, to)
+    except audit_query.AuditQueryError as error:
+        raise _audit_fail(error) from error
+
+
+@audit_router.get("/aggregates")
+def audit_aggregates(
+    session: Annotated[Session, Depends(get_session)],
+    group_by: Annotated[str, Query(alias="groupBy")],
+    from_: Annotated[str | None, Query(alias="from")] = None,
+    to: Annotated[str | None, Query()] = None,
+    near_percent: Annotated[int, Query(alias="nearPercent")] = 90,
+) -> dict[str, Any]:
+    try:
+        return audit_query.aggregates(session, from_, to, group_by, near_percent)
     except audit_query.AuditQueryError as error:
         raise _audit_fail(error) from error

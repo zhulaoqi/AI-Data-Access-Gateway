@@ -308,6 +308,8 @@ def test_list_defaults_to_24_hours_newest_first_and_never_carries_sql(env: Env) 
         "queryId": "qry_done",
         "requestId": None,  # rows written before the field existed
         "channel": None,
+        "clientIp": None,
+        "sqlFingerprint": None,
         "status": "completed",
         "queueWaitMs": 12,
         "rowCount": 2,
@@ -380,6 +382,9 @@ def test_filter_by_query_id_event_type_datasource_and_window(env: Env) -> None:
     assert env.ids_of(eventType="audit_sql_view") == {env.ids["view"]}
     assert env.ids_of(datasourceId="ds1") == env.ids_of()
     assert env.ids_of(datasourceId="other") == set()
+    assert env.ids_of(datasourceId="other,ds1") == env.ids_of()
+    too_many = ",".join(f"ds{i}" for i in range(201))
+    assert env.get("/ext/audit/events", datasourceId=too_many).status_code == 422
     wide = env.ids_of(**{"from": (naive_now() - timedelta(days=3)).isoformat() + "Z"})
     assert env.ids["old"] in wide and len(wide) == 10
     narrow = env.ids_of(

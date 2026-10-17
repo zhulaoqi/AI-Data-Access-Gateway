@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from adg_ext.admission import Admission
+    from adg_ext.blocklist import BlocklistCache
     from adg_ext.revocation import RevocationCache
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -181,6 +182,7 @@ def render(
     admission: "Admission",
     queries: QueryMetrics,
     revocation: "RevocationCache | None" = None,
+    blocklist: "BlocklistCache | None" = None,
 ) -> str:
     """The full exposition text; deterministic ordering (sorted label values)."""
 
@@ -273,6 +275,35 @@ def render(
             "(since start-up when it never was).",
         )
         w.sample("adg_ext_revocation_poll_age_seconds", revocation.poll_age_seconds())
+    if blocklist is not None and blocklist.enabled:
+        w.family(
+            "adg_ext_blocklist_version",
+            "gauge",
+            "Version of the source blocklist currently enforced.",
+        )
+        w.sample("adg_ext_blocklist_version", blocklist.version)
+        w.family("adg_ext_blocklist_entries", "gauge", "Entries in the enforced blocklist.")
+        w.sample("adg_ext_blocklist_entries", blocklist.size())
+        w.family(
+            "adg_ext_blocklist_poll_age_seconds",
+            "gauge",
+            "Seconds since the blocklist was last pulled successfully "
+            "(since start-up when it never was).",
+        )
+        w.sample("adg_ext_blocklist_poll_age_seconds", blocklist.poll_age_seconds())
+        w.family(
+            "adg_ext_blocklist_refused_total",
+            "counter",
+            "Blocklist snapshots refused by the shrink guard.",
+        )
+        w.sample("adg_ext_blocklist_refused_total", blocklist.refused)
+        w.family(
+            "adg_ext_blocked_total",
+            "counter",
+            "Requests refused by the blocklist, by reason (source_blocked / grant_frozen).",
+        )
+        w.sample("adg_ext_blocked_total", blocklist.blocked_total, reason="source_blocked")
+        w.sample("adg_ext_blocked_total", blocklist.frozen_total, reason="grant_frozen")
     return w.text()
 
 

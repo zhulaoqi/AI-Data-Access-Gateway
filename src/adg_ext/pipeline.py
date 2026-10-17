@@ -25,11 +25,12 @@ from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationEr
 from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.policy.runtime import IdentityContext
+from adg_ext import clientip, guard
 from adg_ext import context as ctxmod
-from adg_ext import guard
 from adg_ext.admission import Admission, AdmissionRejected, Ticket
 from adg_ext.analyze import FilterDef, TableView, rewrite
 from adg_ext.config import get_ext_settings
+from adg_ext.fingerprint import sql_fingerprint
 from adg_ext.killer import kill_query
 from adg_ext.metrics import get_query_metrics, reset_query_metrics
 
@@ -166,6 +167,13 @@ def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> d
 
     meta: dict[str, Any] = {"channel": "mcp"}
     meta.update(audit_extra or {})
+    if not meta.get("client_ip"):
+        # PA-8: the MCP/HTTP path has no caller-supplied address; use the resolved request address
+        resolved = clientip.current()
+        if resolved:
+            meta["client_ip"] = resolved
+        else:
+            meta.pop("client_ip", None)
     if request_id:
         meta["request_id"] = request_id
     return meta
@@ -265,6 +273,11 @@ def run(
     if datasource.status != "active":
         return reject("permission_rejected", "datasource_disabled")
     dialect = guard.dialect_for(datasource.type)
+    # PA-8: a literal-free structural hash of the statement; the only SQL-derived value that leaves
+    # the executor for risk inspection (see ``adg_ext.fingerprint``).
+    fingerprint = sql_fingerprint(query, dialect)
+    if fingerprint:
+        audit_meta["sql_fingerprint"] = fingerprint
 
     declared = [svc._get_resource(rid) for rid in resource_ids]
     for resource in declared:
@@ -428,6 +441,7 @@ def _execute(
                 "rewritten_sql": final_sql,
                 "grant": identity.user_id,
                 "queue_wait_ms": int(ticket.waited_seconds * 1000),
+                "max_rows": effective_limit,
                 "accessed_fields": verdict.result.accessed_fields,
                 **audit_extra,
             },

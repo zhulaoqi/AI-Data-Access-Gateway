@@ -18,6 +18,7 @@ from adg.control_plane.db import get_session
 from adg.control_plane.models.api_key import ApiKey
 from adg.policy.runtime import IdentityContext, load_runtime_identity_for_user
 from adg.shared.security import hash_api_key
+from adg_ext import enforce as ext_enforce
 from adg_ext import revocation as ext_revocation
 from adg_ext.config import ext_enabled
 
@@ -78,6 +79,9 @@ def authenticate_api_key_value(
 ) -> AuthenticatedApiKey:
     """Authenticate one raw API key value against the active control-plane keys."""
 
+    # PA-8: a blocked source is refused before any credential is examined.
+    ext_enforce.check_source(session)
+
     # A shared reverse-proxy peer must never prevent a valid credential from being checked.
     if check_auth_rate_limited(raw_api_key):
         raise HTTPException(
@@ -86,6 +90,7 @@ def authenticate_api_key_value(
         )
 
     if raw_api_key is None or raw_api_key == "":
+        ext_enforce.auth_failed(session, "invalid")
         _record_auth_failure_or_raise_rate_limited(raw_api_key, client_identifier)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -100,6 +105,7 @@ def authenticate_api_key_value(
     ).scalar_one_or_none()
     if api_key is not None:
         if ext_enabled() and ext_revocation.get_cache().is_revoked(api_key.key_hash):
+            ext_enforce.auth_failed(session, "revoked", api_key.user_id)
             _record_auth_failure_or_raise_rate_limited(raw_api_key, client_identifier)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -108,11 +114,13 @@ def authenticate_api_key_value(
         if api_key.expires_at is not None and _normalize_expiration(
             api_key.expires_at
         ) <= datetime.now(UTC):
+            ext_enforce.auth_failed(session, "expired", api_key.user_id)
             _record_auth_failure_or_raise_rate_limited(raw_api_key, client_identifier)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Expired API key",
             )
+        ext_enforce.check_grant(session, api_key.user_id)
         record_auth_success(raw_api_key)
         return AuthenticatedApiKey(
             id=api_key.id,
@@ -120,10 +128,28 @@ def authenticate_api_key_value(
             user_id=api_key.user_id,
         )
 
+    ext_enforce.auth_failed(
+        session, "disabled" if _is_inactive_key(session, raw_api_key) else "invalid"
+    )
     _record_auth_failure_or_raise_rate_limited(raw_api_key, client_identifier)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid API key",
+    )
+
+
+def _is_inactive_key(session: Session, raw_api_key: str) -> bool:
+    """A known key that is no longer active (looked up on a failure, extension only)."""
+
+    if not ext_enabled():
+        return False
+    return (
+        session.execute(
+            select(ApiKey.id).where(
+                ApiKey.status != "active", ApiKey.key_hash == hash_api_key(raw_api_key)
+            )
+        ).first()
+        is not None
     )
 
 

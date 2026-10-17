@@ -17,7 +17,7 @@ from adg.control_plane.models.resource import Resource
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.policy.runtime import load_runtime_identity_for_user
 from adg_ext import context as ctxmod
-from adg_ext import pipeline
+from adg_ext import enforce, pipeline
 from adg_ext.models import ExtSyncObject
 from adg_ext.sync import PREFIX
 
@@ -63,6 +63,10 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
     channel = str(body.get("channel") or "jdbc").strip().lower()
     if not _CHANNEL.fullmatch(channel):
         raise DelegatedError(400, "invalid_channel")
+    # PA-8: refuse blocked sources and frozen grants before looking at the grant at all
+    refusal = enforce.delegated_check(session, grant_id, str(body.get("clientIp") or ""))
+    if refusal is not None:
+        raise DelegatedError(403, str(refusal["reason"]))
     user = _grant_user(session, grant_id)
     identity = load_runtime_identity_for_user(session, user_id=user.id)
     ctx = ctxmod.load(session, user_id=user.id, role_ids=identity.roles)

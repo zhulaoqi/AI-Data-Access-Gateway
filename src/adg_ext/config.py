@@ -23,6 +23,26 @@ class ExtSettings(BaseSettings):
     revocation_ttl_seconds: float = 5.0
     revocation_timeout_seconds: float = 2.0
 
+    # Source blocklist (PA-8, ADR-0027): pull-only versioned feed published by the management
+    # service (scope ``blocklist:read``). Empty URL = feature off. The last good snapshot is kept
+    # in memory and persisted to ``blocklist_snapshot_path`` so a restart can run while the
+    # management service is down.
+    blocklist_url: str = ""
+    blocklist_token: str = ""
+    blocklist_poll_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
+    blocklist_timeout_seconds: float = Field(default=2.0, gt=0.0, le=30.0)
+    blocklist_snapshot_path: str = ""
+    blocklist_consumer: str = "executor"
+    # A full snapshot that removes more than this share of the current entries is refused (a
+    # misbehaving or empty feed must never open the gate); incremental feeds are not affected.
+    blocklist_shrink_guard_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    # How many reverse-proxy hops in front of the executor append to ``X-Forwarded-For``. With 0
+    # the TCP peer is the client and the header is ignored (it can be forged by any caller).
+    trusted_proxy_hops: int = Field(default=0, ge=0, le=10)
+    # Per process aggregation windows kept for ``/ext/audit/aggregates`` (auth failures, blocked).
+    risk_counter_retention_seconds: int = Field(default=26 * 3600, ge=60, le=7 * 24 * 3600)
+    aggregates_max_events: int = Field(default=200_000, ge=1000, le=5_000_000)
+
     # Optional source restriction for the /admin and /admin/ext surfaces (CIDRs, comma separated).
     admin_allowed_cidrs: str = ""
     # Sources allowed to use the `entry` scope (the JDBC entry service). Empty = no restriction.

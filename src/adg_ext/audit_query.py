@@ -20,12 +20,16 @@ from adg.audit.models import AuditEvent
 from adg.audit.service import AuditService
 from adg.control_plane.models.directory import User
 from adg.control_plane.models.resource import Resource
+from adg_ext.config import get_ext_settings
+from adg_ext.riskstats import get_counters
 from adg_ext.sync import PREFIX
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 MAX_OFFSET = 10_000
 MAX_GRANT_IDS = 500
+# ``datasourceId`` accepts a comma separated list (the control plane scopes a maintainer to theirs)
+MAX_DATASOURCE_IDS = 200
 MAX_WINDOW = timedelta(days=93)
 DEFAULT_WINDOW = timedelta(hours=24)
 REASON_TOP = 10
@@ -55,7 +59,7 @@ class Filters:
     start: datetime
     end: datetime
     grant_ids: list[str] = field(default_factory=list)
-    datasource_id: str | None = None
+    datasource_ids: list[str] = field(default_factory=list)
     decision: str | None = None
     status: str | None = None
     table: str | None = None
@@ -125,6 +129,11 @@ def build_filters(
     ids = _split(grant_ids)
     if len(ids) > MAX_GRANT_IDS:
         raise AuditQueryError(422, "too_many_grant_ids")
+    datasource_ids = _split([datasource_id] if datasource_id else None)
+    if len(datasource_ids) > MAX_DATASOURCE_IDS:
+        raise AuditQueryError(422, "too_many_datasource_ids")
+    for value in datasource_ids:
+        _text(value)
     stored_decision = None
     if decision:
         stored_decision = DECISIONS.get(decision.strip().lower())
@@ -139,7 +148,7 @@ def build_filters(
         start=window[0],
         end=window[1],
         grant_ids=ids,
-        datasource_id=_text(datasource_id),
+        datasource_ids=datasource_ids,
         decision=stored_decision,
         status=stored_status,
         table=_text(table),
@@ -288,8 +297,8 @@ def conditions(session: Session, f: Filters) -> list[ColumnElement[bool]]:
     ]
     if f.grant_ids:
         out.append(AuditEvent.user_id.in_(_grant_user_ids(session, f.grant_ids)))
-    if f.datasource_id:
-        out.append(AuditEvent.datasource_id == f.datasource_id)
+    if f.datasource_ids:
+        out.append(AuditEvent.datasource_id.in_(f.datasource_ids))
     if f.decision:
         out.append(AuditEvent.decision == f.decision)
     if f.status:
@@ -383,6 +392,8 @@ def serialize(event: AuditEvent, external_ref: str | None) -> dict[str, Any]:
         "queryId": event.query_id,
         "requestId": _meta_text(meta, "request_id"),
         "channel": _meta_text(meta, "channel"),
+        "clientIp": _meta_text(meta, "client_ip"),
+        "sqlFingerprint": _meta_text(meta, "sql_fingerprint"),
         "status": derive_status(event, meta),
         "queueWaitMs": _int_or_none(meta.get("queue_wait_ms")),
         "rowCount": _int_or_none(meta.get("rows")),
@@ -492,3 +503,181 @@ def stats(session: Session, start: str | None, end: str | None) -> dict[str, Any
         "timeouts": int(row[5]),
         "reasonTop": [{"reason": str(reason), "count": int(n)} for reason, n in top],
     }
+
+
+# ---- aggregates for risk inspection (PA-8) ---------------------------------------------------
+
+AGGREGATE_GROUPS = ("grant_source", "grant_reason", "fingerprint", "auth", "blocked")
+_UNKNOWN_IP = "unknown"
+
+
+def _epoch(value: datetime) -> float:
+    return value.replace(tzinfo=UTC).timestamp()
+
+
+def _reason_codes(reason: str | None) -> list[str]:
+    """``column_not_allowed:ssn,table_not_accessible`` -> the codes before any ``:detail``."""
+
+    out: list[str] = []
+    for part in (reason or "").split(","):
+        code = part.split(":", 1)[0].strip()
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def aggregates(
+    session: Session,
+    start: str | None,
+    end: str | None,
+    group_by: str,
+    near_percent: int = 90,
+) -> dict[str, Any]:
+    """Aggregates over query audit events: no SQL text, no key material, no row data.
+
+    ``grant_source`` / ``grant_reason`` / ``fingerprint`` scan at most ``aggregates_max_events``
+    events of the window in the database order (reading four narrow columns); beyond that the
+    answer is flagged ``truncated`` and the caller must not treat it as complete. ``auth`` and
+    ``blocked`` come from per process counters (see ``adg_ext.riskstats``).
+    """
+
+    if group_by not in AGGREGATE_GROUPS:
+        raise AuditQueryError(422, "invalid_group_by")
+    if near_percent < 1 or near_percent > 100:
+        raise AuditQueryError(422, "invalid_near_percent")
+    window_start, window_end = resolve_window(start, end)
+    head = {"from": _iso(window_start), "to": _iso(window_end), "groupBy": group_by}
+    if group_by in ("auth", "blocked"):
+        counters = get_counters()
+        lo, hi = _epoch(window_start), _epoch(window_end)
+        items = (
+            counters.auth_failures(lo, hi)
+            if group_by == "auth"
+            else counters.blocked_attempts(lo, hi)
+        )
+        return {**head, "items": items, "truncated": False}
+
+    cap = get_ext_settings().aggregates_max_events
+    rows = list(
+        session.execute(
+            select(
+                AuditEvent.user_id,
+                AuditEvent.decision,
+                AuditEvent.reason,
+                AuditEvent.metadata_json,
+                AuditEvent.resource_ids_json,
+            )
+            .where(
+                AuditEvent.created_at >= window_start,
+                AuditEvent.created_at < window_end,
+                AuditEvent.event_type.in_(QUERY_EVENT_TYPES),
+            )
+            .order_by(AuditEvent.created_at)
+            .limit(cap + 1)
+        )
+    )
+    truncated = len(rows) > cap
+    rows = rows[:cap]
+    refs = _external_refs(session, {r[0] for r in rows if r[0]})
+
+    def grant_of(user_id: str | None, meta: dict[str, Any]) -> str | None:
+        return _grant_id(refs.get(user_id or ""), meta, user_id)
+
+    if group_by == "grant_reason":
+        reasons: dict[tuple[str | None, str], int] = {}
+        for user_id, decision, reason, metadata_json, _ in rows:
+            if decision != "denied":
+                continue
+            grant = grant_of(user_id, _loads(metadata_json))
+            for code in _reason_codes(reason):
+                reasons[(grant, code)] = reasons.get((grant, code), 0) + 1
+        items = [
+            {"grantId": g, "reason": code, "count": n}
+            for (g, code), n in sorted(reasons.items(), key=lambda kv: -kv[1])
+        ]
+        return {**head, "items": items, "truncated": truncated}
+
+    if group_by == "fingerprint":
+        prints: dict[tuple[str | None, str], dict[str, Any]] = {}
+        for user_id, _decision, _reason, metadata_json, _ids in rows:
+            meta = _loads(metadata_json)
+            fingerprint = _meta_text(meta, "sql_fingerprint")
+            if fingerprint is None:
+                continue
+            grant = grant_of(user_id, meta)
+            acc = prints.setdefault(
+                (grant, fingerprint), {"count": 0, "sources": set(), "totalRows": 0}
+            )
+            acc["count"] += 1
+            acc["sources"].add(_meta_text(meta, "client_ip") or _UNKNOWN_IP)
+            acc["totalRows"] += _int_or_none(meta.get("rows")) or 0
+        items = [
+            {
+                "grantId": g,
+                "sqlFingerprint": fp,
+                "count": acc["count"],
+                "distinctSources": len(acc["sources"]),
+                "totalRows": acc["totalRows"],
+            }
+            for (g, fp), acc in sorted(prints.items(), key=lambda kv: -kv[1]["count"])
+        ]
+        return {**head, "items": items, "truncated": truncated}
+
+    sources: dict[tuple[str | None, str], dict[str, Any]] = {}
+    for user_id, decision, _reason, metadata_json, resource_ids_json in rows:
+        meta = _loads(metadata_json)
+        grant = grant_of(user_id, meta)
+        ip = _meta_text(meta, "client_ip") or _UNKNOWN_IP
+        acc = sources.setdefault(
+            (grant, ip),
+            {
+                "queries": 0,
+                "allowed": 0,
+                "denied": 0,
+                "tables": set(),
+                "maxRows": 0,
+                "totalRows": 0,
+                "near": 0,
+            },
+        )
+        acc["queries"] += 1
+        if decision == "denied":
+            acc["denied"] += 1
+        else:
+            acc["allowed"] += 1
+        try:
+            decoded = json.loads(resource_ids_json or "[]")
+        except ValueError:
+            decoded = []
+        if isinstance(decoded, list):
+            acc["tables"].update(i for i in decoded if isinstance(i, str))
+        returned = _int_or_none(meta.get("rows"))
+        if returned is not None:
+            acc["maxRows"] = max(acc["maxRows"], returned)
+            acc["totalRows"] += returned
+            limit = _int_or_none(meta.get("max_rows"))
+            if limit and limit > 0 and returned * 100 >= limit * near_percent:
+                acc["near"] += 1
+    items = [
+        {
+            "grantId": g,
+            "clientIp": ip,
+            "queries": acc["queries"],
+            "allowed": acc["allowed"],
+            "denied": acc["denied"],
+            "distinctTables": len(acc["tables"]),
+            "maxRows": acc["maxRows"],
+            "totalRows": acc["totalRows"],
+            "nearLimitQueries": acc["near"],
+        }
+        for (g, ip), acc in sorted(sources.items(), key=lambda kv: -kv[1]["queries"])
+    ]
+    return {**head, "items": items, "truncated": truncated}
+
+
+def _loads(text: str | None) -> dict[str, Any]:
+    try:
+        decoded = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}

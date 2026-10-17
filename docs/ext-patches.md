@@ -13,7 +13,7 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 | `src/adg/masking/service.py` | `strategy == "null"` 返回 None | 脱敏策略 `null` |
 | `src/adg/policy/runtime.py` | `ext_hooks.field_denied`（2 处） | 封闭列范围 |
 | `src/adg/app/main.py` | `ext_install(app, factory)` | 挂载 `/admin/ext/*`、`/ext/delegated/*` |
-| `src/adg/app/dependencies.py` | 吊销名单检查 | 凭据吊销立即生效 |
+| `src/adg/app/dependencies.py` | 吊销名单检查；PA-8：`authenticate_api_key_value` 开头 `enforce.check_source`、鉴权失败计数、通过后 `enforce.check_grant`（均为 `ext_enabled()` 下才生效） | 凭据吊销立即生效；来源黑名单与冻结授权（2.8） |
 | `src/adg/app/main.py` | `FastAPI(..., **ext_app_kwargs())` | `/docs`、`/redoc`、`/openapi.json` 默认关闭（2.6） |
 | `src/adg/shared/crypto.py` | `_decrypt_v2_envelope` 经 `adg_ext.kdf_cache.derive_key` 取派生密钥 | PBKDF2 输出缓存（2.4）；扩展关闭时等同原调用 |
 | `src/adg/control_plane/db.py` | `create_engine_from_url` 在扩展开启时带连接池参数 | 控制面连接池大小与等待超时（2.5） |
@@ -47,6 +47,7 @@ ClickHouse/StarRocks 连接器、先审计后执行、同步 API、委托查询�
 
 - 全部过滤在 SQL 层完成；`table`、`reason`、`status` 的 `LIKE` 只用转义后的输入（转义符 `!`，`%`、`_` 与转义符本身都被转义）。
 - `grantIds` 以授权 ID 传入，经 `User.external_ref = gw:user:<id>` 映射到审计的 `user_id`；响应 `grantId` 反向映射。
+- `datasourceId` 可传逗号分隔的多个执行器数据源 ID（≤ 200，超出返回 422 `too_many_datasource_ids`），管理服务据此把开发者限定在自己维护的数据源上。
 - 时间窗口默认最近 24 小时、最长 93 天；`limit` 默认 50、上限 200；`offset` 上限 10000；越界返回 422。
 - 列表永不含 SQL；详情含 `sqlText`/`rewrittenSql`/`accessedFields`，每次成功读取经 `AuditService.record_sql_view` 写 `audit_sql_view`。
 - **`requestId`、`channel`**：每条查询类审计行（放行的 `started`/`completed`，以及 Guard、权限、准入拒绝）的元数据都带
@@ -318,6 +319,39 @@ Helm Chart 与生产的唯一模式）对 `INSERT` 返回 `Data too long for col
   >64 KB 语句的审计行、200 字符名字走完整同步与委托查询、索引与 `EXPLAIN`）、`test_extint_migrations.py`（SQLite 与 MySQL 上的升级路径；
   旧结构上 40 字符 `query_id` 确实被 MySQL 拒绝）；`tests/ext/test_ext_sync_limits.py`（名字上限、`fit_snapshot`）。
 
+## 2.8 来源黑名单、授权冻结与风险聚合（PA-8，ADR-0027）
+
+管理服务发布**只拉取、带版本**的黑名单（`blocklist:read` 令牌）；执行器每 5 秒拉一次，在本地回答两件事：
+**这个来源 IP 是否被拦**、**这个授权是否被冻结**，热路径上不发任何网络请求。`ADG_EXT_BLOCKLIST_URL` 为空即整体关闭。
+
+- 检查位置只有一个：`authenticate_api_key_value`。来源拦截在**检查凭据之前**，命中返回 403 `source_blocked`
+  （对任何密钥、包括无效密钥与空密钥都一样，不泄漏密钥是否有效）；密钥通过后若其授权被冻结，返回 403 `grant_frozen`。
+  入口（JDBC）走 `/ext/delegated/query`，来源地址取请求体 `clientIp`，授权取 `grantId`，在读取授权前先检查。
+- `allow` 条目永远优先于 `deny`；条目自带 `expiresAt`，过期在本地即失效，无需回源。
+- **取不到来源地址按放行处理**（MCP 在不透传来源的代理之后）；冻结授权仍然生效。
+- 来源地址：`ADG_EXT_TRUSTED_PROXY_HOPS`（默认 0）为前置反向代理的层数。0 层时取 TCP 对端，忽略 `X-Forwarded-For`（任何调用方都能伪造）；
+  N 层时取该头**从右数第 N 个**，更左的条目是客户端自填的，不采信。头缺失、非法或过短时回退到对端。
+- 安全属性：拉取失败/返回异常不清空名单（保留最后一份好快照）；**全量快照**若会删掉超过
+  `ADG_EXT_BLOCKLIST_SHRINK_GUARD_RATIO`（默认 0.5）的现有条目则拒绝（`adg_ext_blocklist_refused_total`），运维可用
+  `POST /admin/ext/blocklist/refresh?force=true` 强制接受；增量不受影响。快照原子写入
+  `ADG_EXT_BLOCKLIST_SNAPSHOT_PATH`（权限 0600），重启后即使管理服务不可达也能继续拦截；文件损坏则忽略。
+- 被拦请求计数并**抽样**写一条审计行（每个来源、每个原因、每进程每分钟至多一条，`event_type=source_blocked`，不含 SQL、不含密钥），
+  攻击流量不会变成数据库写入压力。
+- 查询审计行新增：`client_ip`、`sql_fingerprint`（字面量替换为 `?`、`IN` 列表折叠后取 SHA-256 前 16 位，不含数据、不可逆）、`max_rows`。
+  `GET /ext/audit/events` 的列表项与详情多出 `clientIp`、`sqlFingerprint`。
+- `GET /ext/audit/aggregates?groupBy=…&from=&to=&nearPercent=`（`admin` 作用域，不含 SQL 文本、不含数据）：
+  - `grant_source`：每个（授权，来源）的查询数、放行/拒绝、涉及表数、最大/累计行数、接近行数上限的次数。
+  - `grant_reason`：每个（授权，拒绝原因码）的次数。
+  - `fingerprint`：每个（授权，指纹）的次数、不同来源数、累计行数。
+  - `auth`、`blocked`：鉴权失败（`invalid`/`revoked`/`expired`/`disabled`）与被拦次数，按来源与授权分组。
+  前三种在窗口内最多扫描 `ADG_EXT_AGGREGATES_MAX_EVENTS`（默认 20 万）条，超过则 `truncated=true`，调用方不得当作完整结果。
+- 指标：`adg_ext_blocklist_version`、`adg_ext_blocklist_entries`、`adg_ext_blocklist_poll_age_seconds`、
+  `adg_ext_blocklist_refused_total`、`adg_ext_blocked_total{reason}`。
+- 测试：`tests/ext/test_ext_risk.py`。
+
+已知限制：`auth`、`blocked` 两类计数只存在于**进程内存**（按分钟分桶，保留 `ADG_EXT_RISK_COUNTER_RETENTION_SECONDS`，默认 26 小时）；
+多副本部署时每个副本只看到自己的那一份，重启后清零。巡检把这两类当作「下限」使用。
+
 ## 3. 安全不变量
 
 - 行过滤基于解析后的 AST 注入，参数为带类型的字面量；注入后会二次 `verify`，任何不确定均拒绝（fail-closed）。
@@ -329,6 +363,7 @@ Helm Chart 与生产的唯一模式）对 `INSERT` 返回 `Data too long for col
 - 不缓存任何授权结果；PBKDF2 派生缓存只存派生密钥、键为 HMAC、有上限与过期、不写日志，吊销/删除/过期/墓碑不经过它（2.4）。
 - 请求不在持有控制面连接时排队；拿不到连接是 503 `admission_pool_exhausted`，不是 500（2.5）。
 - 生产配置下 `/docs`、`/redoc`、`/openapi.json` 默认不存在（2.6）。
+- 来源黑名单只拒绝不放行：名单不可用时保留最后一份好快照，空/异常的快照不会清空名单；被拦请求不会泄漏密钥是否有效（2.8）。
 
 ## 4. 已知限制
 
