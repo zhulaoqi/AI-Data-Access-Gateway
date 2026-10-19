@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from adg.app.apollo import load_apollo
 from adg.shared.crypto import FERNET_KDF_MAX_ITERATIONS, FERNET_KDF_MIN_ITERATIONS
 
 DEFAULT_SECRET_KEY = "change-me-to-a-long-random-secret"
@@ -111,4 +112,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return cached settings so dependencies do not rebuild them per request."""
 
+    load_apollo()
     return Settings()

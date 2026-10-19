@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from adg.admin_api.console import router as admin_console_router
 from adg.admin_api.datasources import router as admin_datasource_router
 from adg.admin_api.system import router as admin_system_router
+from adg.app.apollo import enable_for_ide_launch
 from adg.app.settings import get_settings
 from adg.connectors import runtime_engine_cache
 from adg.control_plane.db import SessionLocal
@@ -23,6 +24,7 @@ from adg_ext.config import ext_enabled
 def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     """Build the FastAPI application and attach all V1 routers."""
 
+    enable_for_ide_launch()
     settings = get_settings()
     factory = session_factory or SessionLocal
     mcp_server_app = build_mcp_server_app(factory)
