@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM 172.30.10.185:15000/common/python:3.12-slim-bullseye
 
 ARG PYPI_INDEX_URL=https://pypi.org/simple
 ENV APP_HOME /dianyi/app/sqlgw-executor
