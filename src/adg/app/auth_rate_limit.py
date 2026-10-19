@@ -65,7 +65,7 @@ class AuthRateLimiter:
         if not self._settings.auth_rate_limit_enabled:
             return False
         fingerprints = self._bucket_fingerprints(raw_api_key, client_identifier)
-        if self._settings.auth_rate_limit_storage == "redis":
+        if self._redis_client is not None:
             return any(self._redis_is_blocked(fingerprint) for fingerprint in fingerprints)
         return any(self._memory_is_blocked(fingerprint) for fingerprint in fingerprints)
 
@@ -80,7 +80,7 @@ class AuthRateLimiter:
             return False
         blocked = False
         for fingerprint in self._bucket_fingerprints(raw_api_key, client_identifier):
-            if self._settings.auth_rate_limit_storage == "redis":
+            if self._redis_client is not None:
                 blocked = self._redis_record_failure(fingerprint) or blocked
             else:
                 blocked = self._memory_record_failure(fingerprint) or blocked
@@ -96,7 +96,7 @@ class AuthRateLimiter:
         if not self._settings.auth_rate_limit_enabled:
             return
         fingerprint = self._fingerprint("key", raw_api_key)
-        if self._settings.auth_rate_limit_storage == "redis":
+        if self._redis_client is not None:
             client = self._require_redis_client()
             client.delete(self._failure_key(fingerprint), self._block_key(fingerprint))
             return
@@ -240,6 +240,10 @@ def get_auth_rate_limiter() -> AuthRateLimiter:
             redis_client = None
             if settings.auth_rate_limit_storage == "redis" and settings.auth_rate_limit_redis_url:
                 redis_client = create_redis_client(settings.auth_rate_limit_redis_url)
+            else:
+                from adg_ext.redis_share import get_client
+
+                redis_client = get_client()
             _auth_rate_limiter = AuthRateLimiter(settings, redis_client)
         return _auth_rate_limiter
 

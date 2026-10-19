@@ -33,6 +33,7 @@ from adg_ext.config import get_ext_settings
 from adg_ext.fingerprint import sql_fingerprint
 from adg_ext.killer import kill_query
 from adg_ext.metrics import get_query_metrics, reset_query_metrics
+from adg_ext.redis_share import get_share
 
 if TYPE_CHECKING:
     from adg.gateway_runtime.tools import GatewayRuntimeService
@@ -422,6 +423,7 @@ def _execute(
     except AdmissionRejected as error:
         return rejected("permission_rejected", f"admission_{error.reason}")
 
+    get_share().register_run(request_id or "")
     final = "failed"  # the outcome label unless a branch below says otherwise
     try:
         tagged = f"/* grant={identity.user_id},req={query_id} */ {final_sql}"
@@ -515,6 +517,8 @@ def _execute(
         }
     finally:
         ticket.release()
+        if request_id:
+            get_share().clear_run(request_id)
         if final:
             get_query_metrics().outcome(final)
 
@@ -587,6 +591,7 @@ def _run_connector(
     error = runner.error
     if error is None and runner.result is not None:
         breaker.success()
+        get_share().note_success(datasource.id)
         return runner.result
     if isinstance(error, ConnectorDependencyError):
         breaker.release_probe()
@@ -594,8 +599,10 @@ def _run_connector(
     if isinstance(error, ConnectorOperationError):
         if is_infra_failure(error):
             breaker.failure()
+            get_share().note_failure(datasource.id, breaker.threshold, breaker.open_seconds)
             return "datasource_unavailable"
         breaker.success()  # the datasource answered; the query itself was at fault
+        get_share().note_success(datasource.id)
         return "connector_operation_error"
     breaker.release_probe()
     logger.error("unexpected connector failure: %s", type(error).__name__)

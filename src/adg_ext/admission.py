@@ -9,11 +9,13 @@ busy), then a slot of the datasource-wide limit. Every refusal is a stable reaso
 
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from adg_ext.metrics import Histogram
+from adg_ext.redis_share import get_share
 
 # Rejections that happened after (some) waiting; they feed the wait histogram so that a long tail
 # of queue timeouts is visible, whereas ``queue_full``/``circuit_open`` refuse instantly.
@@ -73,6 +75,7 @@ class Ticket:
         self._released = False
         self._on_cancel: Callable[[], None] | None = None
         self._lock = threading.Lock()
+        self.redis_member: str | None = None
 
     def on_cancel(self, callback: Callable[[], None]) -> None:
         with self._lock:
@@ -107,6 +110,14 @@ class CircuitBreaker:
         self._opened_at: float | None = None
         self._probing = False
         self._lock = threading.Lock()
+
+    @property
+    def threshold(self) -> int:
+        return self._threshold
+
+    @property
+    def open_seconds(self) -> float:
+        return self._open_seconds
 
     @property
     def state(self) -> str:
@@ -232,7 +243,7 @@ class Admission:
         tags: frozenset[str] = frozenset(),
     ) -> Ticket:
         max_concurrency = max(1, max_concurrency)
-        if not self.breaker(datasource_key).allow():
+        if get_share().circuit_open(datasource_key) or not self.breaker(datasource_key).allow():
             with self._cond:
                 self._count("rejected_circuit_open")
             raise AdmissionRejected("circuit_open")
@@ -261,6 +272,16 @@ class Admission:
             self._wait_total += waited
             self._wait_count += 1
             self._count("admitted")
+        member = uuid.uuid4().hex
+        share = get_share()
+        if not share.try_slot(f"user:{user_key}", max_concurrency, member):
+            self._release(ticket)
+            raise AdmissionRejected("queue_full")
+        if not share.try_slot(f"ds:{datasource_key}", self._datasource_limit, member):
+            share.release_slot(f"user:{user_key}", member)
+            self._release(ticket)
+            raise AdmissionRejected("datasource_busy")
+        ticket.redis_member = member
         return ticket
 
     def _observe_rejected_wait(self, error: AdmissionRejected, started: float) -> None:
@@ -328,6 +349,11 @@ class Admission:
             current = self._datasource_running.get(ticket.datasource_key, 0)
             self._datasource_running[ticket.datasource_key] = max(0, current - 1)
             self._cond.notify_all()
+        member = getattr(ticket, "redis_member", None)
+        if member:
+            share = get_share()
+            share.release_slot(f"user:{ticket.user_key}", member)
+            share.release_slot(f"ds:{ticket.datasource_key}", member)
 
     # ---- revocation -------------------------------------------------------------------------
 

@@ -21,6 +21,7 @@ from adg_ext.delegated import DelegatedError, run_delegated
 from adg_ext.dryrun import dry_run
 from adg_ext.netguard import check_source
 from adg_ext.pipeline import get_admission
+from adg_ext.redis_share import get_share
 from adg_ext.sync import ExtSyncError, SyncService
 
 
@@ -178,9 +179,17 @@ def delegated_query(
 @delegated_router.delete("/query/{request_id}")
 def cancel_delegated_query(
     request_id: str,
+    request: Request,
     key: Annotated[AuthenticatedApiKey, Depends(require_entry_key)],
 ) -> dict[str, int]:
     del key
+    forwarded = get_share().forward_cancel(
+        request_id,
+        request.headers.get("authorization"),
+        request.headers.get("x-sqlgw-cancel-hop"),
+    )
+    if forwarded is not None:
+        return {"cancelled": forwarded}
     return {"cancelled": get_admission().revoke(f"req:{request_id}")}
 
 
