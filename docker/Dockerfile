@@ -5,9 +5,6 @@ ENV APP_HOME /dianyi/app/sqlgw-executor
 ENV PATH="${APP_HOME}/.venv/bin:$PATH"
 ENV ADG_BACKEND_PORT=8000
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR $APP_HOME
 COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY src ./src
