@@ -196,6 +196,21 @@ def test_doris_scan_metadata_uses_raw_information_schema(monkeypatch: MonkeyPatc
     assert all(parameters == {"schema": "warehouse"} for _, parameters in connection.statements)
 
 
+def test_doris_scan_metadata_uses_the_pinned_database_list(monkeypatch: MonkeyPatch) -> None:
+    connection = FakeConnection()
+
+    def fake_create_engine(url: object, **kwargs: object) -> FakeEngine:
+        return FakeEngine(connection)
+
+    monkeypatch.setattr(adapter, "create_engine", fake_create_engine, raising=False)
+    monkeypatch.setattr(DorisConnector, "_require_dependency", lambda self: None)
+
+    snapshot = DorisConnector().scan_metadata({"databases": ["analytics"]})
+
+    assert [database["name"] for database in snapshot["databases"]] == ["analytics"]
+    assert all("SCHEMATA" not in sql for sql, _parameters in connection.statements)
+
+
 def test_doris_scan_metadata_discovers_all_accessible_databases_when_database_is_blank(
     monkeypatch: MonkeyPatch,
 ) -> None:

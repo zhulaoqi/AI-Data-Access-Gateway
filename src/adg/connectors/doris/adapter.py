@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, text
 from adg.app.settings import get_settings
 from adg.connectors.base import MetadataSnapshot
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
-from adg.connectors.relational import RelationalConnector
+from adg.connectors.relational import RelationalConnector, pinned_scan_databases
 
 
 class DorisConnector(RelationalConnector):
@@ -21,6 +21,7 @@ class DorisConnector(RelationalConnector):
 
         self._require_dependency()
         connection_config = self._validated_connection_config(config)
+        pinned = pinned_scan_databases(connection_config)
         database_name = str(connection_config.get("database", "")).strip()
 
         try:
@@ -29,14 +30,16 @@ class DorisConnector(RelationalConnector):
                 connect_args=self._doris_one_shot_connect_args(),
             )
             with engine.connect() as connection:
-                database_names = (
-                    [database_name] if database_name else self._list_database_names(connection)
-                )
-                if (
-                    not database_name
-                    and len(database_names) > get_settings().metadata_scan_max_databases
-                ):
-                    raise ConnectorOperationError("metadata_scan_database_limit_exceeded")
+                if pinned is not None:
+                    if not pinned:
+                        raise ConnectorOperationError("metadata_scan_databases_empty")
+                    database_names = pinned
+                elif database_name:
+                    database_names = [database_name]
+                else:
+                    database_names = self._list_database_names(connection)
+                    if len(database_names) > get_settings().metadata_scan_max_databases:
+                        raise ConnectorOperationError("metadata_scan_database_limit_exceeded")
                 databases = [
                     self._scan_database(connection, scanned_database_name)
                     for scanned_database_name in database_names

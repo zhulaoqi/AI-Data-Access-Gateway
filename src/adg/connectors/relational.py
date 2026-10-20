@@ -17,6 +17,29 @@ _METADATA_IPS = {
 }
 
 
+def pinned_scan_databases(config: dict[str, object]) -> list[str] | None:
+    """Return the explicit scan list, or None when the caller did not pin one.
+
+    The management service sends ``databases`` from the metadata scan list. An empty
+    list is returned as ``[]`` so callers refuse to discover every database on the server.
+    """
+
+    if "databases" not in config or config.get("databases") is None:
+        return None
+    raw = config.get("databases")
+    if isinstance(raw, str):
+        name = raw.strip()
+        return [name] if name else []
+    if not isinstance(raw, list):
+        raise ConnectorOperationError("metadata_scan_databases_invalid")
+    names: list[str] = []
+    for item in raw:
+        name = str(item).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 class RelationalConnector:
     """Base implementation for SQLAlchemy-backed relational metadata connectors."""
 
@@ -72,9 +95,22 @@ class RelationalConnector:
 
         self._require_dependency()
         connection_config = self._validated_connection_config(config)
+        pinned = pinned_scan_databases(connection_config)
         configured_database = str(connection_config.get("database", "")).strip()
         try:
-            if configured_database:
+            if pinned is not None:
+                if not pinned:
+                    raise ConnectorOperationError("metadata_scan_databases_empty")
+                databases = []
+                for database_name in pinned:
+                    database_config = {**connection_config, "database": database_name}
+                    database_engine = create_engine(
+                        self._build_url(database_config),
+                        connect_args=self._one_shot_connect_args(),
+                    )
+                    with database_engine.connect() as connection:
+                        databases.append(self._scan_database(connection, database_name))
+            elif configured_database:
                 engine = create_engine(
                     self._build_url(connection_config),
                     connect_args=self._one_shot_connect_args(),

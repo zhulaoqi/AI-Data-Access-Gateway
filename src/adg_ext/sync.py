@@ -286,6 +286,14 @@ class SyncService:
         }
         if spec.get("database"):
             config["database"] = spec["database"]
+        if "databases" in spec:
+            raw_databases = spec.get("databases")
+            if isinstance(raw_databases, list):
+                config["databases"] = [
+                    str(item).strip() for item in raw_databases if str(item).strip()
+                ]
+            else:
+                config["databases"] = []
         if not config["host"] or not config["username"]:
             raise ExtSyncError(422, "host and username are required")
         service = DatasourceService(self._s)

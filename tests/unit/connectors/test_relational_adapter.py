@@ -136,6 +136,41 @@ class FakeDmlEngine:
         self.disposed = True
 
 
+def test_relational_scan_metadata_uses_the_pinned_database_list(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    created_databases: list[str | None] = []
+
+    def fake_create_engine(url: object, **kwargs: object) -> FakeEngine:
+        database = getattr(url, "database", None)
+        created_databases.append(database)
+        return FakeEngine(database)
+
+    def fake_inspect(connection: FakeConnection) -> FakeInspector:
+        return FakeInspector(connection)
+
+    monkeypatch.setattr(relational, "create_engine", fake_create_engine)
+    monkeypatch.setattr(relational, "inspect", fake_inspect)
+    monkeypatch.setattr(FakePostgresConnector, "_require_dependency", lambda self: None)
+
+    snapshot = FakePostgresConnector().scan_metadata(
+        {"host": "db.internal", "databases": ["analytics"]}
+    )
+    databases = cast(list[dict[str, Any]], snapshot["databases"])
+
+    assert created_databases == ["analytics"]
+    assert [database["name"] for database in databases] == ["analytics"]
+
+
+def test_relational_scan_metadata_rejects_an_empty_pinned_database_list(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(FakePostgresConnector, "_require_dependency", lambda self: None)
+
+    with pytest.raises(ConnectorOperationError, match="metadata_scan_databases_empty"):
+        FakePostgresConnector().scan_metadata({"host": "db.internal", "databases": []})
+
+
 def test_relational_scan_metadata_discovers_all_accessible_databases_when_database_is_blank(
     monkeypatch: MonkeyPatch,
 ) -> None:

@@ -15,7 +15,7 @@ from uuid import UUID
 from adg.app.settings import get_settings
 from adg.connectors.base import MetadataSnapshot, QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
-from adg.connectors.relational import RelationalConnector
+from adg.connectors.relational import RelationalConnector, pinned_scan_databases
 
 SYSTEM_DATABASES = ("system", "information_schema", "INFORMATION_SCHEMA")
 _VIEW_ENGINES = {"View", "MaterializedView", "LiveView", "WindowView"}
@@ -88,12 +88,22 @@ class ClickHouseConnector:
 
     def scan_metadata(self, config: dict[str, object]) -> MetadataSnapshot:
         client = self._client(config, {"readonly": 1})
+        pinned = pinned_scan_databases(config)
         configured = str(config.get("database") or "").strip()
+        if pinned is not None and not pinned:
+            client.close()
+            raise ConnectorOperationError("metadata_scan_databases_empty")
         try:
             params: dict[str, object] = {"system": list(SYSTEM_DATABASES)}
             where = "c.database NOT IN {system:Array(String)}"
-            if configured:
+            name_filter = ""
+            if pinned is not None:
+                where += " AND c.database IN {dbs:Array(String)}"
+                name_filter = " AND name IN {dbs:Array(String)}"
+                params["dbs"] = pinned
+            elif configured:
                 where += " AND c.database = {db:String}"
+                name_filter = " AND name = {db:String}"
                 params["db"] = configured
             rows = client.query(
                 "SELECT c.database, c.table, c.name, c.type, c.position, t.engine "
@@ -104,7 +114,7 @@ class ClickHouseConnector:
             ).result_rows
             names = client.query(
                 "SELECT name FROM system.databases WHERE name NOT IN {system:Array(String)}"
-                + (" AND name = {db:String}" if configured else ""),
+                + name_filter,
                 parameters=params,
             ).result_rows
         except ConnectorOperationError:
