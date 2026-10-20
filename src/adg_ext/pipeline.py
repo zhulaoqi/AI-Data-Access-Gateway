@@ -292,6 +292,7 @@ def run(
             return reject("permission_rejected", decision.reason)
 
     _, time_columns = build_views(svc, ctx, declared)
+    reject_wildcards = settings.sql_reject_wildcard
     verdict = guard.check(
         query,
         dialect=dialect,
@@ -299,11 +300,14 @@ def run(
         max_limit=effective_limit,
         operations=ctx.operations,
         time_columns=time_columns,
+        reject_wildcards=reject_wildcards,
     )
     if not verdict.allowed:
         # The wildcard hint lists the columns the caller may use, never anything else.
         probe_views, _ = build_views(svc, ctx, declared)
-        out = rewrite(verdict, probe_views, dialect=dialect, user_params={})
+        out = rewrite(
+            verdict, probe_views, dialect=dialect, user_params={}, reject_wildcards=reject_wildcards
+        )
         return reject("sql_rejected", ",".join(out.reasons), out.hint)
 
     actual = svc._resolve_guard_resources(
@@ -323,7 +327,13 @@ def run(
         return reject("permission_rejected", f"field_disabled:{disabled_field}")
 
     views, _ = build_views(svc, ctx, actual)
-    outcome = rewrite(verdict, views, dialect=dialect, user_params=ctx.user_params)
+    outcome = rewrite(
+        verdict,
+        views,
+        dialect=dialect,
+        user_params=ctx.user_params,
+        reject_wildcards=reject_wildcards,
+    )
     if not outcome.allowed or outcome.sql is None:
         kind = (
             "permission_rejected"
@@ -338,6 +348,9 @@ def run(
     projection_rejection = svc._masking.projection_rejection(
         identity=identity, resources=actual, projections=verdict.result.projections
     )
+    # * 已在改写阶段展开成允许列，脱敏按列名处理，不再把通配符本身当成拒绝。
+    if projection_rejection == "masked_wildcard_projection_not_allowed" and not reject_wildcards:
+        projection_rejection = None
     if projection_rejection is not None:
         return reject("permission_rejected", projection_rejection)
 

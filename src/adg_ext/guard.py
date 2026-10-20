@@ -243,6 +243,7 @@ def check(
     operations: Operations | None = None,
     time_columns: set[str] | None = None,
     now: datetime | None = None,
+    reject_wildcards: bool = True,
 ) -> GuardVerdict:
     """Validate ``sql`` for ``dialect``; the verdict carries every rejection reason found."""
 
@@ -251,6 +252,7 @@ def check(
         max_limit=max_limit,
         execution_mode="read_only",
         strict_validation=True,
+        reject_wildcards=reject_wildcards,
         dialect=dialect,
     )
     try:

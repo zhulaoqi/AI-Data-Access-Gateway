@@ -7,6 +7,7 @@ be sent. The profile spec uses the management service's snake_case form
 
 from typing import Any
 
+from adg.app.settings import get_settings
 from adg_ext import guard
 from adg_ext.analyze import FilterDef, TableView, rewrite
 from adg_ext.params import ParamSpec
@@ -79,6 +80,7 @@ def dry_run(body: dict[str, Any]) -> dict[str, Any]:
             )
         )
 
+    reject_wildcards = get_settings().sql_reject_wildcard
     verdict = guard.check(
         sql,
         dialect=dialect,
@@ -86,6 +88,7 @@ def dry_run(body: dict[str, Any]) -> dict[str, Any]:
         max_limit=limit,
         operations=operations,
         time_columns=time_columns,
+        reject_wildcards=reject_wildcards,
     )
     if verdict.allowed:
         for path in verdict.result.accessed_resources:
@@ -97,7 +100,13 @@ def dry_run(body: dict[str, Any]) -> dict[str, Any]:
                     "warnings": warnings,
                 }
     user_params = {str(k): v for k, v in (body.get("params") or {}).items()}
-    outcome = rewrite(verdict, views, dialect=dialect, user_params=user_params)
+    outcome = rewrite(
+        verdict,
+        views,
+        dialect=dialect,
+        user_params=user_params,
+        reject_wildcards=reject_wildcards,
+    )
     out: dict[str, Any] = {
         "allowed": outcome.allowed,
         "rewrittenSql": outcome.sql,

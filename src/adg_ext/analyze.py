@@ -91,6 +91,93 @@ class Rewrite:
         return not self.reasons and self.sql is not None
 
 
+def _projection_star(projection: exp.Expression) -> str | None:
+    """``None`` when this is not a star. ``""`` for ``*``. The table name for ``t.*``."""
+
+    node = projection.this if isinstance(projection, exp.Alias) else projection
+    if isinstance(node, exp.Star):
+        return ""
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Star):
+        return node.table or ""
+    # 有的 sqlglot 版本把 * 收成 Columns，而不是 Star。
+    if isinstance(node, exp.Columns):
+        return ""
+    text = node.sql().replace("`", "").strip()
+    if text == "*":
+        return ""
+    if text.endswith(".*") and " " not in text:
+        return text[:-2].split(".")[-1]
+    return None
+
+
+def _from_tables(select: exp.Select) -> list[tuple[str, str | None, str]]:
+    """Base tables of this select only: ``(alias, database, name)``. Subqueries are skipped."""
+
+    nodes: list[exp.Expression] = []
+    # sqlglot 的 FROM 参数名有过 from / from_ 两种。
+    source = select.args.get("from_") or select.args.get("from")
+    if source is not None and isinstance(getattr(source, "this", None), exp.Expression):
+        nodes.append(source.this)
+    for join in select.args.get("joins") or []:
+        this = getattr(join, "this", None)
+        if isinstance(this, exp.Expression):
+            nodes.append(this)
+    out: list[tuple[str, str | None, str]] = []
+    for node in nodes:
+        if isinstance(node, exp.Table):
+            out.append((node.alias or node.name, node.db or None, node.name))
+    if out:
+        return out
+    for table in select.find_all(exp.Table):
+        parent = table.parent
+        while parent is not None and not isinstance(parent, exp.Select):
+            parent = parent.parent
+        if parent is select:
+            out.append((table.alias or table.name, table.db or None, table.name))
+    return out
+
+
+def _expand_wildcards(tree: exp.Expression, views: list[TableView]) -> str | None:
+    """Replace ``*`` / ``t.*`` with that table's permitted columns.
+
+    A star that cannot be tied to exactly the permitted columns is refused, so ``*`` never
+    reaches the database as a request for every column the account can see.
+    """
+
+    for select in list(tree.find_all(exp.Select)):
+        if not any(_projection_star(p) is not None for p in select.expressions):
+            continue
+        tables = _from_tables(select)
+        expanded: list[exp.Expression] = []
+        for projection in select.expressions:
+            star = _projection_star(projection)
+            if star is None:
+                expanded.append(projection)
+                continue
+            targets = (
+                tables
+                if star == ""
+                else [t for t in tables if star.lower() in {t[0].lower(), t[2].lower()}]
+            )
+            if not targets:
+                return "wildcard_projection_not_allowed"
+            qualify = len(tables) > 1
+            for alias, db, name in targets:
+                found = [v for v in views if v.restricted and v.matches(db, name)]
+                if len(found) != 1:
+                    return "wildcard_projection_not_allowed"
+                columns = found[0].projection_columns()
+                if not columns:
+                    return "wildcard_projection_not_allowed"
+                table = (alias or name) if qualify else None
+                expanded.extend(exp.column(column, table=table) for column in columns)
+        select.set("expressions", expanded)
+    for select in tree.find_all(exp.Select):
+        if any(_projection_star(projection) is not None for projection in select.expressions):
+            return "wildcard_projection_not_allowed"
+    return None
+
+
 def _wildcards(tree: exp.Expression) -> bool:
     for select in tree.find_all(exp.Select):
         for projection in select.expressions:
@@ -170,6 +257,7 @@ def rewrite(
     *,
     dialect: str | None,
     user_params: dict[str, object],
+    reject_wildcards: bool = True,
 ) -> Rewrite:
     """Apply column scope, masking-position and row-filter rules to an allowed guard verdict."""
 
@@ -189,9 +277,10 @@ def rewrite(
         return out
 
     if restricted and _wildcards(tree):
-        out.reasons.append("wildcard_projection_not_allowed")
-        out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
-        return out
+        if reject_wildcards or _expand_wildcards(tree, views) is not None:
+            out.reasons.append("wildcard_projection_not_allowed")
+            out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
+            return out
 
     # Names the statement defines itself (``expr AS name``); they are not physical columns.
     aliases = {a.alias.lower() for a in tree.find_all(exp.Alias) if a.alias}

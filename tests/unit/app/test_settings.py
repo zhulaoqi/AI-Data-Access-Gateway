@@ -18,6 +18,7 @@ def test_settings_defaults_are_local_friendly() -> None:
     assert settings.admin_resource_tree_max_nodes == 10_000
     assert settings.sql_execution_mode == "read_only"
     assert settings.sql_strict_validation is True
+    assert settings.sql_reject_wildcard is True
     assert settings.runtime_datasource_pool_cache_size == 32
     assert settings.runtime_datasource_pool_idle_ttl_seconds == 300
     assert settings.runtime_datasource_pool_size == 5
@@ -56,6 +57,7 @@ def test_settings_read_adg_prefixed_environment(monkeypatch: MonkeyPatch) -> Non
     monkeypatch.setenv("ADG_ADMIN_RESOURCE_TREE_MAX_NODES", "2000")
     monkeypatch.setenv("ADG_SQL_EXECUTION_MODE", "dml")
     monkeypatch.setenv("ADG_SQL_STRICT_VALIDATION", "false")
+    monkeypatch.setenv("ADG_SQL_REJECT_WILDCARD", "false")
     monkeypatch.setenv("ADG_RUNTIME_DATASOURCE_POOL_CACHE_SIZE", "8")
     monkeypatch.setenv("ADG_RUNTIME_DATASOURCE_POOL_IDLE_TTL_SECONDS", "60")
     monkeypatch.setenv("ADG_RUNTIME_DATASOURCE_POOL_SIZE", "3")
@@ -89,6 +91,7 @@ def test_settings_read_adg_prefixed_environment(monkeypatch: MonkeyPatch) -> Non
     assert settings.admin_resource_tree_max_nodes == 2000
     assert settings.sql_execution_mode == "dml"
     assert settings.sql_strict_validation is False
+    assert settings.sql_reject_wildcard is False
     assert settings.runtime_datasource_pool_cache_size == 8
     assert settings.runtime_datasource_pool_idle_ttl_seconds == 60
     assert settings.runtime_datasource_pool_size == 3

@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     admin_resource_tree_max_nodes: int = Field(default=10_000, ge=1)
     sql_execution_mode: Literal["read_only", "dml", "schema", "admin"] = "read_only"
     sql_strict_validation: bool = True
+    # False：把 SELECT * / t.* 展开成该表已允许的列。True：直接拒绝。
+    # 代码默认拒绝；部署启动脚本目前设为 false，以后要收紧时改回 true。
+    sql_reject_wildcard: bool = True
     runtime_datasource_pool_cache_size: int = Field(default=32, ge=1)
     runtime_datasource_pool_idle_ttl_seconds: int = Field(default=300, gt=0)
     runtime_datasource_pool_size: int = Field(default=5, ge=1)

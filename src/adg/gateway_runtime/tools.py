@@ -376,6 +376,7 @@ class GatewayRuntimeService:
             max_limit=limit,
             execution_mode=settings.sql_execution_mode,
             strict_validation=settings.sql_strict_validation,
+            reject_wildcards=settings.sql_reject_wildcard,
         ).check(query)
         if not guard_result.allowed or guard_result.normalized_sql is None:
             reason = ",".join(guard_result.rejection_reasons)

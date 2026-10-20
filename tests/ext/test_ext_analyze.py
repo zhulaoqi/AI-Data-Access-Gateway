@@ -34,6 +34,29 @@ def test_allowed_query_gets_the_row_filter_and_keeps_limit() -> None:
     assert r.limit == 100
 
 
+def test_wildcard_expands_to_permitted_columns_when_rejection_is_off() -> None:
+    verdict = guard.check(
+        "SELECT * FROM shop.orders",
+        dialect="mysql",
+        default_limit=100,
+        max_limit=100,
+        reject_wildcards=False,
+    )
+    result = rewrite(
+        verdict,
+        [ORDERS],
+        dialect="mysql",
+        user_params={"tenant_id": 7},
+        reject_wildcards=False,
+    )
+    assert result.allowed, result.reasons
+    sql = result.sql.lower()
+    for name in ("id", "amount", "phone", "tenant_id", "created_at"):
+        assert name in sql
+    assert "ssn" not in sql
+    assert "select *" not in sql
+
+
 def test_wildcard_is_rejected_with_the_allowed_columns_as_hint() -> None:
     r = run("SELECT * FROM shop.orders")
     assert r.reasons[0].startswith("wildcard")

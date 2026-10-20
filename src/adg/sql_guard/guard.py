@@ -112,6 +112,7 @@ class SqlGuard:
         max_limit: int = 1000,
         execution_mode: SqlExecutionMode = "read_only",
         strict_validation: bool = True,
+        reject_wildcards: bool = True,
         dialect: str | None = None,
     ) -> None:
         """Configure statement permissions and strict validation for accepted queries."""
@@ -121,6 +122,7 @@ class SqlGuard:
         self._max_limit = max_limit
         self._execution_mode = execution_mode
         self._strict_validation = strict_validation
+        self._reject_wildcards = reject_wildcards
 
     def check(self, sql: str) -> SqlGuardResult:
         """Parse, validate, and normalize a single SQL statement."""
@@ -204,7 +206,7 @@ class SqlGuard:
                 for function_name in used_functions
                 if function_name not in self.allowed_functions
             )
-            if self._has_wildcard_projection(statement):
+            if self._reject_wildcards and self._has_wildcard_projection(statement):
                 rejection_reasons.append("wildcard_projection_not_allowed")
             rejection_reasons.extend(self._temporal_projection_rejections(statement))
         normalized_sql, warnings = self._with_effective_limit(statement)
@@ -241,7 +243,7 @@ class SqlGuard:
                         return "cte_locking_read_not_allowed"
                     if cte_select.args.get("into") is not None:
                         return "cte_select_into_not_allowed"
-                    if self._has_wildcard_projection(cte_select):
+                    if self._reject_wildcards and self._has_wildcard_projection(cte_select):
                         return "cte_wildcard_projection_not_allowed"
                     limit_rejection = self._limit_rejection(cte_select)
                     if limit_rejection is not None:
