@@ -65,6 +65,27 @@ def test_delegated_query_matches_runtime_and_is_audited(
     assert key
 
 
+def test_selected_database_qualifies_tables_the_client_left_unqualified(
+    gateway: Gateway, mysql_seed: dict[str, str]
+) -> None:
+    provision(gateway, mysql_seed)
+    response = gateway.client.post(
+        "/ext/delegated/query",
+        json=body("SELECT id FROM orders ORDER BY id"),
+        headers=entry(gateway),
+    )
+    assert response.status_code == 200, response.text
+    out = response.json()
+    assert out["status"] == "success", out
+    assert [row["id"] for row in out["rows"]] == [1, 2]
+    with gateway.factory() as session:
+        events = session.execute(
+            select(AuditEvent).where(AuditEvent.query_id == out["query_id"])
+        ).scalars()
+        rewritten = [json.loads(event.metadata_json).get("rewritten_sql", "") for event in events]
+    assert any("shop.orders" in sql.lower() for sql in rewritten)
+
+
 def _events(gw: Gateway, **params: Any) -> list[dict[str, Any]]:
     r = gw.client.get("/ext/audit/events", params=params, headers={"X-ADG-API-Key": gw.admin})
     assert r.status_code == 200, r.text

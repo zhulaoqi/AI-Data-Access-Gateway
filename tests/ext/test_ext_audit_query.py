@@ -320,6 +320,15 @@ def test_list_defaults_to_24_hours_newest_first_and_never_carries_sql(env: Env) 
     assert denied["decision"] == "rejected" and denied["status"] is None
 
 
+def test_include_sql_adds_the_statement_and_hit_databases(env: Env) -> None:
+    rows = env.events(includeSql="true")
+    done = next(i for i in rows if i["id"] == env.ids["done"])
+    assert done["sqlText"] == SECRET_SQL
+    assert done["databases"] == ["shop"]
+    plain = env.get("/ext/audit/events")
+    assert "sqlText" not in plain.text and "databases" not in plain.text
+
+
 def test_filter_by_grant_ids_maps_grants_to_executor_users(env: Env) -> None:
     assert env.ids_of(grantIds="g2") == {env.ids["denied"], env.ids["column"]}
     both = env.client.get(

@@ -212,6 +212,7 @@ def list_audit_events(
     request_id: Annotated[str | None, Query(alias="requestId")] = None,
     channel: Annotated[str | None, Query()] = None,
     datasource_id: Annotated[str | None, Query(alias="datasourceId")] = None,
+    include_sql: Annotated[bool, Query(alias="includeSql")] = False,
     limit: Annotated[int | None, Query()] = None,
     offset: Annotated[int, Query()] = 0,
 ) -> dict[str, Any]:
@@ -231,7 +232,9 @@ def list_audit_events(
             request_id=request_id,
             channel=channel,
         )
-        return audit_query.list_events(session, filters, page_limit, page_offset)
+        return audit_query.list_events(
+            session, filters, page_limit, page_offset, include_sql=include_sql
+        )
     except audit_query.AuditQueryError as error:
         raise _audit_fail(error) from error
 

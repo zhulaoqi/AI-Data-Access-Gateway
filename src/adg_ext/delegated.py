@@ -12,12 +12,15 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.directory import User
 from adg.control_plane.models.resource import Resource
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.policy.runtime import load_runtime_identity_for_user
 from adg_ext import context as ctxmod
 from adg_ext import enforce, pipeline
+from adg_ext.analyze import qualify_session_database
+from adg_ext.guard import dialect_for
 from adg_ext.models import ExtSyncObject
 from adg_ext.sync import PREFIX
 
@@ -73,7 +76,8 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
     if not ctx.scopes:
         raise DelegatedError(403, "grant_has_no_scope")
 
-    database = str(body.get("database") or "").strip().lower()
+    raw_database = str(body.get("database") or "").strip()
+    database = raw_database.lower()
     resources = [
         r
         for r in session.execute(
@@ -87,6 +91,11 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
     if len(datasource_ids) > 1:
         raise DelegatedError(409, "datasource_ambiguous")
     datasource_id = datasource_ids[0]
+    # The selected database is the default schema for names the client left unqualified. Qualify
+    # before the guard so authorization and the statement sent to the datasource use the same names.
+    datasource = session.get(Datasource, datasource_id)
+    if datasource is not None:
+        sql = qualify_session_database(sql, raw_database, dialect_for(datasource.type))
 
     svc = GatewayRuntimeService(session)
     result = pipeline.run(
@@ -104,6 +113,7 @@ def run_delegated(session: Session, entry_key_id: str, body: dict[str, Any]) -> 
             "request_id": request_id,
             "client_ip": str(body.get("clientIp") or ""),
             "grant_id": grant_id,
+            **({"database": raw_database} if raw_database else {}),
         },
     )
     if result is None:

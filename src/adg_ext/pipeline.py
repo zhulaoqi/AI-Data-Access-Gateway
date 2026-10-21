@@ -28,8 +28,9 @@ from adg.policy.runtime import IdentityContext
 from adg_ext import clientip, guard
 from adg_ext import context as ctxmod
 from adg_ext.admission import Admission, AdmissionRejected, Ticket
-from adg_ext.analyze import FilterDef, TableView, rewrite
+from adg_ext.analyze import FilterDef, TableView, referenced_databases, rewrite
 from adg_ext.config import get_ext_settings
+from adg_ext.credential_usage import note_api_key
 from adg_ext.fingerprint import sql_fingerprint
 from adg_ext.killer import kill_query
 from adg_ext.metrics import get_query_metrics, reset_query_metrics
@@ -159,6 +160,23 @@ def build_views(
     return views, time_columns
 
 
+def _note_hit_databases(meta: dict[str, Any], sql: str, dialect: str | None) -> None:
+    """Record the databases the statement names.
+
+    Unqualified SQL keeps the client-selected database.
+    """
+
+    found = referenced_databases(sql, dialect)
+    if found:
+        meta["databases"] = found
+        return
+    if isinstance(meta.get("databases"), list) and meta["databases"]:
+        return
+    selected = meta.get("database")
+    if isinstance(selected, str) and selected.strip():
+        meta["databases"] = [selected.strip()]
+
+
 def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> dict[str, Any]:
     """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
 
@@ -251,10 +269,13 @@ def run(
     ctx = ctxmod.load(session, user_id=identity.user_id, role_ids=identity.roles)
     if not ctx.managed:
         return None
+    note_api_key(session, api_key_id)
     settings = get_settings()
     audit_meta = _audit_meta(request_id, audit_extra)
+    dialect_name: str | None = None
 
     def reject(kind: str, reason: str, hint: dict[str, object] | None = None) -> dict[str, Any]:
+        _note_hit_databases(audit_meta, query, dialect_name)
         get_query_metrics().rejected(reason)
         _record_rejection(
             svc, identity, api_key_id, kind, datasource_id, resource_ids, query, reason, audit_meta
@@ -274,6 +295,8 @@ def run(
     if datasource.status != "active":
         return reject("permission_rejected", "datasource_disabled")
     dialect = guard.dialect_for(datasource.type)
+    dialect_name = dialect
+    _note_hit_databases(audit_meta, query, dialect_name)
     # PA-8: a literal-free structural hash of the statement; the only SQL-derived value that leaves
     # the executor for risk inspection (see ``adg_ext.fingerprint``).
     fingerprint = sql_fingerprint(query, dialect)
@@ -354,6 +377,7 @@ def run(
     if projection_rejection is not None:
         return reject("permission_rejected", projection_rejection)
 
+    _note_hit_databases(audit_meta, outcome.sql or query, dialect_name)
     return _execute(
         svc,
         ctx=ctx,

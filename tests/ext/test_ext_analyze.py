@@ -1,7 +1,13 @@
 import pytest
 
 from adg_ext import guard
-from adg_ext.analyze import FilterDef, TableView, rewrite
+from adg_ext.analyze import (
+    FilterDef,
+    TableView,
+    qualify_session_database,
+    referenced_databases,
+    rewrite,
+)
 from adg_ext.params import ParamSpec
 
 ORDERS = TableView(
@@ -24,6 +30,66 @@ def run(sql, dialect="mysql", views=None, params=None):
         dialect=dialect,
         user_params={"tenant_id": 7} if params is None else params,
     )
+
+
+def _bare(sql: str) -> str:
+    return sql.lower().replace("`", "")
+
+
+def test_session_database_qualifies_unqualified_tables() -> None:
+    sql = qualify_session_database(
+        "SELECT * FROM bi_view_panel a JOIN bi_view_panel_label b ON a.id = b.panel_id",
+        "dataeye",
+        "mysql",
+    )
+    bare = _bare(sql)
+    assert "dataeye.bi_view_panel" in bare
+    assert "dataeye.bi_view_panel_label" in bare
+
+
+def test_explicit_database_cte_subquery_and_dual_are_not_requalified() -> None:
+    explicit = "SELECT id FROM other.bi_view_panel"
+    assert qualify_session_database(explicit, "dataeye", "mysql") == explicit
+    dual = "SELECT 1 FROM DUAL"
+    assert qualify_session_database(dual, "dataeye", "mysql") == dual
+    assert qualify_session_database(explicit, "", "mysql") == explicit
+    assert qualify_session_database(explicit, "information_schema", "mysql") == explicit
+
+    cte = qualify_session_database(
+        "WITH t AS (SELECT id FROM bi_view_panel) SELECT id FROM t",
+        "dataeye",
+        "mysql",
+    )
+    assert "dataeye.bi_view_panel" in _bare(cte)
+    assert "dataeye.t" not in _bare(cte)
+
+    nested = qualify_session_database(
+        "SELECT id FROM (SELECT id FROM bi_view_panel) x",
+        "dataeye",
+        "mysql",
+    )
+    assert "dataeye.bi_view_panel" in _bare(nested)
+    assert "dataeye.x" not in _bare(nested)
+
+
+def test_referenced_databases_keep_explicit_names_only() -> None:
+    assert referenced_databases("SELECT id FROM dataeye.bi_view_panel", "mysql") == ["dataeye"]
+    assert referenced_databases(
+        "SELECT a.id FROM bi_view_panel a JOIN other.labels b ON a.id = b.id",
+        "mysql",
+    ) == ["other"]
+    assert referenced_databases(
+        "WITH t AS (SELECT id FROM dataeye.bi_view_panel) SELECT id FROM t",
+        "mysql",
+    ) == ["dataeye"]
+
+
+def test_qualified_name_still_receives_the_row_filter() -> None:
+    sql = qualify_session_database("SELECT id FROM orders", "shop", "mysql")
+    result = run(sql)
+    assert result.allowed, result.reasons
+    assert "shop.orders" in _bare(result.sql or "")
+    assert "tenant_id = 7" in (result.sql or "")
 
 
 def test_allowed_query_gets_the_row_filter_and_keeps_limit() -> None:
