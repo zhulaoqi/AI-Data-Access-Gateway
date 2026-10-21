@@ -45,9 +45,14 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        """Serve the mounted MCP endpoint at /mcp without a redirect hop."""
+        """Serve /mcp and /mcp/c/<grant> as the same endpoint, without a redirect hop.
 
-        if request.scope["path"] == "/mcp":
+        The extra path segment lets one agent load several grants that share this gateway.
+        It is not a credential; authentication still reads the API key header.
+        """
+
+        path = request.scope["path"]
+        if path == "/mcp" or path == "/mcp/c" or path.startswith("/mcp/c/"):
             request.scope["path"] = "/mcp/"
             request.scope["raw_path"] = b"/mcp/"
         return await call_next(request)

@@ -404,6 +404,27 @@ async def test_streamable_mcp_server_rejects_missing_api_key() -> None:
 
 
 @pytest.mark.anyio
+async def test_grant_alias_path_uses_the_same_mcp_endpoint() -> None:
+    """`/mcp/c/<grant>` is only a client discriminator; the key still comes from the header."""
+
+    app, _ = build_streamable_mcp_app()
+    await assert_mcp_list_datasources(
+        app,
+        headers={"X-ADG-API-Key": "adg_runtime"},
+        query="/c/01JGHI",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1:8000",
+    ) as http_client:
+        response = await http_client.post("/mcp/c/01JGHI")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Missing API key"}
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("raw_api_key", "expected_status", "expected_detail"),
     [
