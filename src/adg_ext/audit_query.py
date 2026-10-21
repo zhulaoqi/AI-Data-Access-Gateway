@@ -1,9 +1,10 @@
 """Read side of the audit trail for the management service (PA-7, ``admin`` scope).
 
-Three queries over ``audit_events``: a filtered, paginated list (never carrying SQL), the detail of
-one event (original and rewritten SQL; reading it writes an ``audit_sql_view`` event) and window
-statistics. Every filter is translated to SQL; nothing is filtered in memory. ``LIKE`` patterns are
-built from escaped user input only.
+Three queries over ``audit_events``: a filtered, paginated list (SQL only when
+``includeSql`` is set),
+the detail of one event (original and rewritten SQL; reading it writes an ``audit_sql_view`` event)
+and window statistics. Every filter is translated to SQL; nothing is filtered in memory. ``LIKE``
+patterns are built from escaped user input only.
 
 Contract: ``sql-gateway/api/executor-admin.md`` §9.
 """
@@ -20,6 +21,7 @@ from adg.audit.models import AuditEvent
 from adg.audit.service import AuditService
 from adg.control_plane.models.directory import User
 from adg.control_plane.models.resource import Resource
+from adg_ext.analyze import referenced_databases
 from adg_ext.config import get_ext_settings
 from adg_ext.riskstats import get_counters
 from adg_ext.sync import PREFIX
@@ -376,11 +378,30 @@ def _meta_text(meta: dict[str, Any], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def serialize(event: AuditEvent, external_ref: str | None) -> dict[str, Any]:
-    """List item: never contains SQL text."""
+def _hit_databases(event: AuditEvent, meta: dict[str, Any]) -> list[str]:
+    """Databases the statement hit. Stored names win; otherwise read them from the SQL."""
+
+    stored = meta.get("databases")
+    if isinstance(stored, list):
+        names = [
+            str(item).strip() for item in stored if isinstance(item, str) and str(item).strip()
+        ]
+        if names:
+            return list(dict.fromkeys(names))
+    parsed = referenced_databases(event.sql_text or "", "mysql")
+    if parsed:
+        return parsed
+    selected = _meta_text(meta, "database")
+    return [selected] if selected else []
+
+
+def serialize(
+    event: AuditEvent, external_ref: str | None, *, include_sql: bool = False
+) -> dict[str, Any]:
+    """List item. SQL and hit databases are included only when the caller asks for them."""
 
     meta = _metadata(event)
-    return {
+    item = {
         "id": event.id,
         "createdAt": _iso(event.created_at),
         "eventType": event.event_type,
@@ -399,6 +420,10 @@ def serialize(event: AuditEvent, external_ref: str | None) -> dict[str, Any]:
         "rowCount": _int_or_none(meta.get("rows")),
         "durationMs": _int_or_none(meta.get("duration_ms")),
     }
+    if include_sql:
+        item["sqlText"] = event.sql_text
+        item["databases"] = _hit_databases(event, meta)
+    return item
 
 
 def _external_refs(session: Session, user_ids: set[str]) -> dict[str, str | None]:
@@ -411,7 +436,9 @@ def _external_refs(session: Session, user_ids: set[str]) -> dict[str, str | None
 # ---- operations -------------------------------------------------------------------------------
 
 
-def list_events(session: Session, f: Filters, limit: int, offset: int) -> dict[str, Any]:
+def list_events(
+    session: Session, f: Filters, limit: int, offset: int, *, include_sql: bool = False
+) -> dict[str, Any]:
     where = conditions(session, f)
     total = int(
         session.execute(select(func.count()).select_from(AuditEvent).where(*where)).scalar_one()
@@ -426,7 +453,7 @@ def list_events(session: Session, f: Filters, limit: int, offset: int) -> dict[s
     events = list(session.execute(stmt).scalars())
     refs = _external_refs(session, {e.user_id for e in events if e.user_id})
     return {
-        "items": [serialize(e, refs.get(e.user_id or "")) for e in events],
+        "items": [serialize(e, refs.get(e.user_id or ""), include_sql=include_sql) for e in events],
         "total": total,
         "limit": limit,
         "offset": offset,

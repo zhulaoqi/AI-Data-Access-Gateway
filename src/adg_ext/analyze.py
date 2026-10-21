@@ -10,9 +10,10 @@ from typing import cast
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from adg_ext.errors import ExtRejection
-from adg_ext.guard import GuardVerdict
+from adg_ext.guard import SYSTEM_DATABASES, GuardVerdict
 from adg_ext.params import ParamSpec
 from adg_ext.rowfilter import (
     Binding,
@@ -89,6 +90,67 @@ class Rewrite:
     @property
     def allowed(self) -> bool:
         return not self.reasons and self.sql is not None
+
+
+def qualify_session_database(sql: str, database: str, dialect: str | None) -> str:
+    """Prefix unqualified physical tables with the client session database.
+
+    The connector connection uses the datasource default database, which is not the database the
+    client selected. Already-qualified names, CTE references and ``DUAL`` stay as written. A system
+    database name is never used as a prefix. Parse failures leave the text untouched so the guard
+    reports them.
+    """
+
+    database = database.strip()
+    if not database or database.lower() in SYSTEM_DATABASES:
+        return sql
+    try:
+        tree = cast(exp.Expression, sqlglot.parse_one(sql, read=dialect))
+    except sqlglot.errors.SqlglotError:
+        return sql
+    changed = False
+    for scope in traverse_scope(tree):
+        for table in scope.tables:
+            source = scope.sources.get(table.alias_or_name)
+            if not isinstance(source, exp.Table) or source.db:
+                continue
+            if source.name.lower() == "dual":
+                continue
+            source.set("db", exp.to_identifier(database))
+            changed = True
+    if not changed:
+        return sql
+    return tree.sql(dialect=dialect)
+
+
+def referenced_databases(sql: str, dialect: str | None) -> list[str]:
+    """Databases named on physical tables, in first-seen order.
+
+    Unqualified names contribute nothing.
+    """
+
+    if not sql or not sql.strip():
+        return []
+    try:
+        tree = cast(exp.Expression, sqlglot.parse_one(sql, read=dialect))
+    except sqlglot.errors.SqlglotError:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for scope in traverse_scope(tree):
+        for table in scope.tables:
+            source = scope.sources.get(table.alias_or_name)
+            if not isinstance(source, exp.Table) or not source.db:
+                continue
+            if source.name.lower() == "dual":
+                continue
+            name = str(source.db)
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(name)
+    return found
 
 
 def _projection_star(projection: exp.Expression) -> str | None:
