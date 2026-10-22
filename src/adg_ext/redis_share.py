@@ -1,8 +1,9 @@
-"""Cross-process limits for executor replicas.
+"""Cross-process state for executor replicas.
 
 Redis is optional. Without ``redis.host`` every call keeps the in-process behavior.
-A Redis error does the same: one replica keeps enforcing its own limit instead of
-refusing every query.
+A Redis error on a limit does the same: one replica keeps enforcing its own limit
+instead of refusing every query. MCP sessions are the exception: a read failure is
+reported to the caller so it can retry, and is never treated as "no such session".
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -20,6 +22,16 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "{sqlgw}"
 _LEASE_MS = 300_000
+# Refreshed on every request that uses the session. Long enough that an open Cursor
+# connection still resolves after a quiet stretch; short enough that a deleted
+# process does not leave a permanent key.
+_MCP_SESSION_TTL_SECONDS = 24 * 60 * 60
+_MCP_SESSION_ID = re.compile(r"^[\x21-\x7E]{1,128}$")
+# read_mcp_session results. "unavailable" is a Redis failure, not a missing key.
+MCP_DISABLED = "disabled"
+MCP_HIT = "hit"
+MCP_MISS = "miss"
+MCP_UNAVAILABLE = "unavailable"
 
 _ACQUIRE = """
 local now = tonumber(ARGV[1])
@@ -60,12 +72,18 @@ def get_client() -> Any:
             return None
         try:
             import redis
+            from redis.backoff import ExponentialBackoff
+            from redis.retry import Retry
         except ImportError:
             logger.warning("redis.host is set but the redis package is not installed")
             return None
         port = int(os.environ.get("redis.port") or os.environ.get("REDIS_PORT") or 6379)
         db = int(os.environ.get("redis.db") or os.environ.get("REDIS_DB") or 1)
         password = os.environ.get("redis.password") or os.environ.get("REDIS_PASSWORD") or None
+        # One retry covers a dead pooled connection. The pool checks idle
+        # connections before use so a replica does not keep writing to a socket
+        # Redis already closed. Timeouts stay short: a down Redis must not stall
+        # the query path.
         _client = redis.Redis(
             host=host,
             port=port,
@@ -74,6 +92,9 @@ def get_client() -> Any:
             decode_responses=True,
             socket_timeout=0.4,
             socket_connect_timeout=0.4,
+            socket_keepalive=True,
+            health_check_interval=30,
+            retry=Retry(ExponentialBackoff(cap=0.2, base=0.05), retries=1),
         )
         return _client
 
@@ -178,6 +199,53 @@ class Share:
         except Exception:
             return
 
+    def save_mcp_session(self, session_id: str) -> None:
+        """Remember a Streamable HTTP session so any replica can serve it.
+
+        The value is only a marker. The protocol state is recreated per request;
+        what has to be shared is that this session id was established.
+        """
+
+        if not _mcp_session_id_ok(session_id):
+            return
+        client = get_client()
+        if client is None:
+            return
+        try:
+            client.set(self._mcp_key(session_id), "1", ex=_MCP_SESSION_TTL_SECONDS)
+        except Exception:
+            logger.warning("redis mcp session save failed")
+
+    def read_mcp_session(self, session_id: str) -> str:
+        """Return hit, miss, disabled (no Redis), or unavailable (Redis error)."""
+
+        if not _mcp_session_id_ok(session_id):
+            return MCP_MISS
+        client = get_client()
+        if client is None:
+            return MCP_DISABLED
+        try:
+            found = client.get(self._mcp_key(session_id))
+        except Exception:
+            logger.warning("redis mcp session read failed")
+            return MCP_UNAVAILABLE
+        return MCP_HIT if found else MCP_MISS
+
+    def clear_mcp_session(self, session_id: str) -> None:
+        if not _mcp_session_id_ok(session_id):
+            return
+        client = get_client()
+        if client is None:
+            return
+        try:
+            client.delete(self._mcp_key(session_id))
+        except Exception:
+            logger.warning("redis mcp session delete failed")
+
+    @staticmethod
+    def _mcp_key(session_id: str) -> str:
+        return f"{PREFIX}:mcp:{session_id}"
+
     def forward_cancel(
         self,
         request_id: str,
@@ -218,3 +286,7 @@ _share = Share()
 
 def get_share() -> Share:
     return _share
+
+
+def _mcp_session_id_ok(session_id: str) -> bool:
+    return bool(session_id) and _MCP_SESSION_ID.fullmatch(session_id) is not None

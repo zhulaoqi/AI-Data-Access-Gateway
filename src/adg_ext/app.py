@@ -11,10 +11,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from adg.connectors.registry import get_connector_registry
 from adg.control_plane.models.api_key import ApiKey
+from adg.mcp_server.server import runtime_mcp_server
 from adg_ext import blocklist, revocation
 from adg_ext.clickhouse import ClickHouseConnector
 from adg_ext.clientip import ClientIpMiddleware
 from adg_ext.config import get_ext_settings
+from adg_ext.mcp_session import install_shared_sessions
 from adg_ext.metrics import get_query_metrics
 from adg_ext.mysql_scoped import ScopedMySqlConnector
 from adg_ext.pipeline import get_admission
@@ -62,6 +64,10 @@ def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     app.add_exception_handler(sa_exc.TimeoutError, _pool_exhausted)
     # PA-8: the real client address (trusted proxy hops) for audit rows and blocklist decisions
     app.add_middleware(ClientIpMiddleware)
+    # MCP sessions are created before this install (create_app builds the server first).
+    manager = getattr(runtime_mcp_server, "_session_manager", None)
+    if manager is not None:
+        install_shared_sessions(manager)
 
     cache = revocation.get_cache()
 
