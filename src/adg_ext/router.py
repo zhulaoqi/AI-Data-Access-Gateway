@@ -117,6 +117,22 @@ def reinstate_object(
     return {"reinstated": lifted}
 
 
+@admin_router.post("/sync/datasource_account/{name}/rescan")
+def rescan_datasource(
+    name: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> dict[str, int | str]:
+    """Re-scan the live catalog of a synced datasource without changing its spec."""
+
+    try:
+        counts = SyncService(session).rescan(name)
+        session.commit()
+    except ExtSyncError as error:
+        session.rollback()
+        raise _fail(error) from error
+    return {"status": "ok", **counts}
+
+
 @admin_router.get("/sync/{object_type}")
 def list_objects(
     object_type: str,

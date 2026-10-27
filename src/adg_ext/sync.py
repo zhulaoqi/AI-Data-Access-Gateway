@@ -316,15 +316,27 @@ class SyncService:
             )
             datasource.type = connector_type
         self._s.flush()
+        self._scan(datasource, name)
+        return datasource.id
+
+    def rescan(self, name: str) -> dict[str, int]:
+        """Re-read the live catalog of a synced datasource; the spec and hash stay unchanged."""
+
+        self._check("datasource_account", name)
+        datasource = self._datasource_for(self._find("datasource_account", name))
+        if datasource is None:
+            raise ExtSyncError(404, f"datasource_account {name} has not been synced")
+        return self._scan(datasource, name)
+
+    def _scan(self, datasource: Datasource, name: str) -> dict[str, int]:
         try:
-            connector = self._registry.create(connector_type)
+            connector = self._registry.create(datasource.type)
             snapshot = connector.scan_metadata(datasource.config())
-            MetadataScanService(self._s).replace_snapshot(
+            return MetadataScanService(self._s).replace_snapshot(
                 datasource=datasource, snapshot=fit_snapshot(snapshot, name)
             )
         except (ConnectorDependencyError, ConnectorOperationError) as error:
             raise ExtSyncError(409, f"cannot scan datasource {name}: {error}") from error
-        return datasource.id
 
     def _datasource_for(self, existing: ExtSyncObject | None) -> Datasource | None:
         if existing is None or not existing.external_id:
