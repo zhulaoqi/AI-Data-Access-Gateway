@@ -87,7 +87,7 @@ def test_identifiers_that_cannot_be_stored_are_left_out_and_the_rest_kept(
     assert shop["views"] == []
     # 150 + 1 + 190 = 341 <= MAX_PATH: kept; the path limit itself is exercised below
     assert fitted["databases"][1]["tables"][0]["name"] == "q" * 190
-    assert len(warnings) == 1 and "exceed the control-plane column widths" in warnings[0]
+    assert len(warnings) == 1 and "event=catalog_entries_dropped" in warnings[0]
 
 
 def test_a_relation_whose_path_exceeds_the_path_column_is_left_out() -> None:

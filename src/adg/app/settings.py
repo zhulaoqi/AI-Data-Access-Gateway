@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     metadata_scan_max_databases: int = Field(default=25, ge=1)
     datasource_network_allowlist: str = ""
     log_level: str = "INFO"
+    # 非空时日志同时写入该文件（按 200MB 滚动，保留 10 个）；容器里由 docker/start.sh 设置。
+    log_file: str = ""
     backend_host_port: int | None = Field(default=None, ge=1, le=65535)
     admin_page_default_limit: int = Field(default=50, ge=1)
     admin_page_max_limit: int = Field(default=500, ge=1)

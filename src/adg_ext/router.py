@@ -1,5 +1,6 @@
 """HTTP surface of the extension: sync, dry-run and audit queries (admin), delegated (entry)."""
 
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -12,6 +13,7 @@ from adg.app.dependencies import (
     require_admin_api_key,
     require_scope,
 )
+from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
 from adg_ext import audit_query, blocklist, revocation
@@ -23,6 +25,8 @@ from adg_ext.netguard import check_source
 from adg_ext.pipeline import get_admission
 from adg_ext.redis_share import get_share
 from adg_ext.sync import ExtSyncError, SyncService
+
+logger = logging.getLogger(__name__)
 
 
 def require_ext_admin(
@@ -60,6 +64,7 @@ audit_router = APIRouter(
 
 
 def _fail(error: ExtSyncError) -> HTTPException:
+    logger.warning(kv(event="sync_refused", status=error.status, detail=error.message))
     return HTTPException(status_code=error.status, detail=error.message)
 
 
@@ -96,7 +101,11 @@ def delete_object(
         raise _fail(error) from error
     if external_id and object_type in {"user", "credential"}:
         # revocation must also stop requests that are already queued or running
-        get_admission().revoke(external_id)
+        cancelled = get_admission().revoke(external_id)
+        if cancelled:
+            logger.info(
+                kv(event="revoked_inflight", type=object_type, name=name, cancelled=cancelled)
+            )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

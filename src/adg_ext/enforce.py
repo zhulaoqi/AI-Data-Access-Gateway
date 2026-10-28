@@ -16,6 +16,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from adg.app.log_config import kv
 from adg_ext import blocklist, clientip
 from adg_ext.config import ext_enabled
 from adg_ext.riskstats import get_counters
@@ -93,6 +94,8 @@ def check_source(session: Session | None = None) -> None:
     cache.blocked_total += 1
     get_counters().blocked(ip, None, blocklist.SOURCE_BLOCKED)
     _audit_sample(session, ip, None, blocklist.SOURCE_BLOCKED)
+    if _should_sample(ip or "unknown", "log:" + blocklist.SOURCE_BLOCKED):
+        logger.warning(kv(event="source_blocked", client=ip, sampled="1/min"))
     raise _reject(blocklist.SOURCE_BLOCKED)
 
 
@@ -131,6 +134,8 @@ def refuse_frozen(session: Session | None, grant_id: str) -> None:
     ip = clientip.current()
     get_counters().blocked(ip, grant_id, blocklist.GRANT_FROZEN)
     _audit_sample(session, ip, grant_id, blocklist.GRANT_FROZEN)
+    if _should_sample(ip or "unknown", "log:" + blocklist.GRANT_FROZEN):
+        logger.warning(kv(event="grant_frozen", client=ip, grant=grant_id, sampled="1/min"))
     raise _reject(blocklist.GRANT_FROZEN)
 
 
@@ -172,4 +177,6 @@ def auth_failed(session: Session | None, reason: str, user_id: str | None = None
             grant_id = grant_of_user(session, user_id)
         except Exception:
             grant_id = None
-    get_counters().auth_failed(clientip.current(), grant_id, reason)
+    ip = clientip.current()
+    get_counters().auth_failed(ip, grant_id, reason)
+    logger.warning(kv(event="auth_failed", reason=reason, client=ip, grant=grant_id))

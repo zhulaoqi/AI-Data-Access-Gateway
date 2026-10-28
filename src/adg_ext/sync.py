@@ -10,6 +10,7 @@ ApiKey (``runtime`` scope, externally supplied SHA-256 hash).
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +19,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from adg.app.log_config import kv
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
 from adg.connectors.registry import ConnectorRegistry, get_connector_registry
 from adg.control_plane.models.api_key import ApiKey
@@ -127,11 +129,13 @@ def fit_snapshot(snapshot: Any, datasource: str) -> dict[str, Any]:
         databases.append(fitted)
     if dropped:
         logger.warning(
-            "datasource %s: %d catalog entries exceed the control-plane column widths and are "
-            "not exposed (first: %s)",
-            datasource,
-            len(dropped),
-            dropped[0],
+            kv(
+                event="catalog_entries_dropped",
+                datasource=datasource,
+                count=len(dropped),
+                first=dropped[0],
+                reason="exceeds_control_plane_column_width",
+            )
         )
     return {**snapshot, "databases": databases}
 
@@ -173,6 +177,7 @@ class SyncService:
             raise ExtSyncError(400, "hash must be a 64 character digest")
         existing = self._find(object_type, name)
         if existing is not None and existing.hash == hash_ and existing.external_id:
+            logger.debug(kv(event="sync_put", type=object_type, name=name, changed=False))
             return existing.external_id
         handler = getattr(self, f"_put_{object_type}")
         external_id: str = handler(name, spec, existing)
@@ -183,6 +188,16 @@ class SyncService:
         record.updated_at = datetime.now(UTC)
         self._s.add(record)
         self._s.flush()
+        logger.info(
+            kv(
+                event="sync_put",
+                type=object_type,
+                name=name,
+                changed=True,
+                created=existing is None,
+                external_id=external_id,
+            )
+        )
         return external_id
 
     def delete(self, object_type: str, name: str) -> None:
@@ -193,6 +208,9 @@ class SyncService:
         getattr(self, f"_delete_{object_type}")(name, existing)
         self._s.delete(existing)
         self._s.flush()
+        logger.info(
+            kv(event="sync_delete", type=object_type, name=name, external_id=existing.external_id)
+        )
 
     def reinstate(self, object_type: str, name: str) -> bool:
         """Lift the revocation tombstone of a user or credential (explicit, admin only).
@@ -226,7 +244,7 @@ class SyncService:
             for key in keys:
                 key.key_hash = f"retired:{key.id}"  # frees the unique hash, can never match
         self._s.flush()
-        logger.info("tombstone lifted for %s %s", object_type, name)
+        logger.info(kv(event="sync_reinstated", type=object_type, name=name))
         return True
 
     def external_id_of(self, object_type: str, name: str) -> str | None:
@@ -329,14 +347,34 @@ class SyncService:
         return self._scan(datasource, name)
 
     def _scan(self, datasource: Datasource, name: str) -> dict[str, int]:
+        started = time.perf_counter()
         try:
             connector = self._registry.create(datasource.type)
             snapshot = connector.scan_metadata(datasource.config())
-            return MetadataScanService(self._s).replace_snapshot(
+            counts = MetadataScanService(self._s).replace_snapshot(
                 datasource=datasource, snapshot=fit_snapshot(snapshot, name)
             )
         except (ConnectorDependencyError, ConnectorOperationError) as error:
+            logger.warning(
+                kv(
+                    event="catalog_scan_failed",
+                    datasource=name,
+                    engine=datasource.type,
+                    ms=int((time.perf_counter() - started) * 1000),
+                    error=type(error).__name__,
+                )
+            )
             raise ExtSyncError(409, f"cannot scan datasource {name}: {error}") from error
+        logger.info(
+            kv(
+                event="catalog_scanned",
+                datasource=name,
+                engine=datasource.type,
+                ms=int((time.perf_counter() - started) * 1000),
+                **{k: v for k, v in counts.items() if isinstance(v, int)},
+            )
+        )
+        return counts
 
     def _datasource_for(self, existing: ExtSyncObject | None) -> Datasource | None:
         if existing is None or not existing.external_id:

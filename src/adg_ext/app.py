@@ -9,6 +9,7 @@ from sqlalchemy import exc as sa_exc
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from adg.app.log_config import kv
 from adg.connectors.registry import get_connector_registry
 from adg.control_plane.models.api_key import ApiKey
 from adg.mcp_server.server import runtime_mcp_server
@@ -39,7 +40,13 @@ def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:
     """No control-plane connection within the pool timeout: a clear, retryable 503 (never a 500)."""
 
     retry_after = get_ext_settings().pool_exhausted_retry_after_seconds
-    logger.warning("control-plane pool exhausted: %s", type(error).__name__)
+    logger.warning(
+        kv(
+            event="control_plane_pool_exhausted",
+            error=type(error).__name__,
+            retry_after=retry_after,
+        )
+    )
     get_query_metrics().rejected(POOL_EXHAUSTED)
     get_admission().count_rejection("pool_exhausted")
     return JSONResponse(

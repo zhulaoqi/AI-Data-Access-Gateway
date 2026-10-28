@@ -10,6 +10,8 @@ esac
 
 # SELECT * 暂时放行：展开成该表已允许的列。要重新拒绝，启动前设 ADG_SQL_REJECT_WILDCARD=true。
 export ADG_SQL_REJECT_WILDCARD="${ADG_SQL_REJECT_WILDCARD:-false}"
+# 日志同时落到宿主机挂载目录（与控制面、JDBC 入口同一位置），格式见 src/adg/app/log_config.py
+export ADG_LOG_FILE="${ADG_LOG_FILE:-/dianyi/log/sqlgw-executor.log}"
 
 cd /dianyi/app/sqlgw-executor
 exec uvicorn adg.app.main:create_app --factory --host 0.0.0.0 --port "${ADG_BACKEND_PORT:-8000}"

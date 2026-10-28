@@ -19,6 +19,7 @@ from uuid import uuid4
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import select
 
+from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.connectors.base import QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
@@ -277,6 +278,7 @@ def run(
     def reject(kind: str, reason: str, hint: dict[str, object] | None = None) -> dict[str, Any]:
         _note_hit_databases(audit_meta, query, dialect_name)
         get_query_metrics().rejected(reason)
+        _log_rejected(identity.user_id, api_key_id, datasource_id, kind, reason, audit_meta)
         _record_rejection(
             svc, identity, api_key_id, kind, datasource_id, resource_ids, query, reason, audit_meta
         )
@@ -423,6 +425,7 @@ def _execute(
 
     def rejected(kind: str, reason: str) -> dict[str, Any]:
         get_query_metrics().rejected(reason)
+        _log_rejected(identity.user_id, api_key_id, datasource_id, kind, reason, audit_extra)
         _record_rejection(
             svc,
             identity,
@@ -493,8 +496,15 @@ def _execute(
             final = ""  # no connection within the pool timeout: a 503 for the caller, see router
             session.rollback()
             raise
-        except Exception:
-            logger.error("audit write failed; refusing to execute query %s", query_id)
+        except Exception as error:
+            logger.error(
+                kv(
+                    event="audit_write_failed",
+                    query_id=query_id,
+                    action="refuse_query",
+                    error=type(error).__name__,
+                )
+            )
             session.rollback()
             get_query_metrics().audit_unavailable()
             get_query_metrics().rejected("audit_unavailable")
@@ -513,6 +523,20 @@ def _execute(
             metadata["error_type"] = outcome
             event.metadata_json = _dumps(metadata)
             _persist(session)
+            logger.warning(
+                kv(
+                    event="query",
+                    query_id=query_id,
+                    grant=identity.user_id,
+                    datasource=datasource_id,
+                    outcome=final,
+                    error=outcome,
+                    ms=duration_ms,
+                    queue_wait_ms=int(ticket.waited_seconds * 1000),
+                    request_id=request_id,
+                    fingerprint=audit_extra.get("sql_fingerprint"),
+                )
+            )
             return {
                 "query_id": query_id,
                 "status": "error",
@@ -542,6 +566,22 @@ def _execute(
         event.metadata_json = _dumps(metadata)
         _persist(session)
         final = "completed"
+        logger.info(
+            kv(
+                event="query",
+                query_id=query_id,
+                grant=identity.user_id,
+                datasource=datasource_id,
+                outcome=final,
+                rows=len(rows),
+                truncated=truncated,
+                masked=len(masked_columns),
+                ms=duration_ms,
+                queue_wait_ms=int(ticket.waited_seconds * 1000),
+                request_id=request_id,
+                fingerprint=audit_extra.get("sql_fingerprint"),
+            )
+        )
         return {
             "query_id": query_id,
             "status": "success",
@@ -572,6 +612,28 @@ _ERROR_MESSAGES = {
 }
 
 
+def _log_rejected(
+    grant: str | None,
+    api_key_id: str,
+    datasource_id: str | None,
+    kind: str,
+    reason: str,
+    meta: dict[str, Any],
+) -> None:
+    logger.info(
+        kv(
+            event="query_rejected",
+            grant=grant,
+            api_key=api_key_id,
+            datasource=datasource_id,
+            kind=kind,
+            reason=reason,
+            request_id=meta.get("request_id"),
+            fingerprint=meta.get("sql_fingerprint"),
+        )
+    )
+
+
 def json_loads(text: str | None) -> dict[str, Any]:
     try:
         value = json.loads(text or "{}")
@@ -588,8 +650,8 @@ def _persist(session: Any) -> None:
     try:
         session.flush()
         session.commit()
-    except Exception:
-        logger.error("completion audit write failed", exc_info=False)
+    except Exception as error:
+        logger.error(kv(event="audit_completion_write_failed", error=type(error).__name__))
         session.rollback()
 
 
@@ -642,5 +704,12 @@ def _run_connector(
         get_share().note_success(datasource.id)
         return "connector_operation_error"
     breaker.release_probe()
-    logger.error("unexpected connector failure: %s", type(error).__name__)
+    logger.error(
+        kv(
+            event="connector_unexpected_error",
+            query_id=query_id,
+            datasource=datasource.id,
+            error=type(error).__name__,
+        )
+    )
     return "connector_operation_error"
