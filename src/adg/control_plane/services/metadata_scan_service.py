@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
+from adg.shared.ids import uuidv7
 
 
 class MetadataScanService:
@@ -27,6 +28,12 @@ class MetadataScanService:
             resource.path: resource
             for resource in self._session.execute(
                 select(Resource).where(Resource.datasource_id == datasource.id)
+            ).scalars()
+        }
+        self._existing_fields = {
+            (field.resource_id, field.name): field
+            for field in self._session.execute(
+                select(ResourceField).where(ResourceField.datasource_id == datasource.id)
             ).scalars()
         }
         seen_resource_ids: set[str] = set()
@@ -98,6 +105,7 @@ class MetadataScanService:
                 resource_count += len(relation_resources)
                 field_count += len(relation_fields)
 
+        self._session.flush()
         self._delete_stale_snapshot_rows(datasource.id, seen_resource_ids, seen_field_ids)
         return {"resources": resource_count, "fields": field_count}
 
@@ -120,6 +128,7 @@ class MetadataScanService:
         resource = existing_resources.get(path)
         if resource is None:
             resource = Resource(
+                id=uuidv7(),
                 datasource_id=datasource.id,
                 path=path,
                 display_name=name,
@@ -137,7 +146,6 @@ class MetadataScanService:
         resource.query_language = query_language
         resource.metadata_json = json.dumps(metadata, separators=(",", ":"))
         resource.scanned_at = scanned_at
-        self._session.flush()
         return resource
 
     def _payload_description(self, payload: Mapping[str, object]) -> str | None:
@@ -162,15 +170,10 @@ class MetadataScanService:
     ) -> ResourceField:
         """Create or update one field while keeping manual descriptions and status."""
 
-        field = self._session.execute(
-            select(ResourceField).where(
-                ResourceField.datasource_id == datasource.id,
-                ResourceField.resource_id == relation.id,
-                ResourceField.name == name,
-            )
-        ).scalar_one_or_none()
+        field = self._existing_fields.get((relation.id, name))
         if field is None:
             field = ResourceField(
+                id=uuidv7(),
                 datasource_id=datasource.id,
                 resource_id=relation.id,
                 name=name,
@@ -179,6 +182,7 @@ class MetadataScanService:
                 metadata_json=json.dumps({}, separators=(",", ":")),
             )
             self._session.add(field)
+            self._existing_fields[(relation.id, name)] = field
         elif field.description is None and description is not None:
             field.description = description
 
@@ -186,7 +190,6 @@ class MetadataScanService:
         field.nullable = nullable
         field.ordinal_position = ordinal_position
         field.metadata_json = json.dumps({}, separators=(",", ":"))
-        self._session.flush()
         return field
 
     def _delete_stale_snapshot_rows(
