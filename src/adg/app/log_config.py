@@ -97,7 +97,7 @@ def configure_logging(level: str = "INFO", log_file: str = "") -> None:
         if log_file:
             handlers.append(
                 RotatingFileHandler(
-                    log_file, maxBytes=200 * 1024 * 1024, backupCount=10, encoding="utf-8"
+                    log_file, maxBytes=200 * 1024 * 1024, backupCount=5, encoding="utf-8"
                 )
             )
         for handler in handlers:
