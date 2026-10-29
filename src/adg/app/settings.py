@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     runtime_datasource_pool_idle_ttl_seconds: int = Field(default=300, gt=0)
     runtime_datasource_pool_size: int = Field(default=5, ge=1)
     runtime_datasource_pool_max_overflow: int = Field(default=0, ge=0)
+    # 单执行器进程所有运行时数据源池合计的物理连接硬上限。
+    runtime_datasource_pool_global_max_connections: int = Field(default=1024, ge=1)
     runtime_datasource_connect_timeout_seconds: int = Field(default=10, gt=0)
     runtime_datasource_read_timeout_seconds: int = Field(default=120, gt=0)
     runtime_datasource_write_timeout_seconds: int = Field(default=120, gt=0)

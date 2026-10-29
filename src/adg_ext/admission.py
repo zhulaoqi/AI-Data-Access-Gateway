@@ -1,5 +1,5 @@
-"""Admission control (PA-4): per-user concurrency, a bounded FIFO queue, a datasource-wide
-limit and a per-datasource circuit breaker.
+"""Admission control (PA-4): per-user concurrency, a bounded FIFO queue, per-datasource
+limits protected by a deployment-wide hard cap, and per-datasource circuit breakers.
 
 The runtime is synchronous and runs in worker threads, so the controller is thread based. A query
 first takes one of the user's concurrency slots (waiting in a bounded FIFO queue when they are all
@@ -29,6 +29,7 @@ class MetricsView:
     queued: int
     running: int
     datasource_running: dict[str, int]
+    datasource_limits: dict[str, int]
     breakers: dict[str, str]
     counters: dict[str, int]
     wait_seconds_avg: float
@@ -173,6 +174,7 @@ class Admission:
         self._cond = threading.Condition()
         self._lanes: dict[str, _Lane] = {}
         self._datasource_running: dict[str, int] = {}
+        self._datasource_limits: dict[str, int] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
         self._counters: dict[str, int] = {}
         self._wait_total = 0.0
@@ -200,6 +202,7 @@ class Admission:
                 queued=sum(len(lane.queue) for lane in self._lanes.values()),
                 running=sum(lane.running for lane in self._lanes.values()),
                 datasource_running=dict(self._datasource_running),
+                datasource_limits=dict(self._datasource_limits),
                 breakers={k: b.state for k, b in self._breakers.items()},
                 counters=dict(self._counters),
                 wait_seconds_avg=(self._wait_total / self._wait_count) if self._wait_count else 0.0,
@@ -240,9 +243,13 @@ class Admission:
         max_concurrency: int,
         queue_size: int,
         queue_timeout: float,
+        datasource_limit: int | None = None,
         tags: frozenset[str] = frozenset(),
     ) -> Ticket:
         max_concurrency = max(1, max_concurrency)
+        effective_datasource_limit = max(
+            1, min(self._datasource_limit, datasource_limit or self._datasource_limit)
+        )
         if get_share().circuit_open(datasource_key) or not self.breaker(datasource_key).allow():
             with self._cond:
                 self._count("rejected_circuit_open")
@@ -256,7 +263,7 @@ class Admission:
             self._observe_rejected_wait(error, started)
             raise
         try:
-            self._take_datasource_slot(datasource_key, deadline)
+            self._take_datasource_slot(datasource_key, effective_datasource_limit, deadline)
         except AdmissionRejected as error:
             with self._cond:
                 self._lanes[user_key].running -= 1
@@ -277,7 +284,7 @@ class Admission:
         if not share.try_slot(f"user:{user_key}", max_concurrency, member):
             self._release(ticket)
             raise AdmissionRejected("queue_full")
-        if not share.try_slot(f"ds:{datasource_key}", self._datasource_limit, member):
+        if not share.try_slot(f"ds:{datasource_key}", effective_datasource_limit, member):
             share.release_slot(f"user:{user_key}", member)
             self._release(ticket)
             raise AdmissionRejected("datasource_busy")
@@ -328,9 +335,12 @@ class Admission:
                 self._cond.notify_all()
                 raise
 
-    def _take_datasource_slot(self, datasource_key: str, deadline: float) -> None:
+    def _take_datasource_slot(
+        self, datasource_key: str, datasource_limit: int, deadline: float
+    ) -> None:
         with self._cond:
-            while self._datasource_running.get(datasource_key, 0) >= self._datasource_limit:
+            self._datasource_limits[datasource_key] = datasource_limit
+            while self._datasource_running.get(datasource_key, 0) >= datasource_limit:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     self._count("rejected_datasource_busy")

@@ -121,7 +121,7 @@ MySQL 用例在改动前稳定复现 `status=error`，并含「库端确实拒�
 | `adg_ext_query_total` | counter | `outcome` = `completed`/`failed`/`timeout`/`cancelled`/`rejected` | 受管查询按结果计数；五个取值启动即为 0。`rejected` 含 Guard、权限、准入、`audit_unavailable` 拒绝；`failed` 是放行后执行失败（数据源不可用、连接器错误等） |
 | `adg_ext_query_rejected_total` | counter | `reason` | 拒绝原因码取**第一个冒号之前**的部分（`column_not_allowed:ssn` → `column_not_allowed`）；一次拒绝含多个原因码时每个各计一次；原因须匹配 `[a-z][a-z0-9_]{0,63}`，否则记为 `other`；至多 64 个不同取值，溢出并入 `other` |
 | `adg_ext_admission_wait_seconds` | histogram | `le` | 排队等待分布，桶 5ms…60s；放行的请求与等待后被拒（`queue_timeout`/`datasource_busy`/`revoked`）的请求都计入，`queue_full`/`circuit_open` 瞬时拒绝不计 |
-| `adg_ext_admission_datasource_limit` | gauge | `datasource` | 数据源并发上限（`ADG_EXT_DATASOURCE_MAX_CONCURRENCY`，全局同一值），覆盖所有出现过运行或熔断状态的数据源 |
+| `adg_ext_admission_datasource_limit` | gauge | `datasource` | 数据源当前生效的查询并发上限（来自控制面同步的数据源容量，并受进程级连接预算约束） |
 | `adg_ext_audit_unavailable_total` | counter | — | 因审计写入失败而拒绝的请求数（同时计入 `rejected`） |
 | `adg_ext_revocation_poll_age_seconds` | gauge | — | 距上次**成功**拉取吊销名单的秒数（从未成功则为进程内缓存创建后的秒数）；未配置 `ADG_EXT_REVOCATION_URL` 时不输出 |
 
@@ -225,11 +225,10 @@ PBKDF2**：API Key 是 `SHA-256(key)` 的索引查找，委托路径只做 `ext_
    与既有 `admission_*` 原因码同一词表（`reason` 同名字段，进 `adg_ext_query_rejected_total{reason="admission_pool_exhausted"}` 与
    `adg_ext_admission_rejected_total{reason="pool_exhausted"}`），但**用 HTTP 503 而不是 200**：此时没有控制面连接，无法写审计行，
    所以这类拒绝**没有审计行**（只有指标与日志）。放行后才拿不到连接（写开始审计行时）同样 503，槽位与熔断探针照常释放。
-4. **数据源并发上限不超过运行时连接池**（`pipeline.effective_datasource_limit`）：`ADG_EXT_DATASOURCE_MAX_CONCURRENCY`（默认 20）
-   与 `ADG_RUNTIME_DATASOURCE_POOL_SIZE + MAX_OVERFLOW`（默认 5 + 0）相互矛盾时，多放行的语句会停在连接器自己的池里（上游池等待 30 s），
-   既不排队也不受排队超时约束；更糟的是等待连接超过了语句超时后，请求已返回 `query_timeout`，工作线程却仍在等池、之后照样执行
-   （线程转储里有 4 个线程卡在 `relational.py` 的池取连接）。现在有效上限取两者较小值（gauge `adg_ext_admission_datasource_limit` 反映有效值）；
-   要提高单数据源并发，同时调大 `ADG_RUNTIME_DATASOURCE_POOL_SIZE`。
+4. **数据源并发上限不超过连接预算**（`pipeline.effective_datasource_capacity`）：控制面同步的
+   `connectionBudget` / `maxQueryConcurrency`（缺省按标准档 32/16）再受
+   `ADG_RUNTIME_DATASOURCE_POOL_GLOBAL_MAX_CONNECTIONS`（默认 1024）约束。连接池按数据源预算换代，
+   进程级物理连接有全局守卫；gauge `adg_ext_admission_datasource_limit` 反映每个数据源的有效查询并发。
 
 **前后对比**（`test_extint_bench.py -k stall`，5 授权 × 每授权 6 并发，授权上限 3 / 队列 10 / 排队超时 30 s，语句超时 2 s，
 真实 uvicorn，MySQL 慢查询）：

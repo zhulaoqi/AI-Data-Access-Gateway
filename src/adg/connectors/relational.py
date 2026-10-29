@@ -2,6 +2,7 @@ import importlib
 import ipaddress
 import socket
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import URL, create_engine, inspect, text
 from sqlalchemy.engine import Connection
@@ -222,10 +223,18 @@ class RelationalConnector:
         self._require_dependency()
         connection_config = self._validated_connection_config(config)
         try:
+            pool_options: dict[str, Any] = {}
+            if connection_config.get("_ext_datasource_id"):
+                pool_options["datasource_key"] = str(connection_config["_ext_datasource_id"])
+            if connection_config.get("_ext_connection_budget") is not None:
+                pool_options["connection_budget"] = int(
+                    str(connection_config["_ext_connection_budget"])
+                )
             engine = runtime_engine_cache.get_engine(
                 self.connector_type,
                 self._build_url(connection_config),
                 connect_args=self._runtime_connect_args(),
+                **pool_options,
             )
             with engine.begin() as connection:
                 result = connection.execute(text(sql))

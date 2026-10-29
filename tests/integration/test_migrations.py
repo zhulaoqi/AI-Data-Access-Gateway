@@ -161,9 +161,7 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         / "versions"
     )
     revision_files = sorted(
-        path.name
-        for path in versions_path.glob("*.py")
-        if path.name != "__init__.py"
+        path.name for path in versions_path.glob("*.py") if path.name != "__init__.py"
     )
     assert revision_files == [
         "202604260001_directory_runtime_baseline.py",
@@ -172,6 +170,7 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202606110001_resource_policy_datasource_scope.py",
         "202610140001_ext_tables.py",
         "202610150001_widen_audit_query_id_and_ext_columns.py",
+        "202610290001_executor_capacity.py",
     ]
 
     revisions: dict[str, tuple[str, str | None]] = {}
@@ -206,5 +205,9 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202610150001_widen_audit_query_id_and_ext_columns.py": (
             "202610150001",
             "202610140001",
+        ),
+        "202610290001_executor_capacity.py": (
+            "202610290001",
+            "202610150001",
         ),
     }

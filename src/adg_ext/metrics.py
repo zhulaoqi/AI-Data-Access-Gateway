@@ -195,18 +195,23 @@ def render(
     w.sample("adg_ext_admission_running", view.running)
 
     running = view.datasource_running
+    limits = view.datasource_limits
     breakers = view.breakers
-    datasources = sorted(set(running) | set(breakers))
+    datasources = sorted(set(running) | set(limits) | set(breakers))
     w.family("adg_ext_admission_datasource_running", "gauge", "Requests executing per datasource.")
     for ds in datasources:
         w.sample("adg_ext_admission_datasource_running", running.get(ds, 0), datasource=ds)
     w.family(
         "adg_ext_admission_datasource_limit",
         "gauge",
-        "Datasource-wide concurrency limit (ADG_EXT_DATASOURCE_MAX_CONCURRENCY).",
+        "Effective datasource concurrency limit after capacity and deployment caps.",
     )
     for ds in datasources:
-        w.sample("adg_ext_admission_datasource_limit", admission.datasource_limit, datasource=ds)
+        w.sample(
+            "adg_ext_admission_datasource_limit",
+            limits.get(ds, admission.datasource_limit),
+            datasource=ds,
+        )
     w.family(
         "adg_ext_admission_breaker_state",
         "gauge",

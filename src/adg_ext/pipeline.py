@@ -35,6 +35,7 @@ from adg_ext.credential_usage import note_api_key
 from adg_ext.fingerprint import sql_fingerprint
 from adg_ext.killer import kill_query
 from adg_ext.metrics import get_query_metrics, reset_query_metrics
+from adg_ext.models import ExtDatasourceCapacity
 from adg_ext.redis_share import get_share
 
 if TYPE_CHECKING:
@@ -53,20 +54,35 @@ _INFRA_CLASSES = {
 }
 _admission: Admission | None = None
 _admission_lock = threading.Lock()
+DEFAULT_DATASOURCE_CONNECTION_BUDGET = 32
+DEFAULT_DATASOURCE_QUERY_CONCURRENCY = 16
 
 
 def effective_datasource_limit() -> int:
-    """The datasource-wide concurrency cap: never above what the runtime pool can serve.
+    """Process deployment hard cap applied above every datasource contract."""
 
-    The connector draws from a pool of ``ADG_RUNTIME_DATASOURCE_POOL_SIZE`` (+ overflow)
-    connections; admitting more statements than that parks them inside the pool, outside the
-    queue and its timeout, so they would neither queue nor be refused in a controlled way.
-    """
+    return get_settings().runtime_datasource_pool_global_max_connections
 
-    base = get_ext_settings().datasource_max_concurrency
+
+def effective_datasource_capacity(
+    capacity: ExtDatasourceCapacity | None,
+) -> tuple[int, int]:
+    """Return effective ``(connection budget, query concurrency)`` under deployment caps."""
+
     runtime = get_settings()
-    capacity = runtime.runtime_datasource_pool_size + runtime.runtime_datasource_pool_max_overflow
-    return max(1, min(base, capacity))
+    deployment_connections = runtime.runtime_datasource_pool_global_max_connections
+    connection_budget = (
+        min(DEFAULT_DATASOURCE_CONNECTION_BUDGET, deployment_connections)
+        if capacity is None
+        else min(capacity.connection_budget, deployment_connections)
+    )
+    requested_queries = (
+        DEFAULT_DATASOURCE_QUERY_CONCURRENCY
+        if capacity is None
+        else capacity.max_query_concurrency
+    )
+    query_concurrency = min(connection_budget, requested_queries)
+    return max(1, connection_budget), max(1, query_concurrency)
 
 
 def release_connection(session: Any) -> None:
@@ -77,6 +93,12 @@ def release_connection(session: Any) -> None:
     """
 
     session.commit()
+
+
+def admission_rejection_kind(reason: str) -> str:
+    """Separate datasource capacity pressure from user/grant admission limits."""
+
+    return "datasource_capacity_rejected" if reason == "datasource_busy" else "permission_rejected"
 
 
 def get_admission() -> Admission:
@@ -422,6 +444,8 @@ def _execute(
     user_key = identity.user_id or api_key_id
     admission = get_admission()
     limits = ctx.limits
+    capacity = session.get(ExtDatasourceCapacity, datasource_id)
+    connection_budget, datasource_limit = effective_datasource_capacity(capacity)
 
     def rejected(kind: str, reason: str) -> dict[str, Any]:
         get_query_metrics().rejected(reason)
@@ -450,6 +474,7 @@ def _execute(
             max_concurrency=limits["maxConcurrency"],
             queue_size=limits["queueSize"],
             queue_timeout=float(limits["queueTimeoutSeconds"]),
+            datasource_limit=datasource_limit,
             tags=frozenset(
                 t
                 for t in (
@@ -461,7 +486,7 @@ def _execute(
             ),
         )
     except AdmissionRejected as error:
-        return rejected("permission_rejected", f"admission_{error.reason}")
+        return rejected(admission_rejection_kind(error.reason), f"admission_{error.reason}")
 
     get_share().register_run(request_id or "")
     final = "failed"  # the outcome label unless a branch below says otherwise
@@ -511,7 +536,16 @@ def _execute(
             final = ""
             return {"status": "rejected", "reason": "audit_unavailable"}
 
-        outcome = _run_connector(svc, datasource, tagged, effective_limit, query_id, limits, ticket)
+        outcome = _run_connector(
+            svc,
+            datasource,
+            tagged,
+            effective_limit,
+            query_id,
+            limits,
+            ticket,
+            connection_budget,
+        )
         duration_ms = int((time.monotonic() - started_wall) * 1000)
         metadata: dict[str, Any] = dict(json_loads(event.metadata_json))
         metadata.update(phase="completed", duration_ms=duration_ms)
@@ -663,6 +697,7 @@ def _run_connector(
     query_id: str,
     limits: dict[str, int],
     ticket: Ticket,
+    connection_budget: int,
 ) -> QueryResult | str:
     """Execute on a worker thread; returns the result or an error-type string."""
 
@@ -670,6 +705,8 @@ def _run_connector(
     config = dict(datasource.config())
     config["_ext_timeout_seconds"] = int(timeout)
     config["_ext_query_id"] = query_id
+    config["_ext_datasource_id"] = datasource.id
+    config["_ext_connection_budget"] = connection_budget
     breaker = get_admission().breaker(datasource.id)
     connector = svc._connector_registry.create(datasource.type)
 

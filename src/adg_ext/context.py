@@ -143,4 +143,9 @@ def load(session: Session, *, user_id: str | None, role_ids: Iterable[str]) -> E
         attr = session.get(ExtUserAttribute, user_id)
         if attr is not None:
             ctx.user_params = dict(_loads(attr.params_json, {}))
+            user_limits = _loads(attr.limits_json, {})
+            if isinstance(user_limits, dict):
+                for key in DEFAULT_LIMITS:
+                    if user_limits.get(key) is not None:
+                        ctx.limits[key] = min(ctx.limits[key], int(user_limits[key]))
     return ctx

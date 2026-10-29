@@ -10,7 +10,16 @@ def make(**kw):
     return Admission(**kw)
 
 
-def acquire(a, user="u", ds="d", conc=1, queue=2, timeout=0.5, tags=frozenset()):
+def acquire(
+    a,
+    user="u",
+    ds="d",
+    conc=1,
+    queue=2,
+    timeout=0.5,
+    datasource_limit=None,
+    tags=frozenset(),
+):
     return a.acquire(
         tags=tags,
         user_key=user,
@@ -18,6 +27,7 @@ def acquire(a, user="u", ds="d", conc=1, queue=2, timeout=0.5, tags=frozenset())
         max_concurrency=conc,
         queue_size=queue,
         queue_timeout=timeout,
+        datasource_limit=datasource_limit,
     )
 
 
@@ -100,6 +110,34 @@ def test_datasource_limit_applies_across_users() -> None:
     acquire(a, user="b", ds="x").release()
     # the user slot of the refused request was given back
     assert a.snapshot()["running"] == 0
+
+
+def test_datasource_specific_limits_are_independent_and_visible() -> None:
+    a = make(datasource_limit=10)
+    x = acquire(a, user="x1", ds="x", datasource_limit=1)
+    y1 = acquire(a, user="y1", ds="y", datasource_limit=2)
+    y2 = acquire(a, user="y2", ds="y", datasource_limit=2)
+
+    with pytest.raises(AdmissionRejected) as error:
+        acquire(a, user="x2", ds="x", timeout=0.05, datasource_limit=1)
+    assert error.value.reason == "datasource_busy"
+    assert a.metrics_view().datasource_limits == {"x": 1, "y": 2}
+
+    x.release()
+    y1.release()
+    y2.release()
+
+
+def test_datasource_limit_cannot_exceed_deployment_hard_limit() -> None:
+    a = make(datasource_limit=2)
+    first = acquire(a, user="a", ds="x", datasource_limit=20)
+    second = acquire(a, user="b", ds="x", datasource_limit=20)
+    with pytest.raises(AdmissionRejected) as error:
+        acquire(a, user="c", ds="x", timeout=0.05, datasource_limit=20)
+    assert error.value.reason == "datasource_busy"
+    assert a.metrics_view().datasource_limits["x"] == 2
+    first.release()
+    second.release()
 
 
 def test_breaker_opens_then_half_open_probe_closes() -> None:

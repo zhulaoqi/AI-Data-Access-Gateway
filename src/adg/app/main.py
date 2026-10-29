@@ -132,7 +132,9 @@ def _log_startup(settings: Settings) -> None:
             blocklist_configured=bool(ext.blocklist_url),
             trusted_proxy_hops=ext.trusted_proxy_hops,
             audit_fail_closed=ext.audit_fail_closed,
-            datasource_max_concurrency=ext.datasource_max_concurrency,
+            runtime_pool_global_max_connections=(
+                settings.runtime_datasource_pool_global_max_connections
+            ),
         )
     )
 

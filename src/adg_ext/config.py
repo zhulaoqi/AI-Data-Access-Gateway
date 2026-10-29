@@ -48,8 +48,7 @@ class ExtSettings(BaseSettings):
     # Sources allowed to use the `entry` scope (the JDBC entry service). Empty = no restriction.
     entry_allowed_cidrs: str = ""
 
-    # Admission control (PA-4) defaults; per-grant limits from the role spec override them.
-    datasource_max_concurrency: int = 20
+    # Admission control (PA-4); per-grant and per-datasource limits come from synced contracts.
     breaker_failure_threshold: int = 5
     breaker_open_seconds: float = 30.0
 

@@ -16,6 +16,7 @@ class CacheSettings:
     runtime_datasource_pool_idle_ttl_seconds: int = 300
     runtime_datasource_pool_size: int = 5
     runtime_datasource_pool_max_overflow: int = 0
+    runtime_datasource_pool_global_max_connections: int = 1024
 
 
 class FakeEngine:
@@ -204,3 +205,70 @@ def test_runtime_create_engine_uses_pre_ping_and_pool_limits() -> None:
         "max_overflow": 0,
         "connect_args": {"connect_timeout": 10},
     }
+
+
+def test_datasource_connection_budget_overrides_default_pool_size() -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    def engine_factory(url: URL, **kwargs: Any) -> FakeEngine:
+        captured_kwargs.update(kwargs)
+        return FakeEngine("engine")
+
+    cache = RuntimeEngineCache(
+        settings_provider=lambda: CacheSettings(),
+        engine_factory=cast(EngineFactory, engine_factory),
+    )
+    cache.get_engine(
+        "postgres",
+        make_url(),
+        connect_args={"connect_timeout": 10},
+        datasource_key="ds-orders",
+        connection_budget=3,
+    )
+
+    assert captured_kwargs["pool_size"] == 3
+    assert captured_kwargs["max_overflow"] == 0
+
+
+def test_capacity_change_replaces_pool_and_disposes_only_old_idle_generation() -> None:
+    created: list[FakeEngine] = []
+
+    def engine_factory(url: URL, **kwargs: Any) -> FakeEngine:
+        engine = FakeEngine(f"pool-{kwargs['pool_size']}")
+        created.append(engine)
+        return engine
+
+    cache = RuntimeEngineCache(
+        settings_provider=lambda: CacheSettings(),
+        engine_factory=cast(EngineFactory, engine_factory),
+    )
+    first = cast(
+        FakeEngine,
+        cache.get_engine(
+            "postgres",
+            make_url(),
+            datasource_key="ds-orders",
+            connection_budget=5,
+        ),
+    )
+    same = cache.get_engine(
+        "postgres",
+        make_url(),
+        datasource_key="ds-orders",
+        connection_budget=5,
+    )
+    replacement = cast(
+        FakeEngine,
+        cache.get_engine(
+            "postgres",
+            make_url(),
+            datasource_key="ds-orders",
+            connection_budget=2,
+        ),
+    )
+
+    assert same is first
+    assert replacement is not first
+    assert first.disposed is True
+    assert replacement.disposed is False
+    assert len(cache) == 1

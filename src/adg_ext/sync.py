@@ -33,6 +33,7 @@ from adg.control_plane.services.datasource_service import DatasourceService
 from adg.control_plane.services.metadata_scan_service import MetadataScanService
 from adg_ext.guard import dialect_for
 from adg_ext.models import (
+    ExtDatasourceCapacity,
     ExtRoleSpec,
     ExtRoleTable,
     ExtRowFilterPolicy,
@@ -334,8 +335,42 @@ class SyncService:
             )
             datasource.type = connector_type
         self._s.flush()
+        self._sync_datasource_capacity(datasource.id, spec.get("capacity"))
         self._scan(datasource, name)
         return datasource.id
+
+    def _sync_datasource_capacity(self, datasource_id: str, raw: Any) -> None:
+        existing = self._s.get(ExtDatasourceCapacity, datasource_id)
+        if raw is None:
+            if existing is not None:
+                self._s.delete(existing)
+            return
+        if not isinstance(raw, dict):
+            raise ExtSyncError(422, "capacity must be an object")
+        try:
+            connection_budget = int(raw["connectionBudget"])
+            max_query_concurrency = int(raw["maxQueryConcurrency"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExtSyncError(
+                422, "capacity requires integer connectionBudget and maxQueryConcurrency"
+            ) from error
+        if connection_budget < 1 or max_query_concurrency < 1:
+            raise ExtSyncError(422, "datasource capacity values must be positive")
+        tier = str(raw.get("tier") or "")[:64]
+        if existing is None:
+            self._s.add(
+                ExtDatasourceCapacity(
+                    datasource_id=datasource_id,
+                    tier=tier,
+                    connection_budget=connection_budget,
+                    max_query_concurrency=max_query_concurrency,
+                )
+            )
+        else:
+            existing.tier = tier
+            existing.connection_budget = connection_budget
+            existing.max_query_concurrency = max_query_concurrency
+        self._s.flush()
 
     def rescan(self, name: str) -> dict[str, int]:
         """Re-read the live catalog of a synced datasource; the spec and hash stay unchanged."""
@@ -395,6 +430,11 @@ class SyncService:
             self._s.execute(
                 delete(ExtRowFilterPolicy).where(ExtRowFilterPolicy.resource_id.in_(resource_ids))
             )
+        self._s.execute(
+            delete(ExtDatasourceCapacity).where(
+                ExtDatasourceCapacity.datasource_id == datasource.id
+            )
+        )
         DatasourceService(self._s).delete_datasource(datasource.id)
 
     # ---- role -----------------------------------------------------------------------------
@@ -582,10 +622,12 @@ class SyncService:
         self._s.add(UserRole(user_id=user.id, role_id=role_id))
         attribute = self._s.get(ExtUserAttribute, user.id)
         params = json.dumps(spec.get("params") or {}, separators=(",", ":"), sort_keys=True)
+        limits = json.dumps(spec.get("limits") or {}, separators=(",", ":"), sort_keys=True)
         if attribute is None:
-            self._s.add(ExtUserAttribute(user_id=user.id, params_json=params))
+            self._s.add(ExtUserAttribute(user_id=user.id, params_json=params, limits_json=limits))
         else:
             attribute.params_json = params
+            attribute.limits_json = limits
         self._s.flush()
         return user.id
 

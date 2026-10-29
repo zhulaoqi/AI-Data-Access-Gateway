@@ -14,14 +14,19 @@ def test_migration_creates_the_ext_tables(tmp_path: Path) -> None:
     config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", url)
     command.upgrade(config, "head")
-    tables = set(inspect(create_engine(url)).get_table_names())
+    inspector = inspect(create_engine(url))
+    tables = set(inspector.get_table_names())
     assert {
         "ext_sync_objects",
         "ext_role_specs",
         "ext_role_tables",
         "ext_row_filter_policies",
         "ext_user_attributes",
+        "ext_datasource_capacities",
     } <= tables
+    assert "limits_json" in {
+        column["name"] for column in inspector.get_columns("ext_user_attributes")
+    }
     command.downgrade(config, "202606110001")
     assert "ext_sync_objects" not in set(inspect(create_engine(url)).get_table_names())
 

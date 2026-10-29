@@ -28,7 +28,8 @@ from adg.app.settings import get_settings
 from adg.shared.ids import uuidv7
 
 OLD = "202610140001"  # shipped the VARCHAR(36) query_id
-HEAD = "202610150001"
+WIDENING = "202610150001"
+HEAD = "202610290001"
 BASELINE = "202604260001"  # before the ext tables exist
 LONG_REF = "gw:rf:" + "f" * 194  # a row filter's external id is its (200 char) object name
 
@@ -118,11 +119,11 @@ def _is_mysql(url: str) -> bool:
     return url.startswith("mysql")
 
 
-def test_there_is_exactly_one_head_and_it_is_the_widening_migration() -> None:
+def test_there_is_exactly_one_head_and_capacity_follows_widening() -> None:
     script = ScriptDirectory.from_config(_config("sqlite://"))
     assert script.get_heads() == [HEAD]
     revision = script.get_revision(HEAD)
-    assert revision is not None and revision.down_revision == OLD
+    assert revision is not None and revision.down_revision == WIDENING
 
 
 def test_empty_database_upgrades_and_the_upgrade_is_repeatable(url: str) -> None:
@@ -144,9 +145,9 @@ def test_empty_database_upgrades_and_the_upgrade_is_repeatable(url: str) -> None
 
         command.downgrade(_config(url), "-1")
         get_settings.cache_clear()
-        assert _current(engine) == OLD
-        assert _length(engine, "audit_events", "query_id") == 36
-        assert _length(engine, "ext_sync_objects", "external_id") == 64
+        assert _current(engine) == WIDENING
+        assert _length(engine, "audit_events", "query_id") == 64
+        assert _length(engine, "ext_sync_objects", "external_id") == 256
 
         alembic_upgrade(url)  # up again after a rollback
         assert _current(engine) == HEAD

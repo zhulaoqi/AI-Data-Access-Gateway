@@ -77,3 +77,15 @@ class ExtUserAttribute(Base):
 
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     params_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
+    limits_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
+class ExtDatasourceCapacity(Base):
+    """Executor capacity supplied for one synced datasource account."""
+
+    __tablename__ = "ext_datasource_capacities"
+
+    datasource_id: Mapped[str] = mapped_column(ForeignKey("datasources.id"), primary_key=True)
+    tier: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    connection_budget: Mapped[int] = mapped_column(nullable=False)
+    max_query_concurrency: Mapped[int] = mapped_column(nullable=False)
