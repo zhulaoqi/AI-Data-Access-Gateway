@@ -168,14 +168,11 @@ def test_guard_tracks_projection_output_lineage() -> None:
     ]
 
 
-def test_guard_rejects_derived_projection_without_stable_output_name() -> None:
-    result = SqlGuard(strict_validation=False).check(
-        "select lower(email) from public.customers"
-    )
+def test_guard_allows_unaliased_expression() -> None:
+    result = SqlGuard().check("select lower(email), id + 1 from public.customers")
 
-    assert result.allowed is False
-    assert result.normalized_sql is None
-    assert result.rejection_reasons == ["derived_projection_requires_alias"]
+    assert result.allowed is True
+    assert result.normalized_sql is not None
 
 
 def test_guard_reduces_limit_to_maximum() -> None:
@@ -350,6 +347,20 @@ def test_guard_rejects_select_star() -> None:
     assert "wildcard_projection_not_allowed" in result.rejection_reasons
 
 
+def test_guard_allows_star_over_a_derived_table() -> None:
+    wrapped = SqlGuard().check(
+        "select * from (select id, name from public.customers order by updated_at desc limit 3) "
+        "as miao_sql_result limit 3"
+    )
+    cte = SqlGuard().check(
+        "with c as (select id, name from public.customers) select * from c"
+    )
+
+    assert wrapped.allowed is True
+    assert cte.allowed is True
+    assert "wildcard_projection_not_allowed" not in wrapped.rejection_reasons
+
+
 def test_guard_rejects_qualified_wildcard() -> None:
     result = SqlGuard().check("select c.*, c.id from public.customers c")
 
@@ -358,11 +369,11 @@ def test_guard_rejects_qualified_wildcard() -> None:
     assert "wildcard_projection_not_allowed" in result.rejection_reasons
 
 
-def test_guard_rejects_non_whitelisted_functions() -> None:
-    result = SqlGuard().check("select md5(email) from public.customers")
+def test_guard_rejects_side_effect_functions() -> None:
+    result = SqlGuard().check("select sleep(5) from public.customers")
 
     assert result.allowed is False
-    assert "function_not_allowed:md5" in result.rejection_reasons
+    assert "function_not_allowed:sleep" in result.rejection_reasons
 
 
 def test_guard_relaxed_validation_allows_non_allowlisted_select_features() -> None:
@@ -429,11 +440,11 @@ def test_guard_allows_date_literal_casts() -> None:
     assert result.used_functions == []
 
 
-def test_guard_rejects_non_literal_casts() -> None:
-    result = SqlGuard().check("select cast(email as text) from public.customers")
+def test_guard_allows_cast_of_a_granted_column() -> None:
+    result = SqlGuard().check("select cast(email as char) as email_text from public.customers")
 
-    assert result.allowed is False
-    assert "function_not_allowed:cast" in result.rejection_reasons
+    assert result.allowed is True
+    assert result.normalized_sql is not None
 
 
 @pytest.mark.parametrize(
@@ -464,30 +475,23 @@ def test_guard_allows_common_temporal_predicate_functions(query: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "query,rejection",
+    "query",
     [
-        (
-            "select date(created_at) as created_day from public.orders",
-            "temporal_projection_not_allowed:date",
-        ),
-        (
-            "select date_format(created_at, '%Y-%m-%d') as created_day from public.orders",
-            "temporal_projection_not_allowed:date_format",
-        ),
-        (
-            "select cast(created_at as date) as created_day from public.orders",
-            "temporal_projection_not_allowed:cast",
-        ),
+        "select date(created_at) as created_day from public.orders",
+        "select date_format(created_at, '%Y-%m-%d') as created_day from public.orders",
+        "select cast(created_at as date) as created_day from public.orders",
+        "select id from public.orders union all select id from public.orders",
+        "select id from public.orders except select id from public.orders",
+        "select row_number() over (order by id) as n from public.orders",
+        "select concat(id, '-'), coalesce(id, 0), case when id > 0 then id end from public.orders",
     ],
 )
-def test_guard_rejects_temporal_column_projections(
-    query: str,
-    rejection: str,
-) -> None:
-    result = SqlGuard().check(query)
+def test_guard_allows_read_structures_inside_the_grant(query: str) -> None:
+    result = SqlGuard(default_limit=100, max_limit=100).check(query)
 
-    assert result.allowed is False
-    assert rejection in result.rejection_reasons
+    assert result.allowed is True, result.rejection_reasons
+    assert result.normalized_sql is not None
+    assert "LIMIT 100" in result.normalized_sql
 
 
 def test_guard_allows_common_aggregate_functions() -> None:

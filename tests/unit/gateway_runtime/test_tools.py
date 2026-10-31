@@ -81,6 +81,7 @@ class RuntimeSettingsStub:
     secret_kdf_iterations = 1
     sql_execution_mode = "read_only"
     sql_strict_validation = False
+    sql_reject_wildcard = True
     runtime_query_max_limit = 1000
 
 

@@ -16,7 +16,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
-from adg.sql_guard.guard import SqlGuard, SqlGuardResult
+from adg.sql_guard.guard import SqlGuard, SqlGuardResult, is_read_query
 
 DIALECTS = {
     "mysql": "mysql",
@@ -108,7 +108,7 @@ def _structural_reasons(statement: exp.Expression) -> list[str]:
     for kind, reason in _COMMAND_REASONS.items():
         if isinstance(statement, kind):
             add(reason)
-    if not isinstance(statement, exp.Select):
+    if not isinstance(statement, exp.Select) and not is_read_query(statement):
         if not reasons:
             add("statement_not_allowed")
         return reasons

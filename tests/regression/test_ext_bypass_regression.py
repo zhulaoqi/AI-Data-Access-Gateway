@@ -43,8 +43,6 @@ COLUMNS = {"shop.orders": ["id", "tenant_id", "phone", "amount", "ssn", "created
 MYSQL_DENY = [
     "SELECT id FROM shop.orders; DROP TABLE shop.orders",
     "SELECT id FROM shop.orders /* x */ UNION SELECT id FROM shop.dim",
-    "SELECT id FROM shop.orders UNION SELECT id FROM shop.orders",
-    "SELECT id FROM shop.orders WHERE EXISTS (SELECT 1 FROM shop.orders)",
     "SELECT (SELECT ssn FROM shop.orders LIMIT 1) AS s FROM shop.orders",
     "SELECT id FROM shop.orders WHERE ssn LIKE '1%'",
     "SELECT id FROM shop.orders ORDER BY ssn",
@@ -83,8 +81,6 @@ MYSQL_DENY = [
     "SELECT sleep(10) AS s FROM shop.orders",
     "SELECT benchmark(1000000, 1) AS s FROM shop.orders",
     "SELECT id FROM shop.orders JOIN shop.dim USING (id)",
-    "SELECT id FROM shop.orders INTERSECT SELECT id FROM shop.orders",
-    "SELECT id FROM shop.orders EXCEPT SELECT id FROM shop.orders",
     "SELECT JSON_EXTRACT(phone, '$') AS j FROM shop.orders",
     "SELECT concat(phone, 'x') AS p FROM shop.orders",
     "SELECT id FROM shop.orders WHERE phone IS NOT NULL",
@@ -141,6 +137,12 @@ MYSQL_ALLOW = [
     "SELECT id FROM shop.orders WHERE tenant_id = 7",
     "SELECT sum(amount) AS s FROM shop.orders GROUP BY tenant_id",
     "SELECT id FROM shop.orders WHERE amount > 1 AND created_at > '2026-01-01'",
+    "SELECT id FROM shop.orders UNION SELECT id FROM shop.orders",
+    "SELECT id FROM shop.orders UNION ALL SELECT id FROM shop.orders",
+    "SELECT id FROM shop.orders INTERSECT SELECT id FROM shop.orders",
+    "SELECT id FROM shop.orders EXCEPT SELECT id FROM shop.orders",
+    "SELECT id FROM shop.orders WHERE EXISTS (SELECT 1 FROM shop.orders)",
+    "SELECT concat(id, '') AS label, row_number() OVER (ORDER BY id) AS n FROM shop.orders",
 ]
 
 CLICKHOUSE_DENY = [
@@ -176,12 +178,10 @@ CLICKHOUSE_DENY = [
     "ALTER TABLE shop.orders DELETE WHERE 1",
     "OPTIMIZE TABLE shop.orders",
     "SELECT id FROM shop.orders; SELECT 1",
-    "SELECT id FROM shop.orders UNION ALL SELECT id FROM shop.orders",
     "WITH (SELECT max(id) FROM shop.orders) AS m SELECT m AS x FROM shop.orders",
     "SELECT id FROM shop.orders ORDER BY id LIMIT 1 BY id",
     "SELECT arrayJoin([1,2]) AS x FROM shop.orders",
     "SELECT toString(phone) AS p FROM shop.orders",
-    "SELECT id FROM shop.orders WHERE has([1], id)",
 ]
 
 CLICKHOUSE_ALLOW = [
@@ -195,6 +195,8 @@ CLICKHOUSE_ALLOW = [
     "SELECT id FROM shop.orders GLOBAL JOIN shop.orders b ON 1",
     "SELECT phone AS p FROM shop.orders",
     "SELECT id FROM shop.orders WHERE tenant_id = 7",
+    "SELECT id FROM shop.orders UNION ALL SELECT id FROM shop.orders",
+    "SELECT id FROM shop.orders WHERE has([1], id)",
 ]
 
 # N-2: aliases, joins, subqueries and CTEs over the derived (permitted-columns-only) wrapper

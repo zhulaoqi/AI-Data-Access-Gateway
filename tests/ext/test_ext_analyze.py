@@ -131,6 +131,47 @@ def test_wildcard_is_rejected_with_the_allowed_columns_as_hint() -> None:
     }
 
 
+def test_star_over_a_subquery_uses_the_inner_projection() -> None:
+    r = run(
+        "SELECT * FROM (SELECT id, amount FROM shop.orders ORDER BY created_at DESC LIMIT 3) "
+        "AS miao_sql_result LIMIT 3"
+    )
+    assert r.allowed, r.reasons
+    sql = _bare(r.sql or "")
+    assert "select *" not in sql
+    assert "miao_sql_result.id" in sql or sql.startswith("select id, amount from")
+    assert "id" in sql and "amount" in sql
+    assert "ssn" not in sql
+    assert "tenant_id = 7" in sql
+
+
+def test_qualified_star_over_a_subquery_and_cte() -> None:
+    qualified = run(
+        "SELECT s.* FROM (SELECT id, amount AS amt FROM shop.orders) s"
+    )
+    assert qualified.allowed, qualified.reasons
+    assert "amt" in _bare(qualified.sql or "")
+    assert "select *" not in _bare(qualified.sql or "")
+
+    cte = run("WITH c AS (SELECT id, amount FROM shop.orders) SELECT * FROM c")
+    assert cte.allowed, cte.reasons
+    assert "select *" not in _bare(cte.sql or "")
+    assert "id" in _bare(cte.sql or "") and "amount" in _bare(cte.sql or "")
+
+
+def test_star_over_an_inner_physical_star_stays_rejected() -> None:
+    r = run("SELECT * FROM (SELECT * FROM shop.orders) s")
+    assert r.reasons and r.reasons[0].startswith("wildcard")
+
+
+def test_union_subquery_star_uses_matching_output_names() -> None:
+    r = run(
+        "SELECT * FROM (SELECT id FROM shop.orders UNION SELECT id FROM shop.orders) t"
+    )
+    assert r.allowed, r.reasons
+    assert "select *" not in _bare(r.sql or "")
+
+
 def test_count_star_is_not_a_wildcard_projection() -> None:
     r = run("SELECT count(*) AS n FROM shop.orders")
     assert r.allowed, r.reasons
@@ -370,6 +411,38 @@ def test_filter_with_no_permitted_column_at_all_is_rejected() -> None:
     )
     r = run("SELECT 1 AS one FROM shop.orders", views=[view])
     assert r.reasons == ["row_filter_no_permitted_columns"]
+
+
+def test_union_injects_the_row_filter_on_every_branch_and_keeps_the_cap() -> None:
+    r = run("SELECT id, amount FROM shop.orders UNION ALL SELECT id, amount FROM shop.orders")
+    assert r.allowed, r.reasons
+    bare = _bare(r.sql)
+    assert bare.count("tenant_id = 7") == 2
+    assert "ssn" not in bare
+    assert "limit 100" in bare
+
+
+def test_union_still_rejects_a_column_outside_the_grant() -> None:
+    r = run("SELECT id FROM shop.orders UNION SELECT ssn FROM shop.orders")
+    assert "column_not_allowed:ssn" in r.reasons
+
+
+def test_scalar_window_and_date_expressions_on_unmasked_columns() -> None:
+    r = run(
+        "SELECT id + 1, CONCAT(id, ''), IFNULL(amount, 0), "
+        "DATE(created_at) AS created_day, ROW_NUMBER() OVER (ORDER BY id) AS n "
+        "FROM shop.orders"
+    )
+    assert r.allowed, r.reasons
+    assert "tenant_id = 7" in _bare(r.sql)
+    assert "ssn" not in _bare(r.sql)
+
+
+def test_a_function_or_window_on_a_masked_column_stays_rejected() -> None:
+    dated = run("SELECT DATE(phone) AS d FROM shop.orders")
+    assert any(reason.startswith("masked_column_position_not_allowed") for reason in dated.reasons)
+    window = run("SELECT ROW_NUMBER() OVER (ORDER BY phone) AS n FROM shop.orders")
+    assert any("phone" in reason for reason in window.reasons)
 
 
 def test_alias_shadowing_a_denied_column_cannot_reach_the_physical_column() -> None:

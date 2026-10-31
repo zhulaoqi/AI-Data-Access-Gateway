@@ -28,13 +28,11 @@ COMMON_REJECTS = {
     "variable": "select @a from t",
     "session_variable": "select @@version from t",
     "sleep": "select sleep(5) from t",
-    "union": "select id from t union select id from u",
     "limit_subquery": "select id from t limit (select 1)",
     "system_db": "select table_name from information_schema.tables",
     "system_db_upper": "select table_name from INFORMATION_SCHEMA.TABLES",
     "mysql_db": "select user from mysql.user",
     "cross_catalog": "select id from other_cat.db1.t",
-    "derived_no_alias": "select id + 1 from t",
     "lock": "select id from t for update",
 }
 

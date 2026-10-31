@@ -26,6 +26,7 @@ from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationEr
 from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.policy.runtime import IdentityContext
+from adg.sql_guard.guard import ProjectionLineage, projection_lineage
 from adg_ext import clientip, guard
 from adg_ext import context as ctxmod
 from adg_ext.admission import Admission, AdmissionRejected, Ticket
@@ -392,10 +393,17 @@ def run(
         )
         return reject(kind, ",".join(outcome.reasons), outcome.hint)
 
+    # 改写之后的 SQL 才是真正返回的列。用它做脱敏血缘，子查询上展开的 * 和 UNION 才会打到原列。
+    parsed_lineage = projection_lineage(outcome.sql, dialect)
+    projections = verdict.result.projections if parsed_lineage is None else parsed_lineage
     projection_rejection = svc._masking.projection_rejection(
-        identity=identity, resources=actual, projections=verdict.result.projections
+        identity=identity, resources=actual, projections=projections
     )
-    # * 已在改写阶段展开成允许列，脱敏按列名处理，不再把通配符本身当成拒绝。
+    # 行过滤会把物理表包进子查询，改写后的投影几乎都带嵌套 SELECT。
+    # 脱敏列能否出现在函数、WHERE、别名里，已经由改写阶段拦住。
+    if projection_rejection == "masked_nested_projection_not_supported":
+        projection_rejection = None
+    # 物理表上的 * 只在部署关闭 reject_wildcards 时才会被展开成允许列。
     if projection_rejection == "masked_wildcard_projection_not_allowed" and not reject_wildcards:
         projection_rejection = None
     if projection_rejection is not None:
@@ -410,6 +418,7 @@ def run(
         datasource=datasource,
         actual=actual,
         verdict=verdict,
+        projections=projections,
         final_sql=outcome.sql,
         statement_limit=outcome.limit,
         effective_limit=effective_limit,
@@ -429,6 +438,7 @@ def _execute(
     datasource: Datasource,
     actual: list[Resource],
     verdict: guard.GuardVerdict,
+    projections: list[ProjectionLineage],
     final_sql: str,
     statement_limit: int | None,
     effective_limit: int,
@@ -588,7 +598,7 @@ def _execute(
             query_id=query_id,
             resources=actual,
             result=result,
-            projections=verdict.result.projections,
+            projections=projections,
         )
         rows = list(result.rows)
         truncated = (

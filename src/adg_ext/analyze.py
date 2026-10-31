@@ -10,7 +10,7 @@ from typing import cast
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.optimizer.scope import traverse_scope
+from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from adg_ext.errors import ExtRejection
 from adg_ext.guard import SYSTEM_DATABASES, GuardVerdict
@@ -199,17 +199,83 @@ def _from_tables(select: exp.Select) -> list[tuple[str, str | None, str]]:
     return out
 
 
-def _expand_wildcards(tree: exp.Expression, views: list[TableView]) -> str | None:
-    """Replace ``*`` / ``t.*`` with that table's permitted columns.
+def _plain_ident(name: str) -> bool:
+    return bool(name) and name.replace("_", "a").isalnum() and not name[0].isdigit()
 
-    A star that cannot be tied to exactly the permitted columns is refused, so ``*`` never
-    reaches the database as a request for every column the account can see.
+
+def _output_names(expr: exp.Expression) -> list[str] | None:
+    """Result column names of a select or union, after inner stars have been expanded.
+
+    Names must be unique plain identifiers. An expression without an alias has no stable name,
+    so a star over it is refused instead of guessed.
     """
 
-    for select in list(tree.find_all(exp.Select)):
+    if isinstance(expr, exp.SetOperation):
+        left = _output_names(expr.this)
+        other = expr.expression
+        right = _output_names(other) if isinstance(other, exp.Expression) else None
+        if left is None or right is None or [n.lower() for n in left] != [n.lower() for n in right]:
+            return None
+        return left
+    if not isinstance(expr, exp.Select):
+        return None
+    names: list[str] = []
+    for projection in expr.expressions:
+        if _projection_star(projection) is not None:
+            return None
+        if isinstance(projection, exp.Alias):
+            if not _plain_ident(projection.alias):
+                return None
+            names.append(projection.alias)
+            continue
+        if isinstance(projection, exp.Column) and _plain_ident(projection.name):
+            names.append(projection.name)
+            continue
+        return None
+    if not names or len({name.lower() for name in names}) != len(names):
+        return None
+    return names
+
+
+def _columns_of_source(
+    source: object, views: list[TableView], *, allow_physical: bool
+) -> list[str] | None:
+    """Columns a star over this FROM source may become. ``None`` means it cannot be expanded."""
+
+    if isinstance(source, exp.Table):
+        if not allow_physical:
+            return None
+        found = [v for v in views if v.restricted and v.matches(source.db or None, source.name)]
+        if len(found) != 1:
+            return None
+        columns = found[0].projection_columns()
+        return columns or None
+    if isinstance(source, Scope) and isinstance(source.expression, exp.Expression):
+        return _output_names(source.expression)
+    if isinstance(source, exp.Expression):
+        return _output_names(source)
+    return None
+
+
+def _expand_wildcards(
+    tree: exp.Expression, views: list[TableView], *, allow_physical: bool = True
+) -> str | None:
+    """Replace ``*`` / ``t.*`` with known columns.
+
+    A star over a real table becomes that table's permitted columns, and only when physical
+    stars are allowed. A star over a subquery or CTE becomes the names that source already
+    projects, so ``SELECT * FROM (SELECT id, name FROM t) s`` does not ask the database for
+    every column. A star that cannot be named exactly is refused.
+    """
+
+    # traverse_scope visits inner selects before the statements that read them.
+    for scope in traverse_scope(tree):
+        select = scope.expression
+        if not isinstance(select, exp.Select):
+            continue
         if not any(_projection_star(p) is not None for p in select.expressions):
             continue
-        tables = _from_tables(select)
+        sources = list(scope.sources.items())
         expanded: list[exp.Expression] = []
         for projection in select.expressions:
             star = _projection_star(projection)
@@ -217,21 +283,25 @@ def _expand_wildcards(tree: exp.Expression, views: list[TableView]) -> str | Non
                 expanded.append(projection)
                 continue
             targets = (
-                tables
+                sources
                 if star == ""
-                else [t for t in tables if star.lower() in {t[0].lower(), t[2].lower()}]
+                else [
+                    item
+                    for item in sources
+                    if item[0].lower() == star.lower()
+                    or (
+                        isinstance(item[1], exp.Table) and item[1].name.lower() == star.lower()
+                    )
+                ]
             )
             if not targets:
                 return "wildcard_projection_not_allowed"
-            qualify = len(tables) > 1
-            for alias, db, name in targets:
-                found = [v for v in views if v.restricted and v.matches(db, name)]
-                if len(found) != 1:
-                    return "wildcard_projection_not_allowed"
-                columns = found[0].projection_columns()
+            qualify = len(sources) > 1
+            for alias, source in targets:
+                columns = _columns_of_source(source, views, allow_physical=allow_physical)
                 if not columns:
                     return "wildcard_projection_not_allowed"
-                table = (alias or name) if qualify else None
+                table = alias if qualify and alias else None
                 expanded.extend(exp.column(column, table=table) for column in columns)
         select.set("expressions", expanded)
     for select in tree.find_all(exp.Select):
@@ -339,7 +409,9 @@ def rewrite(
         return out
 
     if restricted and _wildcards(tree):
-        if reject_wildcards or _expand_wildcards(tree, views) is not None:
+        # 子查询和 CTE 上的 * 总是按已写出的结果列展开。物理表上的 * 仍由 reject_wildcards 决定。
+        failure = _expand_wildcards(tree, views, allow_physical=not reject_wildcards)
+        if failure is not None or _wildcards(tree):
             out.reasons.append("wildcard_projection_not_allowed")
             out.hint["allowed_columns"] = {v.path: v.permitted_columns() for v in restricted}
             return out
