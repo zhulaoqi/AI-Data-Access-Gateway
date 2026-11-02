@@ -15,6 +15,7 @@ from uuid import UUID
 from adg.app.settings import get_settings
 from adg.connectors.base import MetadataSnapshot, QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
+from adg.connectors.query_limits import QUERY_TIMEOUT_GRACE_SECONDS
 from adg.connectors.relational import RelationalConnector, pinned_scan_databases
 
 SYSTEM_DATABASES = ("system", "information_schema", "INFORMATION_SCHEMA")
@@ -53,7 +54,13 @@ class ClickHouseConnector:
                 "Connector 'clickhouse' requires optional extra 'clickhouse'"
             ) from error
 
-    def _client(self, config: dict[str, object], settings: dict[str, object]) -> Any:
+    def _client(
+        self,
+        config: dict[str, object],
+        settings: dict[str, object],
+        *,
+        send_receive_timeout: int | None = None,
+    ) -> Any:
         driver = self._require_dependency()
         checked = RelationalConnector()._validated_connection_config(config)
         runtime = get_settings()
@@ -68,7 +75,11 @@ class ClickHouseConnector:
                 database=database,
                 secure=bool(checked.get("secure", False)),
                 connect_timeout=runtime.runtime_datasource_connect_timeout_seconds,
-                send_receive_timeout=runtime.runtime_datasource_read_timeout_seconds,
+                send_receive_timeout=(
+                    send_receive_timeout
+                    if send_receive_timeout is not None
+                    else runtime.runtime_datasource_read_timeout_seconds
+                ),
                 settings=settings,
                 autogenerate_session_id=False,
             )
@@ -152,14 +163,22 @@ class ClickHouseConnector:
 
     def execute_query(self, config: dict[str, object], sql: str, limit: int) -> QueryResult:
         timeout = config.get("_ext_timeout_seconds")
+        seconds = int(str(timeout)) if timeout else 0
         settings: dict[str, object] = {
             "readonly": 1,
             "max_result_rows": int(limit),
             "result_overflow_mode": "break",
         }
-        if timeout:
-            settings["max_execution_time"] = int(str(timeout))
-        client = self._client(config, {})
+        send_receive: int | None = None
+        if seconds:
+            settings["max_execution_time"] = seconds
+            # Stay above max_execution_time so a still-running query is not cut
+            # off as a transport failure before the server or the killer stops it.
+            send_receive = max(
+                get_settings().runtime_datasource_read_timeout_seconds,
+                seconds + QUERY_TIMEOUT_GRACE_SECONDS,
+            )
+        client = self._client(config, {}, send_receive_timeout=send_receive)
         try:
             result = client.query(sql, settings=settings)
             names = list(result.column_names)

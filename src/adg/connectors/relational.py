@@ -11,6 +11,7 @@ from adg.app.settings import get_settings
 from adg.connectors import runtime_engine_cache
 from adg.connectors.base import MetadataColumn, MetadataSnapshot, QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
+from adg.connectors.query_limits import RUNTIME_SOCKET_TIMEOUT_SECONDS
 
 _METADATA_IPS = {
     ipaddress.ip_address("169.254.169.254"),
@@ -256,7 +257,29 @@ class RelationalConnector:
         return QueryResult(columns=columns, rows=rows)
 
     def _runtime_connect_args(self) -> dict[str, object]:
-        """Return DBAPI timeout options for runtime query connections."""
+        """Return DBAPI timeout options for pooled runtime query connections.
+
+        Read and write timeouts are at least the product maximum query length.
+        A shorter configured value must not cancel a legal 10-minute query.
+        """
+
+        settings = get_settings()
+        connect_args: dict[str, object] = {
+            "connect_timeout": settings.runtime_datasource_connect_timeout_seconds,
+        }
+        if self.sqlalchemy_drivername.startswith("mysql+"):
+            connect_args["read_timeout"] = max(
+                settings.runtime_datasource_read_timeout_seconds,
+                RUNTIME_SOCKET_TIMEOUT_SECONDS,
+            )
+            connect_args["write_timeout"] = max(
+                settings.runtime_datasource_write_timeout_seconds,
+                RUNTIME_SOCKET_TIMEOUT_SECONDS,
+            )
+        return connect_args
+
+    def _one_shot_connect_args(self) -> dict[str, object]:
+        """Return the configured short timeouts for validation and metadata scans."""
 
         settings = get_settings()
         connect_args: dict[str, object] = {
@@ -266,11 +289,6 @@ class RelationalConnector:
             connect_args["read_timeout"] = settings.runtime_datasource_read_timeout_seconds
             connect_args["write_timeout"] = settings.runtime_datasource_write_timeout_seconds
         return connect_args
-
-    def _one_shot_connect_args(self) -> dict[str, object]:
-        """Return DBAPI timeout options for non-cached validation and scan engines."""
-
-        return self._runtime_connect_args()
 
     def _validate_network_boundary(self, config: dict[str, object]) -> None:
         """Reject datasource hosts that should never be contacted by connectors."""

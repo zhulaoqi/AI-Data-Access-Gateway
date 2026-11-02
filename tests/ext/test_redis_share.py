@@ -11,6 +11,22 @@ from adg_ext.redis_share import (
 )
 
 
+def test_renew_slot_extends_a_live_member(monkeypatch):
+    calls: list[tuple[object, ...]] = []
+
+    class _EvalRedis:
+        def eval(self, script: str, numkeys: int, *args: object) -> int:
+            calls.append((script, numkeys, args))
+            return 1
+
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: _EvalRedis())
+    Share().renew_slot("user:a", "member-1")
+    assert len(calls) == 1
+    assert calls[0][1] == 1
+    assert calls[0][2][0] == "{sqlgw}:slot:user:a"
+    assert calls[0][2][3] == "member-1"
+
+
 def test_share_is_a_noop_without_redis(monkeypatch):
     monkeypatch.delenv("redis.host", raising=False)
     monkeypatch.delenv("REDIS_HOST", raising=False)

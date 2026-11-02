@@ -23,6 +23,7 @@ from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.connectors.base import QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
+from adg.connectors.query_limits import MAX_QUERY_TIMEOUT_SECONDS
 from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.policy.runtime import IdentityContext
@@ -274,6 +275,34 @@ class _Run:
         return self._done.wait(timeout)
 
 
+_SLOT_RENEW_EVERY_SECONDS = 60.0
+
+
+def _renew_admission(ticket: Ticket) -> None:
+    member = ticket.redis_member
+    if not member:
+        return
+    share = get_share()
+    share.renew_slot(f"user:{ticket.user_key}", member)
+    share.renew_slot(f"ds:{ticket.datasource_key}", member)
+
+
+def _wait_for_query(runner: _Run, timeout: float, ticket: Ticket) -> bool:
+    """Wait for the worker, refreshing the cross-replica slot on the way."""
+
+    deadline = time.monotonic() + timeout
+    next_renew = time.monotonic() + _SLOT_RENEW_EVERY_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if runner.wait(min(_SLOT_RENEW_EVERY_SECONDS, remaining)):
+            return True
+        if time.monotonic() >= next_renew:
+            _renew_admission(ticket)
+            next_renew = time.monotonic() + _SLOT_RENEW_EVERY_SECONDS
+
+
 def run(
     svc: "GatewayRuntimeService",
     *,
@@ -498,7 +527,10 @@ def _execute(
     except AdmissionRejected as error:
         return rejected(admission_rejection_kind(error.reason), f"admission_{error.reason}")
 
-    get_share().register_run(request_id or "")
+    get_share().register_run(
+        request_id or "",
+        lease_seconds=min(int(limits["queryTimeoutSeconds"]), MAX_QUERY_TIMEOUT_SECONDS) + 60,
+    )
     final = "failed"  # the outcome label unless a branch below says otherwise
     try:
         tagged = f"/* grant={identity.user_id},req={query_id} */ {final_sql}"
@@ -711,7 +743,7 @@ def _run_connector(
 ) -> QueryResult | str:
     """Execute on a worker thread; returns the result or an error-type string."""
 
-    timeout = float(limits["queryTimeoutSeconds"])
+    timeout = min(float(limits["queryTimeoutSeconds"]), float(MAX_QUERY_TIMEOUT_SECONDS))
     config = dict(datasource.config())
     config["_ext_timeout_seconds"] = int(timeout)
     config["_ext_query_id"] = query_id
@@ -726,7 +758,7 @@ def _run_connector(
     ticket.on_cancel(kill)
     runner = _Run(lambda: connector.execute_query(config, sql, limit))
     runner.start()
-    if not runner.wait(timeout):
+    if not _wait_for_query(runner, timeout, ticket):
         kill()
         runner.wait(5.0)
         breaker.release_probe()

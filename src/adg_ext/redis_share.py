@@ -33,6 +33,17 @@ MCP_HIT = "hit"
 MCP_MISS = "miss"
 MCP_UNAVAILABLE = "unavailable"
 
+_RENEW = """
+local now = tonumber(ARGV[1])
+local lease = tonumber(ARGV[2])
+if redis.call('ZSCORE', KEYS[1], ARGV[3]) == false then return 0 end
+redis.call('ZADD', KEYS[1], now + lease, ARGV[3])
+local ttl = redis.call('PTTL', KEYS[1])
+local want = lease + 30000
+if ttl < want then redis.call('PEXPIRE', KEYS[1], want) end
+return 1
+"""
+
 _ACQUIRE = """
 local now = tonumber(ARGV[1])
 local lease = tonumber(ARGV[2])
@@ -131,6 +142,29 @@ class Share:
             logger.warning("redis slot acquire failed; using the local limit")
             return True
         return bool(ok)
+
+    def renew_slot(self, name: str, member: str) -> None:
+        """Keep a running query's concurrency lease alive.
+
+        The initial lease is five minutes. A query may run for ten, so the
+        owner refreshes the score while it is still executing. A dead process
+        stops refreshing and the slot expires on its own.
+        """
+
+        client = get_client()
+        if client is None or not member:
+            return
+        try:
+            client.eval(
+                _RENEW,
+                1,
+                f"{PREFIX}:slot:{name}",
+                int(time.time() * 1000),
+                _LEASE_MS,
+                member,
+            )
+        except Exception:
+            logger.warning("redis slot renew failed")
 
     def release_slot(self, name: str, member: str) -> None:
         client = get_client()

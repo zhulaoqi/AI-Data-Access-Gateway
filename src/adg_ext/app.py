@@ -61,6 +61,22 @@ def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:
     )
 
 
+async def widen_query_threadpool() -> None:
+    """Leave room for cancellation while long queries occupy worker threads.
+
+    JDBC and MCP both block one thread until the database returns. The default
+    pool is 40, so a burst of ten-minute queries would also stall ``DELETE``
+    cancellation. Raise the pool to at least 128; this is not a connection budget.
+    """
+
+    import anyio
+
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    floor = 128
+    if limiter.total_tokens < floor:
+        limiter.total_tokens = floor
+
+
 def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     registry = get_connector_registry()
     registry.register("clickhouse", ClickHouseConnector)

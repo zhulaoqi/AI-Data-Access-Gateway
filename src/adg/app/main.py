@@ -22,6 +22,7 @@ from adg.mcp_api.tools import router as mcp_tools_router
 from adg.mcp_server.server import build_mcp_server_app, runtime_mcp_server
 from adg_ext.app import app_kwargs as ext_app_kwargs
 from adg_ext.app import install as ext_install
+from adg_ext.app import widen_query_threadpool
 from adg_ext.clientip import current as ext_client_ip
 from adg_ext.config import ext_enabled, get_ext_settings
 
@@ -41,6 +42,7 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         print_banner()
         _log_startup(settings)
+        await widen_query_threadpool()
         async with runtime_mcp_server.session_manager.run():
             try:
                 yield

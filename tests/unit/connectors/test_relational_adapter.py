@@ -353,8 +353,9 @@ def test_relational_execute_query_passes_mysql_wire_timeouts(
     assert captured_connect_args == [
         {
             "connect_timeout": 7,
-            "read_timeout": 45,
-            "write_timeout": 46,
+            # 配置短于 10 分钟查询上限时，运行时连接仍按上限加余量等待。
+            "read_timeout": 660,
+            "write_timeout": 660,
         }
     ]
 
