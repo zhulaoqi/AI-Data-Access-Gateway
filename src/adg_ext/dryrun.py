@@ -27,6 +27,27 @@ def _params(spec: dict[str, Any]) -> tuple[ParamSpec, ...]:
     )
 
 
+def _tables_in_statement(views: list[TableView], resources: list[str]) -> list[TableView] | None:
+    """Spec tables this statement actually reads.
+
+    ``None`` means a reference is missing or matches more than one table. The same table
+    is returned once even when the statement names it more than once.
+    """
+
+    chosen: list[TableView] = []
+    seen: set[int] = set()
+    for path in resources:
+        db, _, name = path.rpartition(".")
+        matched = [view for view in views if view.matches(db or None, name)]
+        if len(matched) != 1:
+            return None
+        marker = id(matched[0])
+        if marker not in seen:
+            seen.add(marker)
+            chosen.append(matched[0])
+    return chosen
+
+
 def dry_run(body: dict[str, Any]) -> dict[str, Any]:
     sql = str(body.get("sql") or "")
     spec: dict[str, Any] = body.get("spec") or {}
@@ -90,19 +111,22 @@ def dry_run(body: dict[str, Any]) -> dict[str, Any]:
         time_columns=time_columns,
         reject_wildcards=reject_wildcards,
     )
+    # Only the tables this statement reads. Other tables in the same profile must not
+    # reject a column name they never expose: dry-run has no per-table catalog, so an
+    # unknown column list would otherwise look like "every table has this column".
+    judged = views
     if verdict.allowed:
-        for path in verdict.result.accessed_resources:
-            db, _, name = path.rpartition(".")
-            if sum(1 for v in views if v.matches(db or None, name)) != 1:
-                return {
-                    "allowed": False,
-                    "rejectReasons": ["table_not_accessible"],
-                    "warnings": warnings,
-                }
+        judged = _tables_in_statement(views, verdict.result.accessed_resources)
+        if judged is None:
+            return {
+                "allowed": False,
+                "rejectReasons": ["table_not_accessible"],
+                "warnings": warnings,
+            }
     user_params = {str(k): v for k, v in (body.get("params") or {}).items()}
     outcome = rewrite(
         verdict,
-        views,
+        judged,
         dialect=dialect,
         user_params=user_params,
         reject_wildcards=reject_wildcards,
