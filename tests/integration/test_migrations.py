@@ -171,6 +171,7 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202610140001_ext_tables.py",
         "202610150001_widen_audit_query_id_and_ext_columns.py",
         "202610290001_executor_capacity.py",
+        "202611030001_catalog_notes.py",
     ]
 
     revisions: dict[str, tuple[str, str | None]] = {}
@@ -209,5 +210,9 @@ def test_migrations_follow_the_expected_directory_runtime_chain() -> None:
         "202610290001_executor_capacity.py": (
             "202610290001",
             "202610150001",
+        ),
+        "202611030001_catalog_notes.py": (
+            "202611030001",
+            "202610290001",
         ),
     }

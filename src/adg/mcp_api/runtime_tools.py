@@ -26,7 +26,11 @@ RUNTIME_TOOL_DEFINITIONS = [
     ),
     RuntimeToolDefinition(
         name="list_resources",
-        description="List readable resources underneath one datasource.",
+        description=(
+            "List readable tables under one datasource. description is the business meaning of "
+            "the table when one was written, otherwise the database comment. database_description "
+            "is the business meaning of the database."
+        ),
     ),
     RuntimeToolDefinition(
         name="list_resources_by_tag",
@@ -34,7 +38,11 @@ RUNTIME_TOOL_DEFINITIONS = [
     ),
     RuntimeToolDefinition(
         name="describe_resource",
-        description="Describe one resource and its readable columns.",
+        description=(
+            "Describe one table and its readable columns. description and database_description "
+            "are business meanings. Each column description is the business meaning of that "
+            "field when one was written, otherwise the database comment."
+        ),
     ),
     RuntimeToolDefinition(
         name="preview_resource",

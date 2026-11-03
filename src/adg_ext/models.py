@@ -80,6 +80,32 @@ class ExtUserAttribute(Base):
     limits_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
+class ExtCatalogNote(Base):
+    """Business meaning of a database, table, or column, overlaid on the scanned comment.
+
+    An empty ``table_name`` is a database. An empty ``column_name`` with a table is the table.
+    These rows never change who can read what; MCP prefers them over the scanned description.
+    """
+
+    __tablename__ = "ext_catalog_notes"
+    __table_args__ = (
+        UniqueConstraint(
+            "datasource_id",
+            "database_name",
+            "table_name",
+            "column_name",
+            name="uq_ext_catalog_note",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuidv7)
+    datasource_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    database_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    table_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    column_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class ExtDatasourceCapacity(Base):
     """Executor capacity supplied for one synced datasource account."""
 

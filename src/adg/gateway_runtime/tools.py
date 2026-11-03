@@ -17,6 +17,7 @@ from adg.policy.runtime import IdentityContext, RuntimePolicyService
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
 from adg_ext import pipeline as ext_pipeline
+from adg_ext.catalog_notes import NoteIndex, prefer, table_address
 from adg_ext.config import ext_enabled
 
 
@@ -117,7 +118,8 @@ class GatewayRuntimeService:
             for resource in self._visible_resources(identity=identity, datasource_id=datasource_id)
         ]
         self._record_discovery(identity, api_key_id, "list_resources", datasource_id, [])
-        return {"resources": [self._serialize_resource(resource) for resource in resources]}
+        notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
+        return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
 
     def list_resources_by_tag(
         self,
@@ -129,9 +131,7 @@ class GatewayRuntimeService:
         """Return policy-visible resources that have at least one requested tag."""
 
         self._session.flush()
-        tag_rows = self._session.execute(
-            select(Tag).where(Tag.name.in_(tag_names))
-        ).scalars()
+        tag_rows = self._session.execute(select(Tag).where(Tag.name.in_(tag_names))).scalars()
         tag_ids = [tag.id for tag in tag_rows]
         resources = [
             resource
@@ -139,7 +139,8 @@ class GatewayRuntimeService:
             if self._resource_has_any_tag(resource, tag_ids)
         ]
         self._record_discovery(identity, api_key_id, "list_resources_by_tag", None, [])
-        return {"resources": [self._serialize_resource(resource) for resource in resources]}
+        notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
+        return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
 
     def describe_resource(
         self,
@@ -189,6 +190,8 @@ class GatewayRuntimeService:
             )
             .order_by(ResourceField.ordinal_position)
         ).scalars()
+        notes = NoteIndex.load(self._session, {resource.datasource_id})
+        database, table = table_address(resource)
         columns = []
         for field in fields:
             field_access = self._policy.check_field_access(
@@ -203,7 +206,10 @@ class GatewayRuntimeService:
                         "name": field.name,
                         "data_type": field.data_type,
                         "nullable": field.nullable,
-                        "description": field.description,
+                        "description": prefer(
+                            notes.column(resource.datasource_id, database, table, field.name),
+                            field.description,
+                        ),
                         "access": "allowed",
                         "masking_strategy": None,
                     }
@@ -216,6 +222,11 @@ class GatewayRuntimeService:
             "name": resource.name,
             "path": resource.path,
             "kind": resource.kind,
+            "database": database,
+            "database_description": notes.database(resource.datasource_id, database),
+            "description": prefer(
+                notes.table(resource.datasource_id, database, table), resource.description
+            ),
             "columns": columns,
         }
 
@@ -668,9 +679,14 @@ class GatewayRuntimeService:
                 unique.append(tag)
         return unique
 
-    def _serialize_resource(self, resource: Resource) -> dict[str, Any]:
-        """Shape a resource for MCP-style runtime responses."""
+    def _serialize_resource(self, resource: Resource, notes: NoteIndex) -> dict[str, Any]:
+        """Shape a resource for MCP-style runtime responses.
 
+        ``description`` is the business meaning when one was synced, otherwise the scanned
+        comment. ``database_description`` is only the business meaning of the database.
+        """
+
+        database, table = table_address(resource)
         return {
             "id": resource.id,
             "datasource_id": resource.datasource_id,
@@ -678,7 +694,11 @@ class GatewayRuntimeService:
             "name": resource.name,
             "path": resource.path,
             "display_name": resource.display_name,
-            "description": resource.description,
+            "description": prefer(
+                notes.table(resource.datasource_id, database, table), resource.description
+            ),
+            "database": database,
+            "database_description": notes.database(resource.datasource_id, database),
             "query_language": resource.query_language,
         }
 
@@ -718,6 +738,7 @@ class GatewayRuntimeService:
                 current = resources_by_id.get(current.parent_id) if current.parent_id else None
             reasons[resource.id] = reason
         return reasons
+
     def _disabled_resource_reason(self, resource: Resource) -> str | None:
         """Return a stable rejection reason when a resource or ancestor is disabled."""
 

@@ -16,6 +16,7 @@ from adg.control_plane.models.masking import DecryptContext, MaskingPolicy
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.policy.runtime import IdentityContext
+from adg_ext.models import ExtCatalogNote
 
 
 class FakeConnector:
@@ -406,6 +407,7 @@ def test_runtime_discovery_hides_resources_under_disabled_parent(
 
     assert listed["resources"] == []
 
+
 def test_database_policy_makes_child_tables_discoverable(db_session: Session) -> None:
     add_datasource(db_session)
     database = add_resource(
@@ -470,6 +472,67 @@ def test_describe_resource_hides_denied_fields(db_session: Session) -> None:
             "masking_strategy": None,
         }
     ]
+
+
+def test_mcp_uses_business_meaning_when_one_was_synced(db_session: Session) -> None:
+    add_datasource(db_session)
+    resource = add_resource(db_session, resource_id="res_customers")
+    resource.description = "库内表备注"
+    db_session.flush()
+    email = db_session.execute(
+        select(ResourceField).where(
+            ResourceField.resource_id == resource.id,
+            ResourceField.name == "email",
+        )
+    ).scalar_one()
+    email.description = "列备注"
+    allow_resource_read(db_session, resource.id)
+    db_session.add_all(
+        [
+            ExtCatalogNote(
+                datasource_id="ds_1",
+                database_name="warehouse.public",
+                table_name="",
+                column_name="",
+                text="客户库",
+            ),
+            ExtCatalogNote(
+                datasource_id="ds_1",
+                database_name="warehouse.public",
+                table_name="customers",
+                column_name="",
+                text="客户表",
+            ),
+            ExtCatalogNote(
+                datasource_id="ds_1",
+                database_name="warehouse.public",
+                table_name="customers",
+                column_name="email",
+                text="邮箱",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    listed = runtime(db_session).list_resources(
+        identity=identity(),
+        api_key_id="key_1",
+        datasource_id="ds_1",
+    )
+    described = runtime(db_session).describe_resource(
+        identity=identity(),
+        api_key_id="key_1",
+        resource_id=resource.id,
+    )
+
+    assert listed["resources"][0]["description"] == "客户表"
+    assert listed["resources"][0]["database_description"] == "客户库"
+    assert described["description"] == "客户表"
+    assert described["database_description"] == "客户库"
+    email_column = next(column for column in described["columns"] if column["name"] == "email")
+    id_column = next(column for column in described["columns"] if column["name"] == "id")
+    assert email_column["description"] == "邮箱"
+    assert id_column["description"] is None
 
 
 def test_execute_query_rejects_actual_resources_outside_declared_scope(
@@ -552,8 +615,7 @@ def test_execute_query_runs_allowed_read_only_cte(db_session: Session) -> None:
         datasource_id="ds_1",
         resource_ids=[resource.id],
         query=(
-            "with customer_ids as (select id from public.customers) "
-            "select id from customer_ids"
+            "with customer_ids as (select id from public.customers) select id from customer_ids"
         ),
         limit=1,
     )
@@ -889,6 +951,7 @@ def test_list_resources_checks_resource_policy_and_tags_in_one_batch(
     assert resource_policy_select_count == 1
     assert resource_tag_select_count == 1
 
+
 def test_execute_query_checks_field_policies_in_one_batch(db_session: Session) -> None:
     add_datasource(db_session)
     resource = add_resource(db_session, resource_id="res_customers")
@@ -949,9 +1012,7 @@ def test_execute_query_applies_fixed_masking_policy(db_session: Session) -> None
     )
 
     assert response["rows"] == [{"id": 1, "email": "REDACTED"}]
-    assert response["masking"]["masked_columns"] == [
-        {"name": "email", "strategy": "fixed"}
-    ]
+    assert response["masking"]["masked_columns"] == [{"name": "email", "strategy": "fixed"}]
 
 
 def test_execute_query_masks_aliased_columns_case_insensitively(
@@ -988,9 +1049,7 @@ def test_execute_query_masks_aliased_columns_case_insensitively(
 
         assert response["status"] == "success"
         assert response["rows"] == [{"LEAKED": "REDACTED"}]
-        assert response["masking"]["masked_columns"] == [
-            {"name": "LEAKED", "strategy": "fixed"}
-        ]
+        assert response["masking"]["masked_columns"] == [{"name": "LEAKED", "strategy": "fixed"}]
 
 
 def test_execute_query_rejects_cte_when_resource_has_masking_policy(
@@ -1160,9 +1219,7 @@ def test_execute_query_applies_reversible_masking_policy(db_session: Session) ->
     )
 
     assert response["rows"][0]["email"].startswith("$adg_rev$")
-    assert response["masking"]["masked_columns"] == [
-        {"name": "email", "strategy": "reversible"}
-    ]
+    assert response["masking"]["masked_columns"] == [{"name": "email", "strategy": "reversible"}]
     assert db_session.query(DecryptContext).count() == 1
 
 

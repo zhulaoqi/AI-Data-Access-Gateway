@@ -5,7 +5,8 @@ name; PUT/DELETE are idempotent and the hash it was synced at is kept so the man
 can reconcile. Object types map to ADG as: datasource_account -> Datasource (+ metadata scan),
 role -> Role + resource policies + masking policies + ``ext_role_*`` rows, row_filter ->
 ``ext_row_filter_policies``, user -> User + user role + ``ext_user_attributes``, credential ->
-ApiKey (``runtime`` scope, externally supplied SHA-256 hash).
+ApiKey (``runtime`` scope, externally supplied SHA-256 hash), catalog_note -> ``ext_catalog_notes``
+(business meanings only; it does not change which tables or columns a role may read).
 """
 
 import json
@@ -31,6 +32,7 @@ from adg.control_plane.models.resource import Resource, ResourceField
 from adg.control_plane.services.api_key_service import create_api_key
 from adg.control_plane.services.datasource_service import DatasourceService
 from adg.control_plane.services.metadata_scan_service import MetadataScanService
+from adg_ext.catalog_notes import delete_notes, replace_notes
 from adg_ext.guard import dialect_for
 from adg_ext.models import (
     ExtDatasourceCapacity,
@@ -46,7 +48,7 @@ from adg_ext.rowfilter import compile_template
 logger = logging.getLogger(__name__)
 
 PREFIX = "gw:"
-TYPES = ("datasource_account", "role", "row_filter", "user", "credential")
+TYPES = ("datasource_account", "role", "row_filter", "user", "credential", "catalog_note")
 _ENGINE_TO_CONNECTOR = {
     "mysql": "mysql",
     "starrocks": "doris",
@@ -435,7 +437,26 @@ class SyncService:
                 ExtDatasourceCapacity.datasource_id == datasource.id
             )
         )
+        delete_notes(self._s, datasource.id)
         DatasourceService(self._s).delete_datasource(datasource.id)
+
+    # ---- catalog notes --------------------------------------------------------------------
+
+    def _put_catalog_note(
+        self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None
+    ) -> str:
+        datasource_name = str(spec.get("datasource") or "")
+        if not datasource_name:
+            raise ExtSyncError(422, "catalog_note requires datasource")
+        datasource_id = self._external_id("datasource_account", datasource_name, "datasource")
+        try:
+            replace_notes(self._s, datasource_id, spec)
+        except ValueError as error:
+            raise ExtSyncError(422, str(error)) from error
+        return datasource_id
+
+    def _delete_catalog_note(self, name: str, existing: ExtSyncObject) -> None:
+        delete_notes(self._s, existing.external_id)
 
     # ---- role -----------------------------------------------------------------------------
 

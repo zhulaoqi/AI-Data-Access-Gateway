@@ -29,7 +29,7 @@ from adg.shared.ids import uuidv7
 
 OLD = "202610140001"  # shipped the VARCHAR(36) query_id
 WIDENING = "202610150001"
-HEAD = "202610290001"
+HEAD = "202611030001"
 BASELINE = "202604260001"  # before the ext tables exist
 LONG_REF = "gw:rf:" + "f" * 194  # a row filter's external id is its (200 char) object name
 
