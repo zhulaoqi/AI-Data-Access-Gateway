@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -13,7 +14,10 @@ from sqlalchemy import URL, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 
+from adg.app.log_config import kv
 from adg.app.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimePoolSettings(Protocol):
@@ -36,6 +40,7 @@ class _GlobalConnectionBudget:
         self._lock = RLock()
         self._used = 0
         self._connections: set[int] = set()
+        self._exhausted_logged_at = 0.0
 
     @property
     def used(self) -> int:
@@ -47,6 +52,12 @@ class _GlobalConnectionBudget:
 
         with self._lock:
             if self._used >= limit:
+                now = time.monotonic()
+                if now - self._exhausted_logged_at >= 30:
+                    self._exhausted_logged_at = now
+                    logger.warning(
+                        kv(event="datasource_pool_exhausted", db_connections=self._used, limit=limit)
+                    )
                 return False
             self._used += 1
             return True
@@ -79,6 +90,12 @@ class _GlobalConnectionBudget:
 
 
 _global_connection_budget = _GlobalConnectionBudget()
+
+
+def global_db_connections() -> tuple[int, int]:
+    """Process-wide physical connections in use, and the deployment cap."""
+
+    return _global_connection_budget.used, get_settings().runtime_datasource_pool_global_max_connections
 
 
 @dataclass

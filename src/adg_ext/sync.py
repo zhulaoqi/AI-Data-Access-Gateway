@@ -358,7 +358,13 @@ class SyncService:
             ) from error
         if connection_budget < 1 or max_query_concurrency < 1:
             raise ExtSyncError(422, "datasource capacity values must be positive")
-        tier = str(raw.get("tier") or "")[:64]
+        tier = str(raw.get("tier") or raw.get("capacityTier") or "")[:64]
+        changed = (
+            existing is None
+            or existing.tier != tier
+            or existing.connection_budget != connection_budget
+            or existing.max_query_concurrency != max_query_concurrency
+        )
         if existing is None:
             self._s.add(
                 ExtDatasourceCapacity(
@@ -373,6 +379,16 @@ class SyncService:
             existing.connection_budget = connection_budget
             existing.max_query_concurrency = max_query_concurrency
         self._s.flush()
+        if changed:
+            logger.info(
+                kv(
+                    event="capacity_updated",
+                    datasource=datasource_id,
+                    tier=tier or "-",
+                    connections=connection_budget,
+                    concurrency=max_query_concurrency,
+                )
+            )
 
     def rescan(self, name: str) -> dict[str, int]:
         """Re-read the live catalog of a synced datasource; the spec and hash stay unchanged."""

@@ -486,9 +486,11 @@ def _execute(
     capacity = session.get(ExtDatasourceCapacity, datasource_id)
     connection_budget, datasource_limit = effective_datasource_capacity(capacity)
 
-    def rejected(kind: str, reason: str) -> dict[str, Any]:
+    def rejected(kind: str, reason: str, state: dict[str, int] | None = None) -> dict[str, Any]:
         get_query_metrics().rejected(reason)
-        _log_rejected(identity.user_id, api_key_id, datasource_id, kind, reason, audit_extra)
+        _log_rejected(
+            identity.user_id, api_key_id, datasource_id, kind, reason, audit_extra, state
+        )
         _record_rejection(
             svc,
             identity,
@@ -525,7 +527,11 @@ def _execute(
             ),
         )
     except AdmissionRejected as error:
-        return rejected(admission_rejection_kind(error.reason), f"admission_{error.reason}")
+        return rejected(
+            admission_rejection_kind(error.reason),
+            f"admission_{error.reason}",
+            error.state,
+        )
 
     get_share().register_run(
         request_id or "",
@@ -695,6 +701,7 @@ def _log_rejected(
     kind: str,
     reason: str,
     meta: dict[str, Any],
+    state: dict[str, int] | None = None,
 ) -> None:
     logger.info(
         kv(
@@ -706,6 +713,64 @@ def _log_rejected(
             reason=reason,
             request_id=meta.get("request_id"),
             fingerprint=meta.get("sql_fingerprint"),
+            **(state or {}),
+        )
+    )
+
+
+_capacity_log_started = False
+_capacity_log_guard = threading.Lock()
+
+
+def start_capacity_log(interval_seconds: int = 60) -> None:
+    """One capacity line per minute, and only while something is running or connected."""
+
+    global _capacity_log_started
+    with _capacity_log_guard:
+        if _capacity_log_started:
+            return
+        _capacity_log_started = True
+    threading.Thread(
+        target=_capacity_log_loop,
+        args=(max(15, interval_seconds),),
+        name="capacity-log",
+        daemon=True,
+    ).start()
+
+
+def _capacity_log_loop(interval_seconds: int) -> None:
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            _log_capacity_state()
+        except Exception:
+            logger.warning(kv(event="capacity_state_failed", error="snapshot"))
+
+
+def _log_capacity_state() -> None:
+    from adg.connectors.runtime_engine_cache import global_db_connections
+
+    view = get_admission().metrics_view()
+    db_used, db_limit = global_db_connections()
+    if view.running == 0 and view.queued == 0 and db_used == 0:
+        return
+    busiest_id = "-"
+    busiest_running = 0
+    busiest_limit = 0
+    if view.datasource_running:
+        busiest_id, busiest_running = max(view.datasource_running.items(), key=lambda item: item[1])
+        busiest_limit = view.datasource_limits.get(busiest_id, 0)
+    logger.info(
+        kv(
+            event="capacity_state",
+            running=view.running,
+            queued=view.queued,
+            datasources=len(view.datasource_running),
+            busiest=busiest_id,
+            busiest_running=busiest_running,
+            busiest_limit=busiest_limit,
+            db_connections=db_used,
+            db_connection_limit=db_limit,
         )
     )
 

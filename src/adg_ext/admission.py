@@ -36,11 +36,16 @@ class MetricsView:
 
 
 class AdmissionRejected(Exception):
-    """The request was not admitted; ``reason`` is a stable code."""
+    """The request was not admitted; ``reason`` is a stable code.
 
-    def __init__(self, reason: str) -> None:
+    ``state`` is the limits and counts at the moment of refusal (grant concurrency, queue,
+    datasource concurrency). It is for the rejection log only.
+    """
+
+    def __init__(self, reason: str, **state: int) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.state = state
 
 
 @dataclass
@@ -283,11 +288,20 @@ class Admission:
         share = get_share()
         if not share.try_slot(f"user:{user_key}", max_concurrency, member):
             self._release(ticket)
-            raise AdmissionRejected("queue_full")
+            raise AdmissionRejected(
+                "queue_full",
+                grant_limit=max_concurrency,
+                queue_limit=queue_size,
+                ds_limit=effective_datasource_limit,
+            )
         if not share.try_slot(f"ds:{datasource_key}", effective_datasource_limit, member):
             share.release_slot(f"user:{user_key}", member)
             self._release(ticket)
-            raise AdmissionRejected("datasource_busy")
+            raise AdmissionRejected(
+                "datasource_busy",
+                grant_limit=max_concurrency,
+                ds_limit=effective_datasource_limit,
+            )
         ticket.redis_member = member
         return ticket
 
@@ -310,7 +324,13 @@ class Admission:
                 return
             if len(lane.queue) >= queue_size:
                 self._count("rejected_queue_full")
-                raise AdmissionRejected("queue_full")
+                raise AdmissionRejected(
+                    "queue_full",
+                    grant_running=lane.running,
+                    grant_queued=len(lane.queue),
+                    grant_limit=max_concurrency,
+                    queue_limit=queue_size,
+                )
             waiter = _Waiter(tags)
             lane.queue.append(waiter)
             try:
@@ -327,7 +347,13 @@ class Admission:
                     remaining = deadline - self._clock()
                     if remaining <= 0:
                         self._count("rejected_queue_timeout")
-                        raise AdmissionRejected("queue_timeout")
+                        raise AdmissionRejected(
+                            "queue_timeout",
+                            grant_running=lane.running,
+                            grant_queued=len(lane.queue),
+                            grant_limit=max_concurrency,
+                            queue_limit=queue_size,
+                        )
                     self._cond.wait(remaining)
             except AdmissionRejected:
                 if waiter in lane.queue:
@@ -344,7 +370,12 @@ class Admission:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     self._count("rejected_datasource_busy")
-                    raise AdmissionRejected("datasource_busy")
+                    running = self._datasource_running.get(datasource_key, 0)
+                    raise AdmissionRejected(
+                        "datasource_busy",
+                        ds_running=running,
+                        ds_limit=datasource_limit,
+                    )
                 self._cond.wait(remaining)
             self._datasource_running[datasource_key] = (
                 self._datasource_running.get(datasource_key, 0) + 1
