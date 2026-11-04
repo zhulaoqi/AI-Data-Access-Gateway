@@ -16,8 +16,14 @@ never leaks a column name), validated against ``[a-z][a-z0-9_]*`` and capped at
 executor's datasource id. Users, SQL text, key material and error messages never become labels.
 """
 
+import asyncio
+import gc
+import os
 import re
+import resource
+import sys
 import threading
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -65,6 +71,18 @@ MAX_REASONS = 64
 OTHER = "other"
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ADMISSION_REJECT_PREFIX = "rejected_"
+# 这些原因在第一次发生前也输出 0，否则拒绝序列要等事故之后才出现。
+ADMISSION_REJECT_REASONS = (
+    "circuit_open",
+    "queue_full",
+    "revoked",
+    "queue_timeout",
+    "datasource_busy",
+)
+_MAX_DATASOURCE_HISTOGRAMS = 128
+_PROCESS_START = time.time()
+_loop_lag = 0.0
+_loop_lag_lock = threading.Lock()
 
 
 def reason_label(code: str) -> str:
@@ -115,6 +133,7 @@ class QueryMetrics:
         self._rejected: dict[str, int] = {}
         self._audit_unavailable = 0
         self._duration = Histogram(DURATION_BUCKETS)
+        self._duration_by_datasource: dict[str, Histogram] = {}
 
     def outcome(self, name: str) -> None:
         if name not in self._outcomes:
@@ -137,13 +156,33 @@ class QueryMetrics:
         with self._lock:
             self._audit_unavailable += 1
 
-    def observe_duration(self, seconds: float) -> None:
-        """Record execution time after a slot was granted. Queue wait is a separate histogram."""
+    def observe_duration(self, seconds: float, datasource: str | None = None) -> None:
+        """Record execution time after a slot was granted. Queue wait is a separate histogram.
+
+        A datasource id also feeds the per-datasource histogram. The global histogram stays
+        unlabeled so existing queries keep working.
+        """
 
         self._duration.observe(seconds)
+        if not datasource or len(datasource) > 128 or "\n" in datasource:
+            return
+        with self._lock:
+            histogram = self._duration_by_datasource.get(datasource)
+            if histogram is None:
+                if len(self._duration_by_datasource) >= _MAX_DATASOURCE_HISTOGRAMS:
+                    return
+                histogram = Histogram(DURATION_BUCKETS)
+                self._duration_by_datasource[datasource] = histogram
+            # observe() takes its own lock; do not call it while holding ours
+            pending = histogram
+        pending.observe(seconds)
 
     def duration_histogram(self) -> Histogram:
         return self._duration
+
+    def datasource_durations(self) -> dict[str, Histogram]:
+        with self._lock:
+            return dict(self._duration_by_datasource)
 
     def snapshot(self) -> tuple[dict[str, int], dict[str, int], int]:
         with self._lock:
@@ -272,12 +311,15 @@ def render(
         "counter",
         "Requests refused by admission control, by reason.",
     )
-    for key in sorted(k for k in counters if k.startswith(_ADMISSION_REJECT_PREFIX)):
-        w.sample(
-            "adg_ext_admission_rejected_total",
-            counters[key],
-            reason=key[len(_ADMISSION_REJECT_PREFIX) :],
-        )
+    reasons = {
+        key[len(_ADMISSION_REJECT_PREFIX) :]: counters[key]
+        for key in counters
+        if key.startswith(_ADMISSION_REJECT_PREFIX)
+    }
+    for reason in ADMISSION_REJECT_REASONS:
+        reasons.setdefault(reason, 0)
+    for reason in sorted(reasons):
+        w.sample("adg_ext_admission_rejected_total", reasons[reason], reason=reason)
 
     w.family(
         "adg_ext_admission_wait_seconds_avg",
@@ -306,6 +348,14 @@ def render(
         "Seconds from gaining an execution slot until the database call returns.",
         queries.duration_histogram(),
     )
+    for datasource, histogram in sorted(queries.datasource_durations().items()):
+        _histogram(
+            w,
+            "adg_ext_datasource_query_duration_seconds",
+            "Per-datasource seconds from a granted slot until the database returns.",
+            histogram,
+            datasource=datasource,
+        )
     w.family(
         "adg_ext_query_rejected_total",
         "counter",
@@ -320,7 +370,22 @@ def render(
     )
     w.sample("adg_ext_audit_unavailable_total", audit_unavailable)
 
-    if revocation is not None and revocation.enabled:
+    revocation_on = revocation is not None and revocation.enabled
+    w.family(
+        "adg_ext_revocation_enabled",
+        "gauge",
+        "1 when the revocation list is being pulled, otherwise 0.",
+    )
+    w.sample("adg_ext_revocation_enabled", 1 if revocation_on else 0)
+    blocklist_on = blocklist is not None and blocklist.enabled
+    w.family(
+        "adg_ext_blocklist_enabled",
+        "gauge",
+        "1 when the source blocklist is being enforced, otherwise 0.",
+    )
+    w.sample("adg_ext_blocklist_enabled", 1 if blocklist_on else 0)
+
+    if revocation_on and revocation is not None:
         w.family(
             "adg_ext_revocation_poll_age_seconds",
             "gauge",
@@ -328,7 +393,7 @@ def render(
             "(since start-up when it never was).",
         )
         w.sample("adg_ext_revocation_poll_age_seconds", revocation.poll_age_seconds())
-    if blocklist is not None and blocklist.enabled:
+    if blocklist_on and blocklist is not None:
         w.family(
             "adg_ext_blocklist_version",
             "gauge",
@@ -357,14 +422,120 @@ def render(
         )
         w.sample("adg_ext_blocked_total", blocklist.blocked_total, reason="source_blocked")
         w.sample("adg_ext_blocked_total", blocklist.frozen_total, reason="grant_frozen")
+    _render_runtime(w)
     return w.text()
 
 
-def _histogram(w: _Writer, name: str, help_: str, histogram: Histogram) -> None:
+def _histogram(
+    w: _Writer, name: str, help_: str, histogram: Histogram, **labels: object
+) -> None:
     buckets, total, count = histogram.snapshot()
-    w.family(name, "histogram", help_)
+    # One family header per metric name. Callers with the same name must share one header.
+    if not any(line.startswith(f"# TYPE {name} ") for line in w.lines):
+        w.family(name, "histogram", help_)
     for bound, n in buckets:
-        w.lines.append(f'{name}_bucket{{le="{_bound(bound)}"}} {n}')
-    w.lines.append(f'{name}_bucket{{le="+Inf"}} {count}')
-    w.lines.append(f"{name}_sum {_number(total)}")
-    w.lines.append(f"{name}_count {count}")
+        _histogram_sample(w, f"{name}_bucket", n, le=_bound(bound), **labels)
+    _histogram_sample(w, f"{name}_bucket", count, le="+Inf", **labels)
+    _histogram_sample(w, f"{name}_sum", total, **labels)
+    _histogram_sample(w, f"{name}_count", count, **labels)
+
+
+def _histogram_sample(w: _Writer, name: str, value: float, **labels: object) -> None:
+    ordered = {k: v for k, v in labels.items() if k != "le"}
+    if "le" in labels:
+        ordered["le"] = labels["le"]
+    w.sample(name, value, **ordered)
+
+
+def _rss_bytes() -> int:
+    try:
+        with open("/proc/self/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(rss)
+    return int(rss) * 1024
+
+
+def _open_fds() -> int | None:
+    for path in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return max(0, len(os.listdir(path)) - 1)
+        except OSError:
+            continue
+    return None
+
+
+def loop_lag_seconds() -> float:
+    with _loop_lag_lock:
+        return _loop_lag
+
+
+async def watch_event_loop(interval: float = 1.0) -> None:
+    """Record how late the event loop wakes up. A stuck loop still serves a stale gauge."""
+
+    global _loop_lag
+    try:
+        while True:
+            started = time.perf_counter()
+            await asyncio.sleep(interval)
+            lag = max(0.0, time.perf_counter() - started - interval)
+            with _loop_lag_lock:
+                _loop_lag = lag
+    except asyncio.CancelledError:
+        raise
+
+
+def _render_runtime(w: _Writer) -> None:
+    """Process and interpreter metrics. Names match prometheus_client's default collectors."""
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    w.family(
+        "process_cpu_seconds_total",
+        "counter",
+        "Total user and system CPU time spent in seconds.",
+    )
+    w.sample("process_cpu_seconds_total", usage.ru_utime + usage.ru_stime)
+    w.family("process_resident_memory_bytes", "gauge", "Resident memory size in bytes.")
+    w.sample("process_resident_memory_bytes", _rss_bytes())
+    w.family(
+        "process_start_time_seconds",
+        "gauge",
+        "Start time of the process since unix epoch in seconds.",
+    )
+    w.sample("process_start_time_seconds", _PROCESS_START)
+    w.family("process_max_fds", "gauge", "Maximum number of open file descriptors.")
+    w.sample("process_max_fds", resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+    open_fds = _open_fds()
+    if open_fds is not None:
+        w.family("process_open_fds", "gauge", "Number of open file descriptors.")
+        w.sample("process_open_fds", open_fds)
+    w.family(
+        "adg_asyncio_loop_lag_seconds",
+        "gauge",
+        "Seconds the event loop was late for its last one-second wake. 0 until the watcher starts.",
+    )
+    w.sample("adg_asyncio_loop_lag_seconds", loop_lag_seconds())
+
+    w.family(
+        "python_gc_collections_total",
+        "counter",
+        "Number of garbage collections, by generation.",
+    )
+    w.family(
+        "python_gc_objects_collected_total",
+        "counter",
+        "Objects collected during garbage collection, by generation.",
+    )
+    for generation, stat in enumerate(gc.get_stats()):
+        label = str(generation)
+        w.sample("python_gc_collections_total", stat.get("collections", 0), generation=label)
+        w.sample(
+            "python_gc_objects_collected_total",
+            stat.get("collected", 0),
+            generation=label,
+        )

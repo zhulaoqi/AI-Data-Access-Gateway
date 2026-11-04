@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from contextlib import asynccontextmanager
@@ -43,10 +44,21 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
         print_banner()
         _log_startup(settings)
         await widen_query_threadpool()
+        loop_watch: asyncio.Task[None] | None = None
+        if ext_enabled():
+            from adg_ext.metrics import watch_event_loop
+
+            loop_watch = asyncio.create_task(watch_event_loop())
         async with runtime_mcp_server.session_manager.run():
             try:
                 yield
             finally:
+                if loop_watch is not None:
+                    loop_watch.cancel()
+                    try:
+                        await loop_watch
+                    except asyncio.CancelledError:
+                        pass
                 logger.info(kv(event="shutdown"))
                 runtime_engine_cache.dispose_all()
 

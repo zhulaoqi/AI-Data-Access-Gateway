@@ -136,9 +136,29 @@ def test_render_is_valid_text_with_all_gap_metrics() -> None:
     assert value(s, "adg_ext_query_duration_seconds_bucket", le="2.5") == 1
     assert value(s, "adg_ext_admission_wait_seconds_count") == 1
     assert value(s, "adg_ext_admission_wait_seconds_bucket", le="+Inf") == 1
-    # no revocation cache given: the poll age is not claimed
+    # no revocation cache given: the poll age is not claimed, but the switch is visible
     assert "adg_ext_revocation_poll_age_seconds" not in text
+    assert value(s, "adg_ext_revocation_enabled") == 0
+    assert value(s, "adg_ext_blocklist_enabled") == 0
+    for reason in ("circuit_open", "queue_full", "revoked", "queue_timeout", "datasource_busy"):
+        assert value(s, "adg_ext_admission_rejected_total", reason=reason) == 0
+    assert value(s, "process_resident_memory_bytes") > 0
+    assert value(s, "process_cpu_seconds_total") >= 0
+    assert value(s, "process_open_fds") >= 0
+    assert value(s, "adg_asyncio_loop_lag_seconds") == 0
+    assert value(s, "python_gc_collections_total", generation="0") >= 0
     t.release()
+
+
+def test_datasource_duration_is_separate_from_the_global_histogram() -> None:
+    q = QueryMetrics()
+    q.observe_duration(1.2, "ds-1")
+    q.observe_duration(0.2)
+    s = parse(metrics.render(new_admission(), q, None))
+    assert value(s, "adg_ext_query_duration_seconds_count") == 2
+    assert value(s, "adg_ext_datasource_query_duration_seconds_count", datasource="ds-1") == 1
+    assert value(s, "adg_ext_datasource_query_duration_seconds_bucket", datasource="ds-1", le="1.0") == 0
+    assert value(s, "adg_ext_datasource_query_duration_seconds_bucket", datasource="ds-1", le="2.5") == 1
 
 
 def test_wait_histogram_buckets_are_monotonic_and_end_in_count() -> None:
@@ -203,7 +223,7 @@ def test_labels_never_carry_users_sql_or_keys() -> None:
     for secret in ("alice", "example.com", "SELECT", "secret", "adg_key", "ssn"):
         assert secret not in text
     label_names = {n for _, labels in parse(text) for n, _ in labels}
-    assert label_names <= {"outcome", "reason", "datasource", "le"}
+    assert label_names <= {"outcome", "reason", "datasource", "le", "generation"}
 
 
 class Clock:
