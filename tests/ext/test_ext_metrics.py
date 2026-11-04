@@ -150,6 +150,23 @@ def test_render_is_valid_text_with_all_gap_metrics() -> None:
     t.release()
 
 
+def test_known_datasource_names_are_exported_beside_the_id() -> None:
+    a = new_admission(datasource_limit=7)
+    a.acquire(
+        user_key="u", datasource_key="ds-1", max_concurrency=1, queue_size=1, queue_timeout=1
+    ).release()
+    q = QueryMetrics()
+    q.observe_duration(1.2, "ds-1")
+    s = parse(metrics.render(a, q, None, names={"ds-1": "BI 系统SR"}))
+    assert value(s, "adg_ext_admission_datasource_limit", datasource="ds-1", name="BI 系统SR") == 7
+    assert value(s, "adg_ext_admission_datasource_running", datasource="ds-1", name="BI 系统SR") == 0
+    assert (
+        value(s, "adg_ext_datasource_query_duration_seconds_count", datasource="ds-1", name="BI 系统SR")
+        == 1
+    )
+    assert "BI 系统SR" in metrics.render(a, q, None, names={"ds-1": "BI 系统SR"})
+
+
 def test_datasource_duration_is_separate_from_the_global_histogram() -> None:
     q = QueryMetrics()
     q.observe_duration(1.2, "ds-1")
@@ -223,7 +240,7 @@ def test_labels_never_carry_users_sql_or_keys() -> None:
     for secret in ("alice", "example.com", "SELECT", "secret", "adg_key", "ssn"):
         assert secret not in text
     label_names = {n for _, labels in parse(text) for n, _ in labels}
-    assert label_names <= {"outcome", "reason", "datasource", "le", "generation"}
+    assert label_names <= {"outcome", "reason", "datasource", "name", "le", "generation"}
 
 
 class Clock:

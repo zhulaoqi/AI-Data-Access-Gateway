@@ -24,7 +24,7 @@ import resource
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -231,12 +231,12 @@ class _Writer:
         self.lines.append(f"# HELP {name} {help_}")
         self.lines.append(f"# TYPE {name} {kind}")
 
-    def sample(self, name: str, value: float, **labels: object) -> None:
+    def sample(self, metric: str, value: float, **labels: object) -> None:
         if labels:
             rendered = ",".join(f'{k}="{_escape(v)}"' for k, v in labels.items())
-            self.lines.append(f"{name}{{{rendered}}} {_number(value)}")
+            self.lines.append(f"{metric}{{{rendered}}} {_number(value)}")
         else:
-            self.lines.append(f"{name} {_number(value)}")
+            self.lines.append(f"{metric} {_number(value)}")
 
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
@@ -256,7 +256,37 @@ def render_current() -> str:
         get_query_metrics(),
         revocation.get_cache(),
         blocklist.get_cache(),
+        names=datasource_display_names(),
     )
+
+
+def datasource_display_names() -> dict[str, str]:
+    """Datasource id to the name shown in the console. Empty when the table cannot be read."""
+
+    try:
+        from sqlalchemy import select
+
+        from adg.control_plane.db import SessionLocal
+        from adg.control_plane.models.datasource import Datasource
+
+        with SessionLocal() as session:
+            rows = session.execute(select(Datasource.id, Datasource.name)).all()
+    except Exception:
+        return {}
+    names: dict[str, str] = {}
+    for datasource_id, name in rows:
+        cleaned = " ".join(str(name or "").split())[:200]
+        if datasource_id and cleaned:
+            names[str(datasource_id)] = cleaned
+    return names
+
+
+def _datasource_labels(datasource_id: str, names: Mapping[str, str]) -> dict[str, str]:
+    labels = {"datasource": datasource_id}
+    name = names.get(datasource_id)
+    if name:
+        labels["name"] = name
+    return labels
 
 
 def render(
@@ -264,11 +294,13 @@ def render(
     queries: QueryMetrics,
     revocation: "RevocationCache | None" = None,
     blocklist: "BlocklistCache | None" = None,
+    names: Mapping[str, str] | None = None,
 ) -> str:
     """The full exposition text; deterministic ordering (sorted label values)."""
 
     w = _Writer()
     view = admission.metrics_view()
+    known_names = names or {}
 
     w.family("adg_ext_admission_queued", "gauge", "Requests currently waiting for a slot.")
     w.sample("adg_ext_admission_queued", view.queued)
@@ -281,7 +313,11 @@ def render(
     datasources = sorted(set(running) | set(limits) | set(breakers))
     w.family("adg_ext_admission_datasource_running", "gauge", "Requests executing per datasource.")
     for ds in datasources:
-        w.sample("adg_ext_admission_datasource_running", running.get(ds, 0), datasource=ds)
+        w.sample(
+            "adg_ext_admission_datasource_running",
+            running.get(ds, 0),
+            **_datasource_labels(ds, known_names),
+        )
     w.family(
         "adg_ext_admission_datasource_limit",
         "gauge",
@@ -291,7 +327,7 @@ def render(
         w.sample(
             "adg_ext_admission_datasource_limit",
             limits.get(ds, admission.datasource_limit),
-            datasource=ds,
+            **_datasource_labels(ds, known_names),
         )
     w.family(
         "adg_ext_admission_breaker_state",
@@ -300,7 +336,9 @@ def render(
     )
     for ds in sorted(breakers):
         w.sample(
-            "adg_ext_admission_breaker_state", BREAKER_STATES.get(breakers[ds], 0), datasource=ds
+            "adg_ext_admission_breaker_state",
+            BREAKER_STATES.get(breakers[ds], 0),
+            **_datasource_labels(ds, known_names),
         )
 
     counters = view.counters
@@ -354,7 +392,7 @@ def render(
             "adg_ext_datasource_query_duration_seconds",
             "Per-datasource seconds from a granted slot until the database returns.",
             histogram,
-            datasource=datasource,
+            **_datasource_labels(datasource, known_names),
         )
     w.family(
         "adg_ext_query_rejected_total",
@@ -427,20 +465,20 @@ def render(
 
 
 def _histogram(
-    w: _Writer, name: str, help_: str, histogram: Histogram, **labels: object
+    w: _Writer, metric: str, help_: str, histogram: Histogram, **labels: object
 ) -> None:
     buckets, total, count = histogram.snapshot()
     # One family header per metric name. Callers with the same name must share one header.
-    if not any(line.startswith(f"# TYPE {name} ") for line in w.lines):
-        w.family(name, "histogram", help_)
+    if not any(line.startswith(f"# TYPE {metric} ") for line in w.lines):
+        w.family(metric, "histogram", help_)
     for bound, n in buckets:
-        _histogram_sample(w, f"{name}_bucket", n, le=_bound(bound), **labels)
-    _histogram_sample(w, f"{name}_bucket", count, le="+Inf", **labels)
-    _histogram_sample(w, f"{name}_sum", total, **labels)
-    _histogram_sample(w, f"{name}_count", count, **labels)
+        _histogram_sample(w, f"{metric}_bucket", n, le=_bound(bound), **labels)
+    _histogram_sample(w, f"{metric}_bucket", count, le="+Inf", **labels)
+    _histogram_sample(w, f"{metric}_sum", total, **labels)
+    _histogram_sample(w, f"{metric}_count", count, **labels)
 
 
-def _histogram_sample(w: _Writer, name: str, value: float, **labels: object) -> None:
+def _histogram_sample(w: _Writer, metric: str, value: float, **labels: object) -> None:
     ordered = {k: v for k, v in labels.items() if k != "le"}
     if "le" in labels:
         ordered["le"] = labels["le"]
