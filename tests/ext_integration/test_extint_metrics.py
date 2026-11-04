@@ -272,3 +272,6 @@ def test_prometheus_endpoint_is_admin_only(gateway: Gateway, mysql_seed: dict[st
     assert gateway.client.get(url, headers={"X-ADG-API-Key": runtime_key}).status_code == 403
     assert gateway.client.get(url).status_code == 401
     assert gateway.admin_get(url).status_code == 200
+    public = gateway.client.get("/mcp/metrics")
+    assert public.status_code == 200
+    assert "adg_ext_query_total" in public.text

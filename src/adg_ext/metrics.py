@@ -178,6 +178,23 @@ class _Writer:
         return "\n".join(self.lines) + "\n"
 
 
+def render_current() -> str:
+    """Prometheus text for the process, without the admin API key.
+
+    Served at ``GET /mcp/metrics`` because that prefix is already routed to the executor.
+    """
+
+    from adg_ext import blocklist, revocation
+    from adg_ext.pipeline import get_admission
+
+    return render(
+        get_admission(),
+        get_query_metrics(),
+        revocation.get_cache(),
+        blocklist.get_cache(),
+    )
+
+
 def render(
     admission: "Admission",
     queries: QueryMetrics,

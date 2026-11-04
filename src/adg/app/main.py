@@ -81,6 +81,15 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     app.include_router(admin_system_router)
     app.include_router(internal_decrypt_router)
     app.include_router(mcp_tools_router)
+    if ext_enabled():
+        from adg_ext.metrics import CONTENT_TYPE, render_current
+
+        @app.get("/mcp/metrics", include_in_schema=False)
+        def public_executor_metrics() -> Response:
+            """Prometheus text for public scrape. Sync and audit stay on the admin key."""
+
+            return Response(content=render_current(), media_type=CONTENT_TYPE)
+
     app.mount("/mcp", mcp_server_app)
     # Added before the extension so its ClientIpMiddleware wraps this one and the access line can
     # use the resolved client address.
