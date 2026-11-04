@@ -56,9 +56,9 @@ def parse(text: str) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
 
 
 def value(
-    samples: dict[tuple[str, tuple[tuple[str, str], ...]], float], name: str, **labels: str
+    samples: dict[tuple[str, tuple[tuple[str, str], ...]], float], metric: str, **labels: str
 ) -> float:
-    return samples[(name, tuple(sorted(labels.items())))]
+    return samples[(metric, tuple(sorted(labels.items())))]
 
 
 def new_admission(**kw: object) -> Admission:

@@ -482,7 +482,7 @@ def _histogram_sample(w: _Writer, metric: str, value: float, **labels: object) -
     ordered = {k: v for k, v in labels.items() if k != "le"}
     if "le" in labels:
         ordered["le"] = labels["le"]
-    w.sample(name, value, **ordered)
+    w.sample(metric, value, **ordered)
 
 
 def _rss_bytes() -> int:
