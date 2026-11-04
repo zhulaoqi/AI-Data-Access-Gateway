@@ -116,6 +116,7 @@ def test_render_is_valid_text_with_all_gap_metrics() -> None:
     q.outcome("timeout")
     q.rejected("column_not_allowed:ssn")
     q.audit_unavailable()
+    q.observe_duration(1.2)
     text = metrics.render(a, q, None)
     s = parse(text)
     assert value(s, "adg_ext_query_total", outcome="completed") == 1
@@ -130,6 +131,9 @@ def test_render_is_valid_text_with_all_gap_metrics() -> None:
     assert value(s, "adg_ext_admission_breaker_state", datasource="ds-1") == 0
     assert value(s, "adg_ext_admission_running") == 1
     assert value(s, "adg_ext_admission_admitted_total") == 1
+    assert value(s, "adg_ext_query_duration_seconds_count") == 1
+    assert value(s, "adg_ext_query_duration_seconds_bucket", le="1.0") == 0
+    assert value(s, "adg_ext_query_duration_seconds_bucket", le="2.5") == 1
     assert value(s, "adg_ext_admission_wait_seconds_count") == 1
     assert value(s, "adg_ext_admission_wait_seconds_bucket", le="+Inf") == 1
     # no revocation cache given: the poll age is not claimed

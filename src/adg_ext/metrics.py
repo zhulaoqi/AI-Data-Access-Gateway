@@ -29,6 +29,22 @@ if TYPE_CHECKING:
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 OUTCOMES = ("completed", "failed", "timeout", "cancelled", "rejected")
+# 排队之后、数据库返回之前的耗时。上限对齐查询超时 600 秒。
+DURATION_BUCKETS: tuple[float, ...] = (
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+)
 WAIT_BUCKETS: tuple[float, ...] = (
     0.005,
     0.01,
@@ -98,6 +114,7 @@ class QueryMetrics:
         self._outcomes: dict[str, int] = dict.fromkeys(OUTCOMES, 0)
         self._rejected: dict[str, int] = {}
         self._audit_unavailable = 0
+        self._duration = Histogram(DURATION_BUCKETS)
 
     def outcome(self, name: str) -> None:
         if name not in self._outcomes:
@@ -119,6 +136,14 @@ class QueryMetrics:
     def audit_unavailable(self) -> None:
         with self._lock:
             self._audit_unavailable += 1
+
+    def observe_duration(self, seconds: float) -> None:
+        """Record execution time after a slot was granted. Queue wait is a separate histogram."""
+
+        self._duration.observe(seconds)
+
+    def duration_histogram(self) -> Histogram:
+        return self._duration
 
     def snapshot(self) -> tuple[dict[str, int], dict[str, int], int]:
         with self._lock:
@@ -275,6 +300,12 @@ def render(
     )
     for outcome in OUTCOMES:
         w.sample("adg_ext_query_total", outcomes.get(outcome, 0), outcome=outcome)
+    _histogram(
+        w,
+        "adg_ext_query_duration_seconds",
+        "Seconds from gaining an execution slot until the database call returns.",
+        queries.duration_histogram(),
+    )
     w.family(
         "adg_ext_query_rejected_total",
         "counter",

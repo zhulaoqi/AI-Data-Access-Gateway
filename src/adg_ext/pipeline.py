@@ -595,6 +595,7 @@ def _execute(
             connection_budget,
         )
         duration_ms = int((time.monotonic() - started_wall) * 1000)
+        get_query_metrics().observe_duration(duration_ms / 1000)
         metadata: dict[str, Any] = dict(json_loads(event.metadata_json))
         metadata.update(phase="completed", duration_ms=duration_ms)
 
