@@ -241,6 +241,7 @@ class GatewayRuntimeService:
         api_key_id: str,
         resource_id: str,
         limit: int,
+        disclosure_headers: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Run a bounded SELECT * preview through the same guarded query pipeline."""
 
@@ -295,6 +296,7 @@ class GatewayRuntimeService:
             query=f"select {preview_columns} from {resource.path}",
             limit=limit,
             event_type="resource_preview",
+            disclosure_headers=disclosure_headers,
         )
 
     def execute_query(
@@ -307,6 +309,7 @@ class GatewayRuntimeService:
         query: str,
         limit: int,
         event_type: str = "query_execution",
+        disclosure_headers: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Validate, authorize, execute, mask, and audit a read-only runtime query."""
 
@@ -321,6 +324,7 @@ class GatewayRuntimeService:
                 query=query,
                 limit=limit,
                 event_type=event_type,
+                disclosure_headers=disclosure_headers,
             )
             if managed is not None:
                 return managed

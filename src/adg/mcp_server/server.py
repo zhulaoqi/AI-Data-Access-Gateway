@@ -197,6 +197,10 @@ def _run_runtime_tool(ctx: McpContext, tool_name: str, payload: dict[str, Any]) 
             payload,
             authenticated.runtime_identity,
             authenticated.id,
+            {
+                "person": request.headers.get("x-gw-person"),
+                "scope": request.headers.get("x-gw-scope"),
+            },
         )
         session.commit()
         return response

@@ -49,7 +49,15 @@ from adg_ext.rowfilter import compile_template
 logger = logging.getLogger(__name__)
 
 PREFIX = "gw:"
-TYPES = ("datasource_account", "role", "row_filter", "user", "credential", "catalog_note")
+TYPES = (
+    "datasource_account",
+    "role",
+    "row_filter",
+    "user",
+    "credential",
+    "catalog_note",
+    "person_scope",
+)
 _ENGINE_TO_CONNECTOR = {
     "mysql": "mysql",
     "starrocks": "doris",
@@ -551,9 +559,12 @@ class SyncService:
             self._s.flush()
         role.status = "active"
         self._clear_role(role.id)
+        operations = dict(spec.get("operations") or {})
+        if spec.get("disclosure") and "disclosure" not in operations:
+            operations["disclosure"] = spec["disclosure"]
         spec_row = ExtRoleSpec(
             role_id=role.id,
-            operations_json=json.dumps(spec.get("operations") or {}, separators=(",", ":")),
+            operations_json=json.dumps(operations, separators=(",", ":")),
             limits_json=json.dumps(spec.get("limits") or {}, separators=(",", ":")),
         )
         self._s.add(spec_row)
@@ -785,3 +796,20 @@ class SyncService:
         record = self._s.get(ApiKey, existing.external_id) if existing.external_id else None
         if record is not None:
             record.status = "revoked"
+
+    def _put_person_scope(self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None) -> str:
+        from adg_ext.disclosure import remember
+
+        dimension = str(spec.get("dimensionId") or "")
+        open_id = str(spec.get("openId") or "")
+        values = [item for item in (spec.get("values") or []) if isinstance(item, str) and item]
+        if dimension and open_id and values:
+            remember(dimension, open_id, values)
+        return name
+
+    def _delete_person_scope(self, name: str, existing: ExtSyncObject) -> None:
+        from adg_ext.disclosure import forget
+
+        spec = json.loads(existing.spec_json or "{}")
+        if isinstance(spec, dict):
+            forget(str(spec.get("dimensionId") or ""), str(spec.get("openId") or ""))

@@ -72,6 +72,7 @@ def dispatch_runtime_tool_call(
     payload: dict[str, Any],
     runtime_identity: IdentityContext,
     api_key_id: str,
+    disclosure_headers: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """Dispatch one runtime tool call to the shared service implementation."""
 
@@ -110,6 +111,7 @@ def dispatch_runtime_tool_call(
             api_key_id=api_key_id,
             resource_id=str(payload["resource_id"]),
             limit=int(payload.get("limit", 20)),
+            disclosure_headers=disclosure_headers,
         )
     if tool_name == "execute_query":
         return runtime.execute_query(
@@ -119,5 +121,6 @@ def dispatch_runtime_tool_call(
             resource_ids=[str(item) for item in payload.get("resource_ids", [])],
             query=str(payload["query"]),
             limit=int(payload.get("limit", 100)),
+            disclosure_headers=disclosure_headers,
         )
     raise KeyError(tool_name)

@@ -202,6 +202,40 @@ def _note_hit_databases(meta: dict[str, Any], sql: str, dialect: str | None) -> 
         meta["databases"] = [selected.strip()]
 
 
+def _person_values(session: Any, dimension_id: str, open_id: str) -> list[str] | None:
+    """One memory hit, else one Redis GET, else the last synced snapshot. Never the full table."""
+
+    from adg_ext.disclosure import _redis, resolve_values, sync_name
+    from adg_ext.models import ExtSyncObject
+
+    def local() -> list[str] | None:
+        row = session.execute(
+            select(ExtSyncObject).where(
+                ExtSyncObject.object_type == "person_scope",
+                ExtSyncObject.name == sync_name(dimension_id, open_id),
+            )
+        ).scalar_one_or_none()
+        if row is None or not row.spec_json:
+            return None
+        try:
+            spec = json.loads(row.spec_json)
+        except json.JSONDecodeError:
+            return None
+        values = spec.get("values") if isinstance(spec, dict) else None
+        if not isinstance(values, list):
+            return None
+        clean = [item for item in values if isinstance(item, str) and item]
+        return clean or None
+
+    def redis_get(key: str) -> str | None:
+        client = _redis()
+        if client is None:
+            raise RuntimeError("redis unavailable")
+        return client.get(key)
+
+    return resolve_values(dimension_id, open_id, redis_get=redis_get, local_get=local)
+
+
 def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> dict[str, Any]:
     """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
 
@@ -315,6 +349,7 @@ def run(
     event_type: str,
     request_id: str | None = None,
     audit_extra: dict[str, Any] | None = None,
+    disclosure_headers: dict[str, str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Run the extended flow; ``None`` means "not managed by the extension, use upstream"."""
 
@@ -339,6 +374,11 @@ def run(
             out["hint"] = hint
         return out
 
+    if ctx.disclosure:
+        if ctx.disclosure.get("conflict"):
+            return reject("permission_rejected", "disclosure_conflict")
+        if audit_meta.get("channel") == "jdbc":
+            return reject("permission_rejected", "disclosure_not_supported_on_jdbc")
     if limit < 1:
         return reject("sql_rejected", "runtime_limit_invalid")
     if limit > settings.runtime_query_max_limit:
@@ -398,6 +438,19 @@ def run(
         return reject("permission_rejected", f"field_disabled:{disabled_field}")
 
     views, _ = build_views(svc, ctx, actual)
+    if ctx.disclosure:
+        from adg_ext.disclosure import bind as bind_disclosure
+
+        reason = bind_disclosure(
+            ctx.disclosure,
+            views,
+            ctx.user_params,
+            channel=str(audit_meta.get("channel") or "mcp"),
+            headers=disclosure_headers,
+            lookup=lambda dimension_id, open_id: _person_values(session, dimension_id, open_id),
+        )
+        if reason:
+            return reject("permission_rejected", reason)
     outcome = rewrite(
         verdict,
         views,

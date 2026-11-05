@@ -53,6 +53,7 @@ class ExtContext:
     operations: Operations = field(default_factory=Operations)
     limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_LIMITS))
     user_params: dict[str, Any] = field(default_factory=dict)
+    disclosure: dict[str, Any] | None = None
 
     @property
     def managed(self) -> bool:
@@ -179,6 +180,12 @@ def load(session: Session, *, user_id: str | None, role_ids: Iterable[str]) -> E
         first = True
         for spec in specs:
             ops = _loads(str(spec.get("operations_json") or "{}"), {})
+            disc = ops.get("disclosure") if isinstance(ops, dict) else None
+            if isinstance(disc, dict) and disc.get("dimensionId"):
+                if ctx.disclosure is None:
+                    ctx.disclosure = disc
+                elif ctx.disclosure.get("dimensionId") != disc.get("dimensionId"):
+                    ctx.disclosure = {"conflict": True, "dimensionId": disc.get("dimensionId")}
             deny_functions |= {str(f).lower() for f in ops.get("denyFunctions") or []}
             deny_syntax |= {str(f).lower() for f in ops.get("denySyntax") or []}
             if ops.get("requireTimeRangeDays"):
