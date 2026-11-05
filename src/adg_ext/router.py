@@ -16,9 +16,11 @@ from adg.app.dependencies import (
 from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
+from adg.runtime_cache import refresh_catalog, refresh_policies
 from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
 from adg_ext.config import get_ext_settings
+from adg_ext.context import refresh_role
 from adg_ext.delegated import DelegatedError, run_delegated
 from adg_ext.dryrun import dry_run
 from adg_ext.netguard import check_source
@@ -63,6 +65,27 @@ audit_router = APIRouter(
 )
 
 
+def _warm_cache(
+    session: Session,
+    object_type: str,
+    external_id: str | None,
+    role_ids: list[str],
+) -> None:
+    """Reload the copies a committed sync just changed. Failures stay in the cache log."""
+
+    if object_type == "role" and external_id:
+        refresh_policies(session)
+        refresh_role(session, external_id)
+        return
+    if object_type != "datasource_account" or not external_id:
+        return
+    refresh_catalog(session, external_id)
+    if role_ids:
+        refresh_policies(session)
+        for role_id in role_ids:
+            refresh_role(session, role_id)
+
+
 def _fail(error: ExtSyncError) -> HTTPException:
     logger.warning(kv(event="sync_refused", status=error.status, detail=error.message))
     return HTTPException(status_code=error.status, detail=error.message)
@@ -82,6 +105,7 @@ def put_object(
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
+    _warm_cache(session, object_type, external_id, [])
     return {"externalId": external_id}
 
 
@@ -95,10 +119,12 @@ def delete_object(
     try:
         external_id = service.external_id_of(object_type, name)
         service.delete(object_type, name)
+        role_ids = [str(role_id) for role_id in getattr(service, "touched_role_ids", [])]
         session.commit()
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
+    _warm_cache(session, object_type, external_id, role_ids)
     if external_id and object_type in {"user", "credential"}:
         # revocation must also stop requests that are already queued or running
         cancelled = get_admission().revoke(external_id)
@@ -134,11 +160,15 @@ def rescan_datasource(
     """Re-scan the live catalog of a synced datasource without changing its spec."""
 
     try:
-        counts = SyncService(session).rescan(name)
+        service = SyncService(session)
+        counts = service.rescan(name)
+        datasource_id = service.external_id_of("datasource_account", name)
         session.commit()
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
+    if datasource_id:
+        refresh_catalog(session, datasource_id)
     return {"status": "ok", **counts}
 
 

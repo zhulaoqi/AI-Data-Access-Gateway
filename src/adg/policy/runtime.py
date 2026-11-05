@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from adg.control_plane.models.directory import Role, User, UserRole
 from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy, ResourceTag
 from adg.control_plane.models.resource import Resource
+from adg.runtime_cache import load_field_policies, load_policies
 from adg_ext import hooks as ext_hooks
 
 
@@ -87,6 +88,8 @@ class RuntimePolicyService:
 
     def __init__(self, session: Session) -> None:
         self._session = session
+        self._policy_groups: dict[str, list[ResourcePolicy]] | None = None
+        self._field_policies: dict[str, list[FieldPolicy]] = {}
 
     def check_resource_access(
         self,
@@ -191,17 +194,21 @@ class RuntimePolicyService:
         self._session.flush()
         if ext_hooks.field_denied(self._session, identity, resource.id, field_name):
             return PolicyDecision(allowed=False, reason="field_not_in_scope")
-        policies = list(
-            self._session.execute(
-                select(FieldPolicy).where(
-                    FieldPolicy.status == "active",
-                    FieldPolicy.action == action,
-                    FieldPolicy.resource_id == resource.id,
-                    FieldPolicy.field_name == field_name,
-                )
-            ).scalars()
-        )
+        policies = [
+            policy
+            for policy in self._cached_field_policies(resource.id)
+            if policy.action == action and policy.field_name == field_name
+        ]
         return self._field_policy_decision(policies=policies, identity=identity)
+
+    def _cached_field_policies(self, resource_id: str) -> list[FieldPolicy]:
+        """Field policies for one resource, loaded once per service and cached in Redis."""
+
+        cached = self._field_policies.get(resource_id)
+        if cached is None:
+            cached = load_field_policies(self._session, resource_id)
+            self._field_policies[resource_id] = cached
+        return cached
 
     def first_inaccessible_field(
         self,
@@ -271,16 +278,12 @@ class RuntimePolicyService:
         identity: IdentityContext,
         action: str,
     ) -> list[ResourcePolicy]:
-        """Load active policies for one action before subject/resource filtering."""
+        """Load active policies for one action. The full set is read once per request."""
 
-        return list(
-            self._session.execute(
-                select(ResourcePolicy).where(
-                    ResourcePolicy.status == "active",
-                    ResourcePolicy.action == action,
-                )
-            ).scalars()
-        )
+        del identity
+        if self._policy_groups is None:
+            self._policy_groups = load_policies(self._session)
+        return self._policy_groups.get(action, [])
 
     def _resource_policy_matches(self, policy: ResourcePolicy, resource: Resource) -> bool:
         """Match a policy to a resource directly, through a tag, or globally."""

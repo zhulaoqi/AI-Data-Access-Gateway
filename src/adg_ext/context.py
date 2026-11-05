@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from adg.runtime_cache import refresh, remember
 from adg_ext.guard import Operations
 from adg_ext.models import ExtRoleSpec, ExtRoleTable, ExtRowFilterPolicy, ExtUserAttribute
 from adg_ext.params import ParamSpec
@@ -83,36 +84,91 @@ def _loads(text: str, default: Any) -> Any:
         return default
 
 
+def _role_bundle(session: Session, role_id: str) -> dict[str, Any]:
+    """Tables, row filters and the spec of one role. Cached; refreshed when the role is synced."""
+
+    raw = remember(f"role:{role_id}", lambda: _role_rows(session, role_id))
+    if not isinstance(raw, dict):
+        return {"tables": [], "filters": [], "specs": []}
+    return raw
+
+
+def refresh_role(session: Session, role_id: str) -> None:
+    """Reload one role's scope after its sync commit."""
+
+    refresh(f"role:{role_id}", lambda: _role_rows(session, role_id))
+
+
+def _role_rows(session: Session, role_id: str) -> dict[str, Any]:
+    tables = session.execute(select(ExtRoleTable).where(ExtRoleTable.role_id == role_id)).scalars()
+    filters = session.execute(
+        select(ExtRowFilterPolicy).where(ExtRowFilterPolicy.role_id == role_id)
+    ).scalars()
+    specs = session.execute(select(ExtRoleSpec).where(ExtRoleSpec.role_id == role_id)).scalars()
+    return {
+        "tables": [
+            {
+                "resource_id": row.resource_id,
+                "allow_json": row.allow_json,
+                "deny_json": row.deny_json,
+                "mask_json": row.mask_json,
+            }
+            for row in tables
+        ],
+        "filters": [
+            {
+                "resource_id": row.resource_id,
+                "where_text": row.where_text,
+                "params_json": row.params_json,
+            }
+            for row in filters
+        ],
+        "specs": [
+            {"operations_json": row.operations_json, "limits_json": row.limits_json}
+            for row in specs
+        ],
+    }
+
+
 def load(session: Session, *, user_id: str | None, role_ids: Iterable[str]) -> ExtContext:
     roles = list(role_ids)
     ctx = ExtContext(role_ids=roles)
     if not roles:
         return ctx
-    for row in session.execute(
-        select(ExtRoleTable).where(ExtRoleTable.role_id.in_(roles))
-    ).scalars():
-        ctx.scopes.setdefault(row.resource_id, []).append(
+    table_rows: list[tuple[str, dict[str, Any]]] = []
+    filter_rows: list[tuple[str, dict[str, Any]]] = []
+    spec_rows: list[dict[str, Any]] = []
+    for role_id in roles:
+        bundle = _role_bundle(session, role_id)
+        for row in bundle.get("tables") or []:
+            if isinstance(row, dict):
+                table_rows.append((role_id, row))
+        for row in bundle.get("filters") or []:
+            if isinstance(row, dict):
+                filter_rows.append((role_id, row))
+        for row in bundle.get("specs") or []:
+            if isinstance(row, dict):
+                spec_rows.append(row)
+    for role_id, row in table_rows:
+        ctx.scopes.setdefault(str(row.get("resource_id")), []).append(
             TableScope(
-                role_id=row.role_id,
-                resource_id=row.resource_id,
-                allow=frozenset(_loads(row.allow_json, [])),
-                deny=frozenset(_loads(row.deny_json, [])),
-                mask=dict(_loads(row.mask_json, {})),
+                role_id=role_id,
+                resource_id=str(row.get("resource_id")),
+                allow=frozenset(_loads(str(row.get("allow_json") or "[]"), [])),
+                deny=frozenset(_loads(str(row.get("deny_json") or "[]"), [])),
+                mask=dict(_loads(str(row.get("mask_json") or "{}"), {})),
             )
         )
-    for rf in session.execute(
-        select(ExtRowFilterPolicy).where(ExtRowFilterPolicy.role_id.in_(roles))
-    ).scalars():
+    for role_id, row in filter_rows:
         params = tuple(
             ParamSpec(p["name"], p["type"], bool(p.get("required", True)), p.get("maxSize"))
-            for p in _loads(rf.params_json, [])
+            for p in _loads(str(row.get("params_json") or "[]"), [])
         )
-        ctx.row_filters.setdefault(rf.resource_id, []).append(
-            RowFilterSpec(rf.role_id, rf.resource_id, rf.where_text, params)
+        resource_id = str(row.get("resource_id"))
+        ctx.row_filters.setdefault(resource_id, []).append(
+            RowFilterSpec(role_id, resource_id, str(row.get("where_text") or ""), params)
         )
-    specs = list(
-        session.execute(select(ExtRoleSpec).where(ExtRoleSpec.role_id.in_(roles))).scalars()
-    )
+    specs = spec_rows
     if specs:
         ctx.has_role_spec = True
         deny_functions: set[str] = set()
@@ -122,12 +178,12 @@ def load(session: Session, *, user_id: str | None, role_ids: Iterable[str]) -> E
         limits = dict(DEFAULT_LIMITS)
         first = True
         for spec in specs:
-            ops = _loads(spec.operations_json, {})
+            ops = _loads(str(spec.get("operations_json") or "{}"), {})
             deny_functions |= {str(f).lower() for f in ops.get("denyFunctions") or []}
             deny_syntax |= {str(f).lower() for f in ops.get("denySyntax") or []}
             if ops.get("requireTimeRangeDays"):
                 days.append(int(ops["requireTimeRangeDays"]))
-            lim = _loads(spec.limits_json, {})
+            lim = _loads(str(spec.get("limits_json") or "{}"), {})
             for key in DEFAULT_LIMITS:
                 if lim.get(key) is not None:
                     value = int(lim[key])

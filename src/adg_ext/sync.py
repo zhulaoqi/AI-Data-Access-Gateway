@@ -444,7 +444,17 @@ class SyncService:
                 select(Resource.id).where(Resource.datasource_id == datasource.id)
             ).scalars()
         )
+        self.touched_role_ids = []
         if resource_ids:
+            self.touched_role_ids = list(
+                dict.fromkeys(
+                    self._s.execute(
+                        select(ExtRoleTable.role_id).where(
+                            ExtRoleTable.resource_id.in_(resource_ids)
+                        )
+                    ).scalars()
+                )
+            )
             self._s.execute(delete(ExtRoleTable).where(ExtRoleTable.resource_id.in_(resource_ids)))
             self._s.execute(
                 delete(ExtRowFilterPolicy).where(ExtRowFilterPolicy.resource_id.in_(resource_ids))

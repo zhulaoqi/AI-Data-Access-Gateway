@@ -33,6 +33,7 @@ from adg.control_plane.models.resource import Resource, ResourceField
 from adg.control_plane.services.api_key_service import create_api_key as create_api_key_record
 from adg.control_plane.services.directory_service import DirectoryService
 from adg.mcp_api.runtime_tools import serialize_runtime_tool_definitions
+from adg.runtime_cache import refresh_catalog, refresh_field_policies, refresh_policies
 from adg_ext.config import ext_enabled
 
 router = APIRouter(prefix="/admin", tags=["admin-console"])
@@ -462,6 +463,7 @@ def delete_resource(
     """Delete a resource and dependent governance, field, and masking rows."""
 
     resource = _get_by_id(session, Resource, resource_id, "Resource not found")
+    datasource_id = resource.datasource_id
     session.execute(delete(ResourceField).where(ResourceField.resource_id == resource_id))
     session.execute(delete(ResourceTag).where(ResourceTag.resource_id == resource_id))
     session.execute(delete(ResourcePolicy).where(ResourcePolicy.resource_id == resource_id))
@@ -469,6 +471,9 @@ def delete_resource(
     session.execute(delete(MaskingPolicy).where(MaskingPolicy.resource_id == resource_id))
     session.delete(resource)
     session.commit()
+    refresh_policies(session)
+    refresh_field_policies(session, resource_id)
+    refresh_catalog(session, datasource_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -773,6 +778,7 @@ def create_resource_policy(
     session.add(policy)
     session.commit()
     session.refresh(policy)
+    refresh_policies(session)
     return _serialize_resource_policy(policy, session)
 
 
@@ -817,6 +823,7 @@ def create_resource_policies_batch(
     session.commit()
     for policy in policies:
         session.refresh(policy)
+    refresh_policies(session)
     return [_serialize_resource_policy(policy, session) for policy in policies]
 
 
@@ -866,6 +873,7 @@ def update_resource_policy(
     _apply_updates(policy, data)
     session.commit()
     session.refresh(policy)
+    refresh_policies(session)
     return _serialize_resource_policy(policy, session)
 
 
@@ -882,9 +890,11 @@ def delete_resource_policy(
         for policy in policies:
             session.delete(policy)
         session.commit()
+        refresh_policies(session)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     _delete_by_id(session, ResourcePolicy, policy_id)
+    refresh_policies(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -914,6 +924,7 @@ def create_field_policy(
     session.add(policy)
     session.commit()
     session.refresh(policy)
+    refresh_field_policies(session, policy.resource_id)
     return _serialize_field_policy(policy, session)
 
 
@@ -939,12 +950,16 @@ def update_field_policy(
     """Update a field-level policy."""
 
     policy = _get_by_id(session, FieldPolicy, policy_id, "Policy not found")
+    previous_resource_id = policy.resource_id
     data = payload.model_dump(exclude_unset=True)
     if data.get("resource_id") is not None:
         _require_resource(session, data["resource_id"])
     _apply_updates(policy, data)
     session.commit()
     session.refresh(policy)
+    refresh_field_policies(session, policy.resource_id)
+    if previous_resource_id != policy.resource_id:
+        refresh_field_policies(session, previous_resource_id)
     return _serialize_field_policy(policy, session)
 
 
@@ -956,7 +971,11 @@ def delete_field_policy(
 ) -> Response:
     """Delete a field-level policy."""
 
-    _delete_by_id(session, FieldPolicy, policy_id)
+    policy = _get_by_id(session, FieldPolicy, policy_id, "Policy not found")
+    resource_id = policy.resource_id
+    session.delete(policy)
+    session.commit()
+    refresh_field_policies(session, resource_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -2261,6 +2280,7 @@ def _sync_resource_policy_subject_group(
     session.commit()
     for policy in replacement_policies:
         session.refresh(policy)
+    refresh_policies(session)
     return _serialize_resource_policy_group(replacement_policies, session)
 
 

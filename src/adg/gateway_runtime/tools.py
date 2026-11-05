@@ -14,6 +14,12 @@ from adg.control_plane.models.governance import ResourceTag, Tag
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.masking.service import MaskingService
 from adg.policy.runtime import IdentityContext, RuntimePolicyService
+from adg.runtime_cache import (
+    load_table_index,
+    match_table_paths,
+    resource_from_index,
+    time_column_names,
+)
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
 from adg_ext import pipeline as ext_pipeline
@@ -133,11 +139,9 @@ class GatewayRuntimeService:
         self._session.flush()
         tag_rows = self._session.execute(select(Tag).where(Tag.name.in_(tag_names))).scalars()
         tag_ids = [tag.id for tag in tag_rows]
-        resources = [
-            resource
-            for resource in self._visible_resources(identity=identity)
-            if self._resource_has_any_tag(resource, tag_ids)
-        ]
+        visible = self._visible_resources(identity=identity)
+        tagged = self._tagged_resource_ids(tag_ids)
+        resources = [resource for resource in visible if resource.id in tagged]
         self._record_discovery(identity, api_key_id, "list_resources_by_tag", None, [])
         notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
         return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
@@ -350,37 +354,19 @@ class GatewayRuntimeService:
                 reason,
             )
             return {"status": "rejected", "reason": reason}
-        declared_resources = [self._get_resource(resource_id) for resource_id in resource_ids]
-        # Declared resources are the caller's intended scope; every declared resource is checked.
-        for resource in declared_resources:
-            disabled_reason = self._disabled_resource_reason(resource)
-            if disabled_reason is not None:
-                self._record_rejection(
-                    identity,
-                    api_key_id,
-                    "permission_rejected",
-                    datasource_id,
-                    resource_ids,
-                    query,
-                    disabled_reason,
-                )
-                return {"status": "rejected", "reason": disabled_reason}
-            decision = self._policy.check_resource_access(
-                identity=identity,
-                resource=resource,
-                action="read",
+        declared_resources = self.load_declared(resource_ids)
+        denial = self.declared_denial(identity, declared_resources, datasource_id=datasource_id)
+        if denial is not None:
+            self._record_rejection(
+                identity,
+                api_key_id,
+                "permission_rejected",
+                datasource_id,
+                resource_ids,
+                query,
+                denial,
             )
-            if not decision.allowed:
-                self._record_rejection(
-                    identity,
-                    api_key_id,
-                    "permission_rejected",
-                    datasource_id,
-                    resource_ids,
-                    query,
-                    decision.reason,
-                )
-                return {"status": "rejected", "reason": decision.reason}
+            return {"status": "rejected", "reason": denial}
 
         guard_result = SqlGuard(
             default_limit=limit,
@@ -606,6 +592,63 @@ class GatewayRuntimeService:
             if decisions.get(resource.id, None) is not None and decisions[resource.id].allowed
         ]
 
+    def load_declared(self, resource_ids: list[str]) -> list[Resource]:
+        """Load the caller's resources in one query, preserving order."""
+
+        if not resource_ids:
+            return []
+        unique = list(dict.fromkeys(resource_ids))
+        found = {
+            resource.id: resource
+            for resource in self._session.execute(
+                select(Resource).where(Resource.id.in_(unique))
+            ).scalars()
+        }
+        if len(found) != len(unique):
+            raise NotFoundError("Resource not found")
+        return [found[resource_id] for resource_id in resource_ids]
+
+    def declared_denial(
+        self,
+        identity: IdentityContext,
+        resources: list[Resource],
+        *,
+        datasource_id: str,
+    ) -> str | None:
+        """First reason the declared resources cannot be read, after one batched check."""
+
+        if not resources:
+            return None
+        other_ids = {
+            resource.datasource_id
+            for resource in resources
+            if resource.datasource_id != datasource_id
+        }
+        for other_id in other_ids:
+            other = self._session.get(Datasource, other_id)
+            if other is None or other.status != "active":
+                return "datasource_disabled"
+        reasons = self._disabled_resource_reasons(resources)
+        for resource in resources:
+            reason = reasons.get(resource.id)
+            if reason is not None:
+                return reason
+        decisions = self._policy.check_resource_access_batch(
+            identity=identity,
+            resources=resources,
+            action="read",
+        )
+        for resource in resources:
+            decision = decisions.get(resource.id)
+            if decision is None or not decision.allowed:
+                return decision.reason if decision is not None else "no_policy_default_deny"
+        return None
+
+    def granted_time_columns(self, datasource_id: str, resource_ids: list[str]) -> set[str]:
+        """Date and time column names for the time-range rule. Cached per datasource."""
+
+        return time_column_names(self._session, datasource_id, resource_ids)
+
     def _resolve_guard_resources(
         self,
         *,
@@ -615,27 +658,9 @@ class GatewayRuntimeService:
     ) -> list[Resource]:
         """Map SQL Guard table references back to exactly one known resource each."""
 
-        resources = list(
-            self._session.execute(
-                select(Resource).where(
-                    Resource.datasource_id == datasource_id,
-                    Resource.kind.in_(["relational_table", "relational_view"]),
-                    Resource.status == "active",
-                )
-            ).scalars()
-        )
-        matched: list[Resource] = []
-        for resource_path in resource_paths:
-            # SQL may reference a full path or a suffix such as schema.table.
-            matches = [
-                resource
-                for resource in resources
-                if resource.path == resource_path or resource.path.endswith(f".{resource_path}")
-                if self._disabled_resource_reason(resource) is None
-            ]
-            if len(matches) == 1:
-                matched.append(matches[0])
-        return matched
+        del identity
+        index = load_table_index(self._session, datasource_id)
+        return [resource_from_index(row) for row in match_table_paths(index, resource_paths)]
 
     def _get_datasource(self, datasource_id: str) -> Datasource:
         """Load a datasource for runtime execution."""
@@ -653,20 +678,15 @@ class GatewayRuntimeService:
             raise NotFoundError("Resource not found")
         return resource
 
-    def _resource_has_any_tag(self, resource: Resource, tag_ids: list[str]) -> bool:
-        """Check whether a resource has any of the requested tag ids."""
+    def _tagged_resource_ids(self, tag_ids: list[str]) -> set[str]:
+        """Resource ids that carry one of ``tag_ids``. One query."""
 
         if not tag_ids:
-            return False
-        return (
-            self._session.execute(
-                select(ResourceTag).where(
-                    ResourceTag.resource_id == resource.id,
-                    ResourceTag.tag_id.in_(tag_ids),
-                )
-            ).scalar_one_or_none()
-            is not None
-        )
+            return set()
+        rows = self._session.execute(
+            select(ResourceTag.resource_id).where(ResourceTag.tag_id.in_(tag_ids))
+        ).scalars()
+        return set(rows)
 
     def _unique_tags(self, tags: Any) -> list[Tag]:
         """Preserve tag order while removing duplicates introduced by joins."""

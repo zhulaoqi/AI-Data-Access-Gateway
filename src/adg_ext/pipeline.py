@@ -357,18 +357,12 @@ def run(
     if fingerprint:
         audit_meta["sql_fingerprint"] = fingerprint
 
-    declared = [svc._get_resource(rid) for rid in resource_ids]
-    for resource in declared:
-        disabled = svc._disabled_resource_reason(resource)
-        if disabled is not None:
-            return reject("permission_rejected", disabled)
-        decision = svc._policy.check_resource_access(
-            identity=identity, resource=resource, action="read"
-        )
-        if not decision.allowed:
-            return reject("permission_rejected", decision.reason)
+    declared = svc.load_declared(resource_ids)
+    denial = svc.declared_denial(identity, declared, datasource_id=datasource_id)
+    if denial is not None:
+        return reject("permission_rejected", denial)
 
-    _, time_columns = build_views(svc, ctx, declared)
+    time_columns = svc.granted_time_columns(datasource_id, [resource.id for resource in declared])
     reject_wildcards = settings.sql_reject_wildcard
     verdict = guard.check(
         query,

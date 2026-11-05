@@ -13,6 +13,7 @@ from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.governance import DatasourceTag, Tag
 from adg.control_plane.services.datasource_service import DatasourceService
 from adg.control_plane.services.metadata_scan_service import MetadataScanService
+from adg.runtime_cache import refresh_catalog, refresh_policies
 from adg.shared.errors import NotFoundError, ValidationError
 
 router = APIRouter(prefix="/admin/datasources", tags=["admin"])
@@ -158,6 +159,8 @@ def delete_datasource(
     except NotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     session.commit()
+    refresh_policies(session)
+    refresh_catalog(session, datasource_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -207,6 +210,7 @@ def scan_datasource(
             detail=_connector_error_detail(error),
         ) from error
     session.commit()
+    refresh_catalog(session, datasource_id)
     return {"status": "ok", **counts}
 
 
