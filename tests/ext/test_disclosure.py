@@ -1,5 +1,6 @@
 from adg_ext.analyze import TableView
 from adg_ext.disclosure import bind, parse_external, resolve_values
+from adg_ext.rowfilter import compile_template, render
 
 
 def _view() -> TableView:
@@ -66,7 +67,7 @@ def test_bind_replaces_an_empty_row_filter_and_keeps_jdbc_closed() -> None:
     assert reason is None
     assert params["gw_disclosure_values"] == ["10086"]
     assert view.filters[0] is not None
-    assert "creator_id IN" in view.filters[0].where
+    assert view.filters[0].where == "`creator_id` IN ({{gw_disclosure_values}})"
 
     jdbc = bind(
         {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
@@ -77,6 +78,81 @@ def test_bind_replaces_an_empty_row_filter_and_keeps_jdbc_closed() -> None:
         lookup=lambda _d, _p: ["10086"],
     )
     assert jdbc == "disclosure_not_supported_on_jdbc"
+
+
+def test_bind_quotes_spaces_and_non_ascii_and_rejects_breakout() -> None:
+    name = "event 的列"
+    view = TableView(path="shop.orders", restricted=True, allow=frozenset({name}), filters=[None])
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": name}]},
+        [view],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert reason is None
+    assert view.filters[0] is not None
+    assert view.filters[0].where == "`event 的列` IN ({{gw_disclosure_values}})"
+    compile_template(view.filters[0].where, view.filters[0].params, dialect="mysql")
+
+    quoted = TableView(path="shop.orders", restricted=True, allow=frozenset({"a`b"}), filters=[None])
+    bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "a`b"}]},
+        [quoted],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["1"],
+    )
+    assert quoted.filters[0] is not None
+    assert quoted.filters[0].where.startswith("`a``b` IN")
+
+    rejected = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "a;b"}]},
+        [TableView(path="shop.orders", restricted=True, allow=frozenset({"a;b"}), filters=[None])],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["1"],
+    )
+    assert rejected is not None
+    assert rejected.startswith("row_filter_column_not_permitted:")
+
+
+def test_comma_separated_values_become_separate_sql_literals() -> None:
+    view = _view()
+    params: dict[str, object] = {}
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [view],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086, 10087", "O'Brien"],
+    )
+    assert reason is None
+    assert params["gw_disclosure_values"] == ["10086", "10087", "O'Brien"]
+    assert view.filters[0] is not None
+    template = compile_template(view.filters[0].where, view.filters[0].params, dialect="mysql")
+    assert render(template, params).sql(dialect="mysql") == "`creator_id` IN ('10086', '10087', 'O''Brien')"
+
+    rejected = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [_view()],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086，10087"],
+    )
+    assert rejected == "disclosure_value_invalid"
+
+    external, external_reason = parse_external(
+        {"person": "agent-1", "scope": '{"v":1,"dimensionId":"dim_1","values":["10086,10087"]}'},
+        "dim_1",
+    )
+    assert external_reason is None
+    assert external == ["10086", "10087"]
 
 
 def test_pending_marker_does_not_fall_back_to_a_stale_local_copy() -> None:

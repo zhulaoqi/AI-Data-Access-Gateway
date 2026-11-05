@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 from typing import Any, Callable
@@ -11,7 +10,7 @@ from typing import Any, Callable
 from adg_ext.analyze import FilterDef, TableView
 from adg_ext.params import ParamSpec
 
-IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UNSAFE = (";", "--", "/*", "*/", "\\", "{", "}")
 PARAM = "gw_disclosure_values"
 REDIS_PREFIX = "gw:person_scope:"
 MEMORY_TTL = 15.0
@@ -94,8 +93,11 @@ def bind(
         values = lookup(str(disclosure["dimensionId"]), person)
         if not values:
             return _friendly(disclosure)
-        if len(values) > MAX_VALUES:
-            return "person_scope_too_large:" + _friendly(disclosure)
+    values, problem = _comma_values(values)
+    if problem == "too_large":
+        return "person_scope_too_large:" + _friendly(disclosure) if source != "external" else "external_scope_too_large"
+    if values is None:
+        return "external_scope_required" if source == "external" else "disclosure_value_invalid"
     if PARAM in user_params:
         return "disclosure_param_conflict"
     spec = ParamSpec(PARAM, "string_list", True, MAX_VALUES)
@@ -107,9 +109,10 @@ def bind(
         column = _column_for(view, bound)
         if column is None:
             return "disclosure_column_missing"
-        if not IDENT.match(column) or not view.permits(column):
+        quoted = _quote(column)
+        if quoted is None or not view.permits(column):
             return f"row_filter_column_not_permitted:{column}"
-        piece = f"{column} IN ({{{{{PARAM}}}}})"
+        piece = f"{quoted} IN ({{{{{PARAM}}}}})"
         clause = piece
         if not view.filters:
             view.filters = [FilterDef(piece, (spec,))]
@@ -180,19 +183,12 @@ def parse_external(headers: dict[str, str | None], dimension_id: str) -> tuple[l
     values = body.get("values")
     if not isinstance(values, list) or not values:
         return None, "external_scope_required"
-    seen: list[str] = []
-    for item in values:
-        if not isinstance(item, str) or not item or _control(item):
-            return None, "external_scope_required"
-        if len(item) > MAX_VALUE_LEN:
-            return None, "external_scope_too_large"
-        if item not in seen:
-            seen.append(item)
-    if len(seen) > MAX_VALUES:
+    clean, problem = _comma_values(values)
+    if problem == "too_large":
         return None, "external_scope_too_large"
-    if not seen:
+    if clean is None:
         return None, "external_scope_required"
-    return seen, None
+    return clean, None
 
 
 def _bindings(columns: list[Any]) -> list[tuple[str, str, str]]:
@@ -239,17 +235,10 @@ def _payload(raw: str) -> list[str] | None:
     if not isinstance(body, dict) or body.get("pending") is True:
         return None
     values = body.get("values")
-    if not isinstance(values, list) or not values:
+    clean, problem = _comma_values(values) if isinstance(values, list) else (None, "invalid")
+    if problem or clean is None:
         return None
-    out: list[str] = []
-    for item in values:
-        if not isinstance(item, str) or not item or len(item) > MAX_VALUE_LEN or _control(item):
-            return None
-        if item not in out:
-            out.append(item)
-    if not out or len(out) > MAX_VALUES:
-        return None
-    return out
+    return clean
 
 
 def _read(dimension_id: str, open_id: str, now: float) -> list[str] | None:
@@ -268,8 +257,43 @@ def _store(dimension_id: str, open_id: str, values: list[str], now: float | None
         _memory[(dimension_id, open_id)] = (clock + MEMORY_TTL, list(values))
 
 
+_BAD_VALUE = ("，", "、", ";", "；")
+
+
+def _comma_values(values: list[Any]) -> tuple[list[str] | None, str]:
+    """Split each item on English commas. A value is one token, never a second separator."""
+
+    if not isinstance(values, list) or not values:
+        return None, "invalid"
+    out: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or _control(item) or any(mark in item for mark in _BAD_VALUE):
+            return None, "invalid"
+        for part in item.split(","):
+            text = part.strip()
+            if not text:
+                continue
+            if len(text) > MAX_VALUE_LEN:
+                return None, "too_large"
+            if text not in out:
+                out.append(text)
+            if len(out) > MAX_VALUES:
+                return None, "too_large"
+    if not out:
+        return None, "invalid"
+    return out, ""
+
+
 def _control(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def _quote(name: str) -> str | None:
+    """Quote a catalog column. Spaces and non-ASCII stay; breakout characters do not."""
+
+    if not name or len(name) > 200 or _control(name) or any(token in name for token in _UNSAFE):
+        return None
+    return "`" + name.replace("`", "``") + "`"
 
 
 def _redis() -> Any:
