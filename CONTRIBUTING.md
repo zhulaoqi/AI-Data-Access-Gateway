@@ -51,6 +51,28 @@ npm run audit:prod
 Set-Location ..
 ```
 
+## Remotes
+
+Push our branches to both remotes. A push that updates only one of them is incomplete. `main` and every feature branch follow this rule.
+
+- GitLab: `git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git`
+- GitHub: `git@github.com:zhulaoqi/AI-Data-Access-Gateway.git`
+
+`upstream` (`HanZephyr/AI-Data-Access-Gateway`) is the public upstream. Do not push our branches there unless someone explicitly asks.
+
+`origin` points only at GitHub. A branch that tracks `origin` will skip GitLab on a plain `git push`. Track `gitlab` instead. That remote is configured with both push URLs, so one push updates both.
+
+Configure it once. The first `--add --push` replaces the implicit push URL, so both URLs have to be added:
+
+```bash
+git remote add gitlab git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git
+git remote set-url --add --push gitlab git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git
+git remote set-url --add --push gitlab git@github.com:zhulaoqi/AI-Data-Access-Gateway.git
+git push -u gitlab HEAD
+```
+
+Before the first push of a new branch, `git remote get-url --push --all gitlab` should list both URLs. After that, `git push` updates GitLab and GitHub together.
+
 ## Pull Request Expectations
 
 - keep changes focused and reviewable

@@ -51,6 +51,28 @@ npm run audit:prod
 Set-Location ..
 ```
 
+## 远端
+
+我们自己的分支要同时推到下面两个远端。只更新其中一个不算推送完成。`main` 和每条功能分支都按这条执行。
+
+- GitLab：`git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git`
+- GitHub：`git@github.com:zhulaoqi/AI-Data-Access-Gateway.git`
+
+`upstream`（`HanZephyr/AI-Data-Access-Gateway`）是公开上游。没有人明确要求时，不要把我们的分支推上去。
+
+`origin` 只指向 GitHub。分支如果跟踪 `origin`，直接 `git push` 会漏掉 GitLab。改为跟踪 `gitlab`。这个远端配置了两个推送地址，一次推送会同时更新两边。
+
+每个克隆配置一次。第一条 `--add --push` 会替换掉隐式的推送地址，所以两个地址都要加上：
+
+```bash
+git remote add gitlab git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git
+git remote set-url --add --push gitlab git@gitlab.yeahmobi.com:gst/AI-Data-Access-Gateway.git
+git remote set-url --add --push gitlab git@github.com:zhulaoqi/AI-Data-Access-Gateway.git
+git push -u gitlab HEAD
+```
+
+新分支第一次推送前，用 `git remote get-url --push --all gitlab` 确认列出了两个地址。之后在这条分支上 `git push` 会同时更新 GitLab 和 GitHub。
+
 ## Pull Request 期望
 
 - 保持改动聚焦，避免无关清理混入
