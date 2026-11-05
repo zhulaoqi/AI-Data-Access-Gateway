@@ -57,9 +57,12 @@ class DorisConnector(RelationalConnector):
         """Return MySQL wire-protocol timeout options for Doris scan connections."""
 
         settings = get_settings()
+        # 大库的 information_schema 经常超过普通查询的 120 秒。扫描连接单独放宽，
+        # 仍短于管理服务等待这次同步的时间，避免查询挂死后占住整次同步。
+        scan_read_timeout = max(settings.runtime_datasource_read_timeout_seconds, 240)
         return {
             "connect_timeout": settings.runtime_datasource_connect_timeout_seconds,
-            "read_timeout": settings.runtime_datasource_read_timeout_seconds,
+            "read_timeout": scan_read_timeout,
             "write_timeout": settings.runtime_datasource_write_timeout_seconds,
         }
 

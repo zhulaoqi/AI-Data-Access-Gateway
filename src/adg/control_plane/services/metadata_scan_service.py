@@ -9,6 +9,10 @@ from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.shared.ids import uuidv7
 
+# 大库一次扫描会有几万张表。整段 NOT IN 会超过数据库的包大小，请求一直不返回，
+# 管理服务就记成「执行器不可达或超时」。删除和刷盘都按这个批量切开。
+_WRITE_BATCH = 400
+
 
 class MetadataScanService:
     """Persists connector metadata snapshots into normalized resource tables."""
@@ -107,6 +111,7 @@ class MetadataScanService:
 
         self._session.flush()
         self._delete_stale_snapshot_rows(datasource.id, seen_resource_ids, seen_field_ids)
+        self._session.flush()
         return {"resources": resource_count, "fields": field_count}
 
     def _upsert_resource(
@@ -200,15 +205,24 @@ class MetadataScanService:
     ) -> None:
         """Remove assets that disappeared from the latest connector snapshot."""
 
-        field_conditions = [ResourceField.datasource_id == datasource_id]
-        if seen_field_ids:
-            field_conditions.append(ResourceField.id.not_in(seen_field_ids))
-        self._session.execute(delete(ResourceField).where(*field_conditions))
+        self._delete_absent(ResourceField, datasource_id, seen_field_ids)
+        self._delete_absent(Resource, datasource_id, seen_resource_ids)
 
-        resource_conditions = [Resource.datasource_id == datasource_id]
-        if seen_resource_ids:
-            resource_conditions.append(Resource.id.not_in(seen_resource_ids))
-        self._session.execute(delete(Resource).where(*resource_conditions))
+    def _delete_absent(
+        self,
+        model: type[Resource] | type[ResourceField],
+        datasource_id: str,
+        seen_ids: set[str],
+    ) -> None:
+        """Delete rows this scan did not touch, in small id lists."""
+
+        existing = self._session.execute(
+            select(model.id).where(model.datasource_id == datasource_id)
+        ).scalars()
+        stale = [item for item in existing if item not in seen_ids]
+        for start in range(0, len(stale), _WRITE_BATCH):
+            chunk = stale[start : start + _WRITE_BATCH]
+            self._session.execute(delete(model).where(model.id.in_(chunk)))
 
     def _upsert_relations(
         self,
@@ -223,6 +237,7 @@ class MetadataScanService:
 
         seen_resource_ids: set[str] = set()
         seen_field_ids: set[str] = set()
+        written = 0
         for relation_key, relation_kind in (
             ("tables", "relational_table"),
             ("views", "relational_view"),
@@ -245,11 +260,17 @@ class MetadataScanService:
                     scanned_at=scanned_at,
                 )
                 seen_resource_ids.add(relation.id)
+                written += 1
+                if written % _WRITE_BATCH == 0:
+                    self._session.flush()
 
                 column_items = relation_payload.get("columns", [])
                 if not isinstance(column_items, Sequence):
                     continue
                 for index, column_payload in enumerate(column_items, start=1):
+                    written += 1
+                    if written % _WRITE_BATCH == 0:
+                        self._session.flush()
                     field = self._upsert_field(
                         datasource=datasource,
                         relation=relation,

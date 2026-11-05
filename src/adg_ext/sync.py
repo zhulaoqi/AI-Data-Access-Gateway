@@ -12,6 +12,7 @@ ApiKey (``runtime`` scope, externally supplied SHA-256 hash), catalog_note -> ``
 import json
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -476,6 +477,43 @@ class SyncService:
 
     # ---- role -----------------------------------------------------------------------------
 
+    def _resource_index(self, datasource_name: str) -> dict[str, Resource | None]:
+        """Map ``database.table`` to the one scanned resource. Ambiguous paths stay unset."""
+
+        datasource_id = self._external_id("datasource_account", datasource_name, "datasource")
+        rows = self._s.execute(
+            select(Resource).where(
+                Resource.datasource_id == datasource_id,
+                Resource.kind.in_(["relational_table", "relational_view"]),
+                Resource.status == "active",
+            )
+        ).scalars()
+        hits: dict[str, dict[str, Resource]] = {}
+        for resource in rows:
+            parts = resource.path.split(".")
+            keys = {resource.path}
+            if len(parts) >= 2:
+                keys.add(f"{parts[-2]}.{parts[-1]}")
+            for key in keys:
+                hits.setdefault(key, {})[resource.id] = resource
+        index: dict[str, Resource | None] = {}
+        for key, found in hits.items():
+            index[key] = next(iter(found.values())) if len(found) == 1 else None
+        return index
+
+    def _field_names(self, resource_ids: Sequence[str]) -> dict[str, set[str]]:
+        names: dict[str, set[str]] = {}
+        unique = list(dict.fromkeys(resource_ids))
+        for start in range(0, len(unique), 400):
+            rows = self._s.execute(
+                select(ResourceField.resource_id, ResourceField.name).where(
+                    ResourceField.resource_id.in_(unique[start : start + 400])
+                )
+            )
+            for resource_id, name in rows:
+                names.setdefault(resource_id, set()).add(name)
+        return names
+
     def _resource_for(self, datasource_name: str, database: str, table: str) -> Resource:
         datasource_id = self._external_id("datasource_account", datasource_name, "datasource")
         key = f"{database}.{table}"
@@ -509,10 +547,22 @@ class SyncService:
             limits_json=json.dumps(spec.get("limits") or {}, separators=(",", ":")),
         )
         self._s.add(spec_row)
-        for table in spec.get("tables") or []:
-            resource = self._resource_for(
-                str(table["datasource"]), str(table["database"]), str(table["table"])
-            )
+        tables = list(spec.get("tables") or [])
+        indexes: dict[str, dict[str, Resource | None]] = {}
+        resolved: list[tuple[dict[str, Any], Resource]] = []
+        for table in tables:
+            datasource_name = str(table["datasource"])
+            index = indexes.get(datasource_name)
+            if index is None:
+                index = self._resource_index(datasource_name)
+                indexes[datasource_name] = index
+            key = f"{table['database']}.{table['table']}"
+            resource = index.get(key)
+            if resource is None:
+                raise ExtSyncError(409, f"table {key} not found in {datasource_name}")
+            resolved.append((table, resource))
+        field_names = self._field_names([resource.id for _, resource in resolved])
+        for table, resource in resolved:
             allow = sorted({str(c) for c in table.get("allow") or []})
             deny = sorted({str(c) for c in table.get("deny") or []})
             mask: dict[str, str] = {str(k): str(v) for k, v in (table.get("mask") or {}).items()}
@@ -534,11 +584,7 @@ class SyncService:
                     resource_id=resource.id,
                 )
             )
-            known = set(
-                self._s.execute(
-                    select(ResourceField.name).where(ResourceField.resource_id == resource.id)
-                ).scalars()
-            )
+            known = field_names.get(resource.id, set())
             for column, method in mask.items():
                 if method not in _MASK_STRATEGIES:
                     raise ExtSyncError(422, f"unsupported mask method {method}")
