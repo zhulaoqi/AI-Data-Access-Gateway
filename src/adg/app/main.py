@@ -43,6 +43,7 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         print_banner()
         _log_startup(settings)
+        _warm_runtime_cache(factory)
         await widen_query_threadpool()
         loop_watch: asyncio.Task[None] | None = None
         if ext_enabled():
@@ -136,6 +137,18 @@ def _database_endpoint(url: str) -> str:
     host = parsed.host or ""
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.drivername}://{host}{port}/{parsed.database or ''}"
+
+
+def _warm_runtime_cache(factory: sessionmaker[Session]) -> None:
+    """Fill authorization and catalog copies before the first query is accepted."""
+
+    try:
+        with factory() as session:
+            from adg.runtime_cache import warm
+
+            warm(session)
+    except Exception:
+        logger.warning(kv(event="hot_cache_warm_failed"), exc_info=True)
 
 
 def _log_startup(settings: Settings) -> None:

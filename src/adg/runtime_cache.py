@@ -1,14 +1,14 @@
-"""Short-lived Redis copies of hot authorization and catalog reads.
+"""Redis copies of hot authorization and catalog reads.
 
-A query used to repeat the same control-plane reads once per granted table. Callers
-read through :func:`remember`. After a commit that changes the underlying rows, the
-writer calls :func:`refresh`, which drops the key and loads the new value back in
-before returning, so the next query does not pay for a cold read.
+Callers read through :func:`remember`. A committed change calls :func:`refresh`, which
+loads the new rows and replaces the key in place before the write returns. The key
+has no expiry: a timer would make the next query miss, and a miss that finishes late
+could write older rows over the snapshot just published by a sync.
 
-Redis is optional. A miss, a broken payload, or any Redis error loads from the
-database and the request still succeeds. A failed refresh deletes the key again so
-a later read cannot keep serving the previous copy; the backstop TTL does the same
-when a delete itself fails.
+Each key has a monotonic version. A refresh publishes only when its version is not
+older than the one already stored, so a slow read cannot put stale rows back. A
+failed reload drops the key only when nothing newer has been published, and the next
+read fills it from the database. Redis errors never fail the request.
 """
 
 from __future__ import annotations
@@ -29,35 +29,136 @@ from adg_ext.redis_share import get_client
 logger = logging.getLogger(__name__)
 
 PREFIX = "{sqlgw}:hot:"
-# Safety net when a writer forgets to refresh. Writers still reload immediately.
-TTL_SECONDS = 120
+_VERSION_PREFIX = "{sqlgw}:hotver:"
+_SEQUENCE_PREFIX = "{sqlgw}:hotseq:"
 _TABLE_KINDS = frozenset({"relational_table", "relational_view"})
 _TIME_MARKERS = ("date", "time")
 
+# Publish when this version is at least the stored one. Never expires.
+_PUBLISH = """-- hot-publish
+local incoming = tonumber(ARGV[1])
+local current = redis.call('GET', KEYS[2])
+if current and tonumber(current) > incoming then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[1])
+return 1
+"""
+
+# A miss may fill only while nobody has published. It must not cover a sync snapshot.
+_FILL = """-- hot-fill
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[1])
+return 1
+"""
+
+# Drop a snapshot only when a newer publish has not already replaced it.
+_DROP = """-- hot-drop
+local current = redis.call('GET', KEYS[2])
+if current and tonumber(current) > tonumber(ARGV[1]) then
+  return 0
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+"""
+
+# A payload that cannot be read is not a snapshot. Remove it so the next fill can store one.
+_DROP_BROKEN = """-- hot-drop-broken
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+"""
+
 
 def remember(key: str, load: Callable[[], Any]) -> Any:
-    """Return the cached JSON value, or load it and store the copy."""
+    """Return the cached JSON value, or load it and store the copy if still absent."""
 
     found = _read(key)
     if found is not _MISS:
         return found
     value = load()
-    _write(key, value)
+    _fill(key, value)
     return value
 
 
 def refresh(key: str, load: Callable[[], Any]) -> None:
-    """Drop the cached copy and store a fresh one. Never raises."""
+    """Replace the cached copy with a fresh load. Never raises and never expires the key."""
 
-    _delete(key)
-    try:
-        value = load()
-    except Exception:
-        logger.warning("event=hot_cache_refresh_load_failed key=%s", key, exc_info=True)
-        _delete(key)
+    version = _next_version(key)
+    loaded = _try_load(load)
+    if loaded is _MISS:
+        logger.warning("event=hot_cache_refresh_load_failed key=%s", key)
+        _drop(key, version)
         return
-    if not _write(key, value):
-        _delete(key)
+    if _publish(key, version, loaded) == "error":
+        _drop(key, version)
+
+
+def warm(session: Session) -> None:
+    """Load every hot key from the database before the process accepts queries.
+
+    Permission sync refreshes the keys it changes. This covers a restart or an empty
+    Redis, so the first query does not wait on a cold read of the whole catalog.
+    """
+
+    if get_client() is None:
+        return
+    from adg.control_plane.models.datasource import Datasource
+    from adg.control_plane.models.directory import Role
+    from adg_ext.context import refresh_role
+
+    refresh_policies(session)
+    datasource_ids = list(session.execute(select(Datasource.id)).scalars())
+    for datasource_id in datasource_ids:
+        refresh_catalog(session, datasource_id)
+    role_ids = list(session.execute(select(Role.id)).scalars())
+    for role_id in role_ids:
+        refresh_role(session, role_id)
+    resource_ids = list(
+        session.execute(select(FieldPolicy.resource_id).distinct()).scalars()
+    )
+    for resource_id in resource_ids:
+        refresh_field_policies(session, resource_id)
+    logger.info(
+        "event=hot_cache_warmed datasources=%s roles=%s field_resources=%s",
+        len(datasource_ids),
+        len(role_ids),
+        len(resource_ids),
+    )
+
+
+def _data_key(key: str) -> str:
+    return PREFIX + key
+
+
+def _version_key(key: str) -> str:
+    return _VERSION_PREFIX + key
+
+
+def _sequence_key(key: str) -> str:
+    return _SEQUENCE_PREFIX + key
+
+
+def _next_version(key: str) -> int:
+    client = get_client()
+    if client is None:
+        return 0
+    try:
+        return int(client.incr(_sequence_key(key)))
+    except Exception:
+        logger.warning("event=hot_cache_version_failed key=%s", key, exc_info=True)
+        return 0
+
+
+def _try_load(load: Callable[[], Any]) -> Any:
+    try:
+        return load()
+    except Exception:
+        logger.warning("event=hot_cache_load_failed", exc_info=True)
+        return _MISS
 
 
 def _read(key: str) -> Any:
@@ -65,40 +166,61 @@ def _read(key: str) -> Any:
     if client is None:
         return _MISS
     try:
-        raw = client.get(PREFIX + key)
+        raw = client.get(_data_key(key))
     except Exception:
         logger.warning("event=hot_cache_read_failed key=%s", key, exc_info=True)
         return _MISS
     if raw is None:
         return _MISS
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
     except ValueError:
         logger.warning("event=hot_cache_payload_invalid key=%s", key)
-        _delete(key)
+        _eval(_DROP_BROKEN, key, 0, None)
         return _MISS
+    if not isinstance(payload, dict) or "d" not in payload:
+        logger.warning("event=hot_cache_payload_invalid key=%s", key)
+        _eval(_DROP_BROKEN, key, 0, None)
+        return _MISS
+    return payload["d"]
 
 
-def _write(key: str, value: Any) -> bool:
+def _fill(key: str, value: Any) -> None:
+    """Store a miss fill only while no published version exists."""
+
+    _eval(_FILL, key, 0, value)
+
+
+def _publish(key: str, version: int, value: Any) -> str:
+    """Store this version, or leave a newer one in place. ``error`` when Redis did not answer."""
+
+    if version <= 0:
+        return "error"
+    result = _eval(_PUBLISH, key, version, value)
+    if result is None:
+        return "error"
+    return "stored" if result == 1 else "older"
+
+
+def _drop(key: str, version: int) -> None:
+    _eval(_DROP, key, version, None)
+
+
+def _eval(script: str, key: str, version: int, value: Any) -> int | None:
     client = get_client()
     if client is None:
-        return False
+        return 0
+    args = [str(version)]
+    if value is not None:
+        args.append(json.dumps({"v": version, "d": value}, separators=(",", ":")))
+    elif script is _DROP:
+        args.append("")
     try:
-        client.set(PREFIX + key, json.dumps(value, separators=(",", ":")), ex=TTL_SECONDS)
-        return True
+        result = client.eval(script, 2, _data_key(key), _version_key(key), *args)
     except Exception:
         logger.warning("event=hot_cache_write_failed key=%s", key, exc_info=True)
-        return False
-
-
-def _delete(key: str) -> None:
-    client = get_client()
-    if client is None:
-        return
-    try:
-        client.delete(PREFIX + key)
-    except Exception:
-        logger.warning("event=hot_cache_delete_failed key=%s", key, exc_info=True)
+        return None
+    return int(result)
 
 
 class _Miss:

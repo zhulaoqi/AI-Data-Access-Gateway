@@ -448,9 +448,12 @@ def update_resource(
     """Update resource display metadata controlled by the admin console."""
 
     resource = _get_by_id(session, Resource, resource_id, "Resource not found")
-    _apply_updates(resource, payload.model_dump(exclude_unset=True))
+    updates = payload.model_dump(exclude_unset=True)
+    _apply_updates(resource, updates)
     session.commit()
     session.refresh(resource)
+    if "status" in updates:
+        refresh_catalog(session, resource.datasource_id)
     return _serialize_resource(resource)
 
 
@@ -503,9 +506,12 @@ def update_resource_field(
     """Update field-level catalog annotations without changing scanned structure."""
 
     field = _get_by_id(session, ResourceField, field_id, "Field not found")
-    _apply_updates(field, payload.model_dump(exclude_unset=True))
+    updates = payload.model_dump(exclude_unset=True)
+    _apply_updates(field, updates)
     session.commit()
     session.refresh(field)
+    if "status" in updates:
+        refresh_catalog(session, field.datasource_id)
     return _serialize_resource_field(field)
 
 

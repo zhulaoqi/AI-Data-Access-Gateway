@@ -8,6 +8,9 @@ from adg.runtime_cache import match_table_paths, refresh, remember
 class _MemoryRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        self.ver: dict[str, str] = {}
+        self.seq: dict[str, int] = {}
+        self.drops: list[str] = []
         self.fail_set = False
         self.fail_get = False
 
@@ -16,14 +19,45 @@ class _MemoryRedis:
             raise ConnectionError("down")
         return self.store.get(key)
 
-    def set(self, key: str, value: str, ex: int | None = None) -> None:
-        del ex
+    def incr(self, key: str) -> int:
         if self.fail_set:
             raise ConnectionError("down")
-        self.store[key] = value
+        self.seq[key] = self.seq.get(key, 0) + 1
+        return self.seq[key]
 
-    def delete(self, key: str) -> None:
-        self.store.pop(key, None)
+    def eval(self, script: str, numkeys: int, *args: str) -> int:
+        if self.fail_set:
+            raise ConnectionError("down")
+        keys = args[:numkeys]
+        argv = args[numkeys:]
+        data_key, ver_key = keys[0], keys[1]
+        if script.startswith("-- hot-drop-broken"):
+            self.store.pop(data_key, None)
+            self.ver.pop(ver_key, None)
+            self.drops.append(data_key)
+            return 1
+        if script.startswith("-- hot-drop"):
+            current = self.ver.get(ver_key)
+            incoming = int(argv[0])
+            if current is not None and int(current) > incoming:
+                return 0
+            self.store.pop(data_key, None)
+            self.ver.pop(ver_key, None)
+            self.drops.append(data_key)
+            return 1
+        if script.startswith("-- hot-fill"):
+            if ver_key in self.ver:
+                return 0
+            self.store[data_key] = argv[1]
+            self.ver[ver_key] = argv[0]
+            return 1
+        current = self.ver.get(ver_key)
+        incoming = int(argv[0])
+        if current is not None and int(current) > incoming:
+            return 0
+        self.store[data_key] = argv[1]
+        self.ver[ver_key] = argv[0]
+        return 1
 
 
 def test_remember_loads_once_then_serves_the_copy(monkeypatch: Any) -> None:
@@ -60,7 +94,19 @@ def test_refresh_replaces_before_returning(monkeypatch: Any) -> None:
     monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
     remember("policies", lambda: ["old"])
     refresh("policies", lambda: ["new"])
+    assert client.drops == []
+    assert "EX" not in client.store["{sqlgw}:hot:policies"]
     assert remember("policies", lambda: ["unused"]) == ["new"]
+
+
+def test_older_refresh_cannot_overwrite_a_newer_snapshot(monkeypatch: Any) -> None:
+    client = _MemoryRedis()
+    client.ver["{sqlgw}:hotver:policies"] = "5"
+    client.store["{sqlgw}:hot:policies"] = '{"v":5,"d":["new"]}'
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+    refresh("policies", lambda: ["old"])
+    assert remember("policies", lambda: ["unused"]) == ["new"]
+    assert client.drops == []
 
 
 def test_failed_refresh_drops_the_stale_copy(monkeypatch: Any) -> None:
