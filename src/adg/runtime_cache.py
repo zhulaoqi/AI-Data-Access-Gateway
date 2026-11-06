@@ -249,6 +249,68 @@ def load_policies(session: Session) -> dict[str, list[ResourcePolicy]]:
     }
 
 
+def bump_visible_epoch() -> None:
+    """Drop the generation of cached visible-table lists. The next list rebuilds them."""
+
+    _next_version("visible_epoch")
+
+
+def visible_epoch() -> int | None:
+    """Current visible-list generation. None when Redis cannot be read."""
+
+    client = get_client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(_sequence_key("visible_epoch"))
+    except Exception:
+        logger.warning("event=hot_cache_read_failed key=visible_epoch", exc_info=True)
+        return None
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_visible(
+    identity_key: str,
+    epoch: int | None,
+    load: Callable[[], dict[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    """Return this identity's visible datasources and tables.
+
+    A Redis miss or a generation change loads from the executor database.
+    An older generation cannot replace the list just published for a newer one.
+    Redis errors return the freshly loaded rows and do not fail the list.
+    """
+
+    key = f"visible:{identity_key}"
+    if epoch is not None:
+        found = _read(key)
+        if (
+            isinstance(found, dict)
+            and found.get("e") == epoch
+            and isinstance(found.get("datasources"), list)
+            and isinstance(found.get("resources"), list)
+        ):
+            return found
+    loaded = load()
+    stored = {
+        "e": 0 if epoch is None else epoch,
+        "datasources": loaded["datasources"],
+        "resources": loaded["resources"],
+    }
+    if epoch is None:
+        return stored
+    if epoch <= 0:
+        _fill(key, stored)
+    else:
+        _publish(key, epoch, stored)
+    return stored
+
+
 def refresh_policies(session: Session) -> None:
     """Reload active resource policies after a committed policy change."""
 
@@ -262,6 +324,7 @@ def refresh_policies(session: Session) -> None:
         return grouped
 
     refresh("policies", load)
+    bump_visible_epoch()
 
 
 def _query_table_index(session: Session, datasource_id: str) -> list[dict[str, Any]]:
@@ -472,3 +535,4 @@ def refresh_catalog(session: Session, datasource_id: str) -> None:
 
     refresh_tables(session, datasource_id)
     refresh_time_columns(session, datasource_id)
+    bump_visible_epoch()

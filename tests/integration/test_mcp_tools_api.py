@@ -257,6 +257,8 @@ def test_mcp_tool_route_inherits_database_policy_to_child_tables() -> None:
                 "path": "warehouse.public.orders",
                 "display_name": "orders",
                 "description": None,
+                "database": "warehouse.public",
+                "database_description": None,
                 "query_language": "sql",
             }
         ]

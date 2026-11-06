@@ -17,6 +17,8 @@ from adg.control_plane.db import SessionLocal
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.mcp_api.runtime_tools import RUNTIME_TOOL_DEFINITIONS, dispatch_runtime_tool_call
 
+_TOOL_DESCRIPTION = {item.name: item.description for item in RUNTIME_TOOL_DEFINITIONS}
+
 runtime_mcp_server = FastMCP("AI Data Access Gateway", host="0.0.0.0")
 McpContext = Context[Any, Any, Any]
 
@@ -208,7 +210,7 @@ def _run_runtime_tool(ctx: McpContext, tool_name: str, payload: dict[str, Any]) 
 
 @runtime_mcp_server.tool(
     name="list_datasources",
-    description=RUNTIME_TOOL_DEFINITIONS[0].description,
+    description=_TOOL_DESCRIPTION["list_datasources"],
 )
 async def list_datasources(
     ctx: McpContext,
@@ -219,20 +221,8 @@ async def list_datasources(
 
 
 @runtime_mcp_server.tool(
-    name="list_tags",
-    description=RUNTIME_TOOL_DEFINITIONS[1].description,
-)
-async def list_tags(
-    ctx: McpContext,
-) -> dict[str, Any]:
-    """List tags visible to the calling runtime identity."""
-
-    return await _run_in_threadpool(_run_runtime_tool, ctx, "list_tags", {})
-
-
-@runtime_mcp_server.tool(
     name="list_resources",
-    description=RUNTIME_TOOL_DEFINITIONS[2].description,
+    description=_TOOL_DESCRIPTION["list_resources"],
 )
 async def list_resources(
     ctx: McpContext,
@@ -251,28 +241,8 @@ async def list_resources(
 
 
 @runtime_mcp_server.tool(
-    name="list_resources_by_tag",
-    description=RUNTIME_TOOL_DEFINITIONS[3].description,
-)
-async def list_resources_by_tag(
-    ctx: McpContext,
-    tag_names: list[str],
-) -> dict[str, Any]:
-    """List readable resources that match one or more tag names."""
-
-    return await _run_in_threadpool(
-        _run_runtime_tool,
-        ctx,
-        "list_resources_by_tag",
-        {
-            "tag_names": tag_names,
-        },
-    )
-
-
-@runtime_mcp_server.tool(
     name="describe_resource",
-    description=RUNTIME_TOOL_DEFINITIONS[4].description,
+    description=_TOOL_DESCRIPTION["describe_resource"],
 )
 async def describe_resource(
     ctx: McpContext,
@@ -292,7 +262,7 @@ async def describe_resource(
 
 @runtime_mcp_server.tool(
     name="preview_resource",
-    description=RUNTIME_TOOL_DEFINITIONS[5].description,
+    description=_TOOL_DESCRIPTION["preview_resource"],
 )
 async def preview_resource(
     ctx: McpContext,
@@ -314,7 +284,7 @@ async def preview_resource(
 
 @runtime_mcp_server.tool(
     name="execute_query",
-    description=RUNTIME_TOOL_DEFINITIONS[6].description,
+    description=_TOOL_DESCRIPTION["execute_query"],
 )
 async def execute_query(
     ctx: McpContext,

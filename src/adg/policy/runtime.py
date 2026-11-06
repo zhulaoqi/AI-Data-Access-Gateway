@@ -85,6 +85,7 @@ class RuntimePolicyService:
         "database": 2,
         "datasource": 1,
     }
+    _TABLE_KINDS = frozenset({"relational_table", "relational_view"})
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -115,6 +116,36 @@ class RuntimePolicyService:
         if any(policy.effect == "allow" for policy in matching):
             return PolicyDecision(allowed=True, reason="allowed_by_policy")
         return PolicyDecision(allowed=False, reason="no_matching_allow")
+
+    def granted_table_ids(
+        self,
+        *,
+        identity: IdentityContext,
+        action: str,
+    ) -> set[str] | None:
+        """Table ids named by this identity's allows.
+
+        None means an allow covers more than one table (a datasource, a tag, a
+        parent node, or every resource). The caller then has to scan.
+        """
+
+        policies = self._resource_policies(identity=identity, action=action)
+        allows = [
+            policy
+            for policy in policies
+            if policy.effect == "allow" and self._subject_matches(policy, identity)
+        ]
+        if any(policy.resource_id is None for policy in allows):
+            return None
+        ids = [policy.resource_id for policy in allows if policy.resource_id is not None]
+        if not ids:
+            return set()
+        rows = self._session.execute(
+            select(Resource.id, Resource.kind).where(Resource.id.in_(ids))
+        ).all()
+        if any(kind not in self._TABLE_KINDS for _, kind in rows):
+            return None
+        return {resource_id for resource_id, kind in rows}
 
     def check_resource_access_batch(
         self,

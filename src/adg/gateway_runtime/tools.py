@@ -16,9 +16,11 @@ from adg.masking.service import MaskingService
 from adg.policy.runtime import IdentityContext, RuntimePolicyService
 from adg.runtime_cache import (
     load_table_index,
+    load_visible,
     match_table_paths,
     resource_from_index,
     time_column_names,
+    visible_epoch,
 )
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
@@ -69,32 +71,9 @@ class GatewayRuntimeService:
     ) -> dict[str, Any]:
         """Return active datasources visible to runtime callers."""
 
-        self._session.flush()
-        visible_datasource_ids = {
-            resource.datasource_id for resource in self._visible_resources(identity=identity)
-        }
-        datasources = self._session.execute(
-            select(Datasource)
-            .where(
-                Datasource.status == "active",
-                Datasource.id.in_(visible_datasource_ids),
-            )
-            .order_by(Datasource.name)
-        ).scalars()
-        response = {
-            "datasources": [
-                {
-                    "id": datasource.id,
-                    "name": datasource.name,
-                    "type": datasource.type,
-                    "datasource_kind": datasource.datasource_kind,
-                    "description": datasource.description,
-                }
-                for datasource in datasources
-            ]
-        }
+        catalog = self._visible_catalog(identity)
         self._record_discovery(identity, api_key_id, "list_datasources", None, [])
-        return response
+        return {"datasources": catalog["datasources"]}
 
     def list_tags(self, *, identity: IdentityContext, api_key_id: str) -> dict[str, Any]:
         """Return tags attached to resources the identity may discover."""
@@ -129,14 +108,14 @@ class GatewayRuntimeService:
     ) -> dict[str, Any]:
         """Return policy-visible relational resources for a datasource."""
 
-        self._session.flush()
+        catalog = self._visible_catalog(identity)
+        self._record_discovery(identity, api_key_id, "list_resources", datasource_id, [])
         resources = [
             resource
-            for resource in self._visible_resources(identity=identity, datasource_id=datasource_id)
+            for resource in catalog["resources"]
+            if resource.get("datasource_id") == datasource_id
         ]
-        self._record_discovery(identity, api_key_id, "list_resources", datasource_id, [])
-        notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
-        return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
+        return {"resources": resources}
 
     def list_resources_by_tag(
         self,
@@ -571,6 +550,41 @@ class GatewayRuntimeService:
             return "Datasource connector dependency is unavailable. Contact an administrator."
         return "Datasource query execution failed. Reference query_id for details."
 
+    def _visible_catalog(self, identity: IdentityContext) -> dict[str, Any]:
+        """Datasources and tables this identity can read, from the hot cache when it matches."""
+
+        def load() -> dict[str, list[dict[str, Any]]]:
+            resources = self._visible_resources(identity=identity)
+            notes = NoteIndex.load(
+                self._session, {resource.datasource_id for resource in resources}
+            )
+            datasource_ids = list(dict.fromkeys(resource.datasource_id for resource in resources))
+            datasources = []
+            if datasource_ids:
+                rows = self._session.execute(
+                    select(Datasource)
+                    .where(Datasource.id.in_(datasource_ids), Datasource.status == "active")
+                    .order_by(Datasource.name)
+                ).scalars()
+                datasources = [
+                    {
+                        "id": datasource.id,
+                        "name": datasource.name,
+                        "type": datasource.type,
+                        "datasource_kind": datasource.datasource_kind,
+                        "description": datasource.description,
+                    }
+                    for datasource in rows
+                ]
+            return {
+                "datasources": datasources,
+                "resources": [self._serialize_resource(resource, notes) for resource in resources],
+            }
+
+        roles = ",".join(sorted(set(identity.roles)))
+        identity_key = f"{identity.user_id or '-'}:{roles}"
+        return load_visible(identity_key, visible_epoch(), load)
+
     def _visible_resources(
         self,
         *,
@@ -579,10 +593,16 @@ class GatewayRuntimeService:
     ) -> list[Resource]:
         """Load relational table/view resources and filter them through resource policies."""
 
+        self._session.flush()
         conditions: list[ColumnElement[bool]] = [
             Resource.kind.in_(["relational_table", "relational_view"]),
             Resource.status == "active",
         ]
+        granted = self._policy.granted_table_ids(identity=identity, action="read")
+        if granted is not None:
+            if not granted:
+                return []
+            conditions.append(Resource.id.in_(granted))
         if datasource_id is not None:
             conditions.append(Resource.datasource_id == datasource_id)
         resources = list(

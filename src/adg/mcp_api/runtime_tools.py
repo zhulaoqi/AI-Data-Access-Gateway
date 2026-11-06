@@ -18,23 +18,18 @@ class RuntimeToolDefinition:
 RUNTIME_TOOL_DEFINITIONS = [
     RuntimeToolDefinition(
         name="list_datasources",
-        description="List the datasources visible to the current runtime identity.",
-    ),
-    RuntimeToolDefinition(
-        name="list_tags",
-        description="List the governance tags visible to the current runtime identity.",
+        description=(
+            "List datasources this grant can read. A datasource is included only when the "
+            "grant allows at least one of its tables."
+        ),
     ),
     RuntimeToolDefinition(
         name="list_resources",
         description=(
-            "List readable tables under one datasource. description is the business meaning of "
-            "the table when one was written, otherwise the database comment. database_description "
-            "is the business meaning of the database."
+            "List tables this grant can read under one datasource. description is the business "
+            "meaning of the table when one was written, otherwise the database comment. "
+            "database_description is the business meaning of the database."
         ),
-    ),
-    RuntimeToolDefinition(
-        name="list_resources_by_tag",
-        description="Find readable resources by one or more governance tag names.",
     ),
     RuntimeToolDefinition(
         name="describe_resource",
@@ -90,19 +85,11 @@ def dispatch_runtime_tool_call(
 
     if tool_name == "list_datasources":
         return runtime.list_datasources(identity=runtime_identity, api_key_id=api_key_id)
-    if tool_name == "list_tags":
-        return runtime.list_tags(identity=runtime_identity, api_key_id=api_key_id)
     if tool_name == "list_resources":
         return runtime.list_resources(
             identity=runtime_identity,
             api_key_id=api_key_id,
             datasource_id=str(payload["datasource_id"]),
-        )
-    if tool_name == "list_resources_by_tag":
-        return runtime.list_resources_by_tag(
-            identity=runtime_identity,
-            api_key_id=api_key_id,
-            tag_names=[str(item) for item in payload.get("tag_names", [])],
         )
     if tool_name == "describe_resource":
         return runtime.describe_resource(

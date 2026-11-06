@@ -5,6 +5,7 @@ from pytest import MonkeyPatch
 from sqlalchemy import event, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
+from tests.unit.policy.test_runtime_cache import _MemoryRedis
 
 from adg.audit.models import AuditEvent
 from adg.connectors.base import MetadataConnector, MetadataSnapshot, QueryResult
@@ -16,6 +17,7 @@ from adg.control_plane.models.masking import DecryptContext, MaskingPolicy
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.policy.runtime import IdentityContext
+from adg.runtime_cache import bump_visible_epoch
 from adg_ext.models import ExtCatalogNote
 
 
@@ -231,6 +233,37 @@ def test_list_datasources_only_returns_datasources_with_visible_resources(
             "description": None,
         }
     ]
+
+
+def test_list_reuses_the_visible_catalog_until_the_generation_changes(
+    db_session: Session,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = _MemoryRedis()
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+    add_datasource(db_session)
+    resource = add_resource(db_session, resource_id="res_orders")
+    allow_resource_read(db_session, resource.id)
+    service = runtime(db_session)
+    calls = {"n": 0}
+    original = service._visible_resources
+
+    def counted(*args: object, **kwargs: object) -> list[Resource]:
+        calls["n"] += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    service._visible_resources = counted  # type: ignore[method-assign]
+
+    assert service.list_datasources(identity=identity(), api_key_id="key_1")["datasources"]
+    listed = service.list_resources(
+        identity=identity(), api_key_id="key_1", datasource_id="ds_1"
+    )
+    assert [item["id"] for item in listed["resources"]] == [resource.id]
+    assert calls["n"] == 1
+
+    bump_visible_epoch()
+    service.list_resources(identity=identity(), api_key_id="key_1", datasource_id="ds_1")
+    assert calls["n"] == 2
 
 
 def test_list_datasources_includes_operator_description_for_agents(db_session: Session) -> None:

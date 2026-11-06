@@ -17,7 +17,7 @@ from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.connectors.registry import get_connector_registry
 from adg.control_plane.db import get_session
-from adg.runtime_cache import refresh_catalog, refresh_policies
+from adg.runtime_cache import bump_visible_epoch, refresh_catalog, refresh_policies
 from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
 from adg_ext.catalog_job import CatalogJobs, scan_account_spec
@@ -75,6 +75,9 @@ def _warm_cache(
 ) -> None:
     """Reload the copies a committed sync just changed. Failures stay in the cache log."""
 
+    if object_type == "catalog_note":
+        bump_visible_epoch()
+        return
     if object_type == "role" and external_id:
         refresh_policies(session)
         refresh_role(session, external_id)
