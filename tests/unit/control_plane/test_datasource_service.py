@@ -1,13 +1,15 @@
 import json
 
+import pytest
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, sessionmaker
 
 from adg.control_plane.models import Base
 from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.control_plane.services.datasource_service import DatasourceService
-from adg.control_plane.services.metadata_scan_service import MetadataScanService
+from adg.control_plane.services.metadata_scan_service import MetadataScanService, persist_snapshot
 
 
 def test_datasource_and_snapshot_models_are_registered() -> None:
@@ -320,3 +322,94 @@ def test_datasource_service_preserves_existing_secret_when_password_is_omitted_o
     assert omitted_password == original_password
     assert blank_password == original_password
     assert blank.config()["password"] == "secret"
+
+
+def _orders(data_type: str = "integer") -> dict[str, object]:
+    return {
+        "databases": [
+            {
+                "name": "shop",
+                "tables": [
+                    {
+                        "name": "orders",
+                        "columns": [
+                            {
+                                "name": "id",
+                                "data_type": data_type,
+                                "nullable": False,
+                                "ordinal_position": 1,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_unchanged_columns_keep_their_row_and_a_type_change_updates_it(db_session: Session) -> None:
+    datasource = DatasourceService(db_session).create_datasource(
+        name="Shop", connector_type="mysql", config={"database": "shop"}
+    )
+    db_session.commit()
+    scan = MetadataScanService(db_session)
+    scan.replace_snapshot(datasource=datasource, snapshot=_orders())
+    db_session.commit()
+    field = db_session.execute(select(ResourceField)).scalar_one()
+    field_id = field.id
+
+    scan.replace_snapshot(datasource=datasource, snapshot=_orders())
+    db_session.commit()
+    db_session.refresh(field)
+    assert field.id == field_id
+    assert field.data_type == "integer"
+
+    scan.replace_snapshot(datasource=datasource, snapshot=_orders("bigint"))
+    db_session.commit()
+    db_session.refresh(field)
+    assert field.id == field_id
+    assert field.data_type == "bigint"
+
+
+def test_a_later_database_failure_keeps_the_database_already_committed(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with session_factory() as session:
+        datasource = DatasourceService(session).create_datasource(
+            name="Shop", connector_type="mysql", config={"database": "shop"}
+        )
+        session.commit()
+        datasource_id = datasource.id
+    original = MetadataScanService.apply_database
+
+    def apply(
+        self: MetadataScanService,
+        *,
+        datasource: Datasource,
+        database_payload: dict[str, object],
+        scanned_at: object,
+    ) -> object:
+        if database_payload["name"] == "later":
+            raise OperationalError("SELECT 1", {}, Exception("connection reset"))
+        return original(
+            self,
+            datasource=datasource,
+            database_payload=database_payload,
+            scanned_at=scanned_at,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(MetadataScanService, "apply_database", apply)
+    snapshot = {
+        "databases": [
+            *_orders()["databases"],  # type: ignore[misc]
+            {"name": "later", "tables": [{"name": "events", "columns": []}]},
+        ]
+    }
+    with pytest.raises(OperationalError):
+        persist_snapshot(session_factory, datasource_id, snapshot)  # type: ignore[arg-type]
+
+    with session_factory() as session:
+        paths = set(session.execute(select(Resource.path)).scalars())
+    assert "shop" in paths
+    assert "shop.orders" in paths
+    assert "later" not in paths

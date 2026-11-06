@@ -23,8 +23,10 @@ from adg.runtime_cache import (
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
 from adg_ext import pipeline as ext_pipeline
+from adg_ext.audience import audience_reason
 from adg_ext.catalog_notes import NoteIndex, prefer, table_address
 from adg_ext.config import ext_enabled
+from adg_ext.models import ExtUserAttribute
 
 
 class GatewayRuntimeService:
@@ -49,6 +51,15 @@ class GatewayRuntimeService:
             masking_encryption_key=getattr(settings, "masking_encryption_key", settings.secret_key),
             kdf_iterations=getattr(settings, "secret_kdf_iterations", 390_000),
         )
+
+    def audience_block(self, identity: IdentityContext, person: str | None) -> str | None:
+        """Reject MCP callers missing from this grant's directory list."""
+
+        if not identity.user_id:
+            return None
+        row = self._session.get(ExtUserAttribute, identity.user_id)
+        raw = None if row is None else row.audience_json
+        return audience_reason(raw, person)
 
     def list_datasources(
         self,

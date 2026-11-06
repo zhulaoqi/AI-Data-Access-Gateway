@@ -152,6 +152,32 @@ def fit_snapshot(snapshot: Any, datasource: str) -> dict[str, Any]:
     return {**snapshot, "databases": databases}
 
 
+def connector_target(spec: dict[str, Any]) -> tuple[str, dict[str, object]]:
+    """Return the connector type and connection config stored for a datasource account."""
+
+    engine = str(spec.get("engine", "")).lower()
+    connector_type = _ENGINE_TO_CONNECTOR.get(engine)
+    if connector_type is None:
+        raise ExtSyncError(422, f"unsupported engine: {engine or 'missing'}")
+    config: dict[str, object] = {
+        "host": spec.get("host"),
+        "port": spec.get("port"),
+        "username": spec.get("username"),
+        "password": spec.get("password"),
+    }
+    if spec.get("database"):
+        config["database"] = spec["database"]
+    if "databases" in spec:
+        raw_databases = spec.get("databases")
+        if isinstance(raw_databases, list):
+            config["databases"] = [str(item).strip() for item in raw_databases if str(item).strip()]
+        else:
+            config["databases"] = []
+    if not config["host"] or not config["username"]:
+        raise ExtSyncError(422, "host and username are required")
+    return connector_type, config
+
+
 class ExtSyncError(Exception):
     """A sync request that cannot be applied; ``status`` is the HTTP status to answer with."""
 
@@ -180,6 +206,8 @@ class SyncService:
     def __init__(self, session: Session, registry: ConnectorRegistry | None = None) -> None:
         self._s = session
         self._registry = registry or get_connector_registry()
+        # Set by the HTTP layer after the live catalog was scanned with no connection held.
+        self.prepared_snapshot: dict[str, Any] | None = None
 
     # ---- public API -----------------------------------------------------------------------
 
@@ -315,28 +343,7 @@ class SyncService:
     def _put_datasource_account(
         self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None
     ) -> str:
-        engine = str(spec.get("engine", "")).lower()
-        connector_type = _ENGINE_TO_CONNECTOR.get(engine)
-        if connector_type is None:
-            raise ExtSyncError(422, f"unsupported engine: {engine or 'missing'}")
-        config: dict[str, object] = {
-            "host": spec.get("host"),
-            "port": spec.get("port"),
-            "username": spec.get("username"),
-            "password": spec.get("password"),
-        }
-        if spec.get("database"):
-            config["database"] = spec["database"]
-        if "databases" in spec:
-            raw_databases = spec.get("databases")
-            if isinstance(raw_databases, list):
-                config["databases"] = [
-                    str(item).strip() for item in raw_databases if str(item).strip()
-                ]
-            else:
-                config["databases"] = []
-        if not config["host"] or not config["username"]:
-            raise ExtSyncError(422, "host and username are required")
+        connector_type, config = connector_target(spec)
         service = DatasourceService(self._s)
         datasource = self._datasource_for(existing)
         if datasource is None:
@@ -358,7 +365,12 @@ class SyncService:
             datasource.type = connector_type
         self._s.flush()
         self._sync_datasource_capacity(datasource.id, spec.get("capacity"))
-        self._scan(datasource, name)
+        snapshot = self.prepared_snapshot
+        self.prepared_snapshot = None
+        if snapshot is None:
+            self._scan(datasource, name)
+        else:
+            MetadataScanService(self._s).replace_snapshot(datasource=datasource, snapshot=snapshot)
         return datasource.id
 
     def _sync_datasource_capacity(self, datasource_id: str, raw: Any) -> None:
@@ -409,6 +421,15 @@ class SyncService:
                     concurrency=max_query_concurrency,
                 )
             )
+
+    def require_synced_datasource(self, name: str) -> str:
+        """Return the datasource id or refuse when this account has not been synced."""
+
+        self._check("datasource_account", name)
+        datasource = self._datasource_for(self._find("datasource_account", name))
+        if datasource is None:
+            raise ExtSyncError(404, f"datasource_account {name} has not been synced")
+        return datasource.id
 
     def rescan(self, name: str) -> dict[str, int]:
         """Re-read the live catalog of a synced datasource; the spec and hash stay unchanged."""
@@ -738,11 +759,20 @@ class SyncService:
         attribute = self._s.get(ExtUserAttribute, user.id)
         params = json.dumps(spec.get("params") or {}, separators=(",", ":"), sort_keys=True)
         limits = json.dumps(spec.get("limits") or {}, separators=(",", ":"), sort_keys=True)
+        audience = _audience_json(spec)
         if attribute is None:
-            self._s.add(ExtUserAttribute(user_id=user.id, params_json=params, limits_json=limits))
+            self._s.add(
+                ExtUserAttribute(
+                    user_id=user.id,
+                    params_json=params,
+                    limits_json=limits,
+                    audience_json=audience,
+                )
+            )
         else:
             attribute.params_json = params
             attribute.limits_json = limits
+            attribute.audience_json = audience
         self._s.flush()
         return user.id
 
@@ -835,6 +865,17 @@ class SyncService:
                 str(spec.get("openId") or ""),
                 _scope_at(spec),
             )
+
+
+def _audience_json(spec: dict[str, Any]) -> str | None:
+    """Store a listed audience. Any other shape clears it."""
+
+    audience = spec.get("audience")
+    if not isinstance(audience, dict) or audience.get("mode") != "listed":
+        return None
+    raw = audience.get("openIds")
+    ids = [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []
+    return json.dumps({"mode": "listed", "openIds": ids}, separators=(",", ":"))
 
 
 def _older_than_stored(existing: ExtSyncObject | None, spec: dict[str, Any]) -> bool:

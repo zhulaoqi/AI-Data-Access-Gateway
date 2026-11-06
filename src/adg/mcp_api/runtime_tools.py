@@ -83,6 +83,11 @@ def dispatch_runtime_tool_call(
             detail="Runtime identity fields are not accepted",
         )
 
+    person = (disclosure_headers or {}).get("person") if disclosure_headers else None
+    blocked = runtime.audience_block(runtime_identity, person)
+    if blocked:
+        return {"status": "rejected", "reason": blocked}
+
     if tool_name == "list_datasources":
         return runtime.list_datasources(identity=runtime_identity, api_key_id=api_key_id)
     if tool_name == "list_tags":

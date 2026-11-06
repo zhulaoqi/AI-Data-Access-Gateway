@@ -1,6 +1,6 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from adg.app.dependencies import AuthenticatedRuntimeKey, require_runtime_api_key
@@ -17,6 +17,8 @@ def call_tool(
     payload: dict[str, Any],
     session: Annotated[Session, Depends(get_session)],
     api_key: Annotated[AuthenticatedRuntimeKey, Depends(require_runtime_api_key)],
+    x_gw_person: Annotated[str | None, Header(alias="X-GW-Person")] = None,
+    x_gw_scope: Annotated[str | None, Header(alias="X-GW-Scope")] = None,
 ) -> dict[str, Any]:
     """Dispatch one MCP-style HTTP tool call to the shared runtime service."""
 
@@ -30,6 +32,7 @@ def call_tool(
             payload,
             api_key.runtime_identity,
             api_key.id,
+            {"person": x_gw_person, "scope": x_gw_scope},
         )
     except KeyError:
         raise HTTPException(

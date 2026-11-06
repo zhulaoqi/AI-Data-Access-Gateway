@@ -78,6 +78,7 @@ class ExtUserAttribute(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     params_json: Mapped[str] = mapped_column(LargeText, nullable=False, default="{}")
     limits_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    audience_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ExtCatalogNote(Base):

@@ -15,10 +15,12 @@ from adg.app.dependencies import (
 )
 from adg.app.log_config import kv
 from adg.app.settings import get_settings
+from adg.connectors.registry import get_connector_registry
 from adg.control_plane.db import get_session
 from adg.runtime_cache import refresh_catalog, refresh_policies
 from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
+from adg_ext.catalog_job import CatalogJobs, scan_account_spec
 from adg_ext.config import get_ext_settings
 from adg_ext.context import refresh_role
 from adg_ext.delegated import DelegatedError, run_delegated
@@ -100,6 +102,17 @@ def put_object(
 ) -> dict[str, str]:
     service = SyncService(session)
     try:
+        if object_type == "datasource_account":
+            # Scan first so the remote read does not hold a pooled connection.
+            existing = service._find(object_type, name)
+            if existing is not None and existing.hash == body.hash and existing.external_id:
+                external_id = existing.external_id
+                session.rollback()
+                return {"externalId": external_id}
+            session.rollback()
+            service.prepared_snapshot = scan_account_spec(
+                body.spec, name, get_connector_registry()
+            )
         external_id = service.put(object_type, name, body.hash, body.spec)
         session.commit()
     except ExtSyncError as error:
@@ -155,21 +168,35 @@ def reinstate_object(
 @admin_router.post("/sync/datasource_account/{name}/rescan")
 def rescan_datasource(
     name: str,
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
-) -> dict[str, int | str]:
-    """Re-scan the live catalog of a synced datasource without changing its spec."""
+) -> dict[str, object]:
+    """Start a catalog scan and return its current state. Poll GET until it finishes."""
 
     try:
-        service = SyncService(session)
-        counts = service.rescan(name)
-        datasource_id = service.external_id_of("datasource_account", name)
-        session.commit()
+        SyncService(session).require_synced_datasource(name)
+        session.rollback()
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
-    if datasource_id:
-        refresh_catalog(session, datasource_id)
-    return {"status": "ok", **counts}
+    return _jobs(request).kick(name)
+
+
+@admin_router.get("/sync/datasource_account/{name}/rescan")
+def rescan_status(name: str, request: Request) -> dict[str, object]:
+    """Return the latest catalog scan for this datasource account."""
+
+    job = _jobs(request).get(name)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no catalog scan")
+    return job
+
+
+def _jobs(request: Request) -> CatalogJobs:
+    jobs = getattr(request.app.state, "catalog_jobs", None)
+    if not isinstance(jobs, CatalogJobs):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="catalog jobs")
+    return jobs
 
 
 @admin_router.get("/sync/{object_type}")
