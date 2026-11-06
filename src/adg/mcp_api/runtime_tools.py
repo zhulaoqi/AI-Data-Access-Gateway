@@ -47,6 +47,18 @@ RUNTIME_TOOL_DEFINITIONS = [
         name="execute_query",
         description="Run one read-only SQL query scoped to declared resources.",
     ),
+    RuntimeToolDefinition(
+        name="resolve_person",
+        description=(
+            "用调用者自己的企业邮箱，查出他在本网关通讯录里的 open_id。"
+            "这个值只能由用户写进 MCP 客户端配置的请求头 X-GW-Person，然后重新连接。"
+            "本工具的返回值不会改变当前连接已经带上的请求头，也不能当作其他工具的参数。"
+            "只接受用户明确给出的完整企业邮箱，不要猜测、补全或改查别人的邮箱。"
+            "查到之后，把 open_id 原样告诉用户，请他写入 headers.X-GW-Person 并重连；"
+            "在他重连之前，不要继续查数据。"
+            "不同飞书应用的 open_id 不同。这里返回的是本网关通讯录里的那个。"
+        ),
+    ),
 ]
 
 FORBIDDEN_RUNTIME_IDENTITY_FIELDS = frozenset({"user_id", "roles", "groups"})
@@ -78,10 +90,19 @@ def dispatch_runtime_tool_call(
             detail="Runtime identity fields are not accepted",
         )
 
+    if tool_name == "resolve_person":
+        return runtime.resolve_person(
+            identity=runtime_identity,
+            api_key_id=api_key_id,
+            email=str(payload.get("email") or ""),
+        )
+
     person = (disclosure_headers or {}).get("person") if disclosure_headers else None
     blocked = runtime.audience_block(runtime_identity, person)
     if blocked:
-        return {"status": "rejected", "reason": blocked}
+        from adg_ext.audience import audience_message
+
+        return {"status": "rejected", "reason": blocked, "message": audience_message(blocked)}
 
     if tool_name == "list_datasources":
         return runtime.list_datasources(identity=runtime_identity, api_key_id=api_key_id)

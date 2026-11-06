@@ -15,6 +15,7 @@ from adg.app.dependencies import AuthenticatedRuntimeKey, authenticate_runtime_a
 from adg.app.settings import get_settings
 from adg.control_plane.db import SessionLocal
 from adg.gateway_runtime.tools import GatewayRuntimeService
+from adg.mcp_api.agent_message import attach_agent_message
 from adg.mcp_api.runtime_tools import RUNTIME_TOOL_DEFINITIONS, dispatch_runtime_tool_call
 
 _TOOL_DESCRIPTION = {item.name: item.description for item in RUNTIME_TOOL_DEFINITIONS}
@@ -205,7 +206,25 @@ def _run_runtime_tool(ctx: McpContext, tool_name: str, payload: dict[str, Any]) 
             },
         )
         session.commit()
-        return response
+        return attach_agent_message(response)
+
+
+@runtime_mcp_server.tool(
+    name="resolve_person",
+    description=_TOOL_DESCRIPTION["resolve_person"],
+)
+async def resolve_person(
+    ctx: McpContext,
+    email: str,
+) -> dict[str, Any]:
+    """Resolve one enterprise email to the directory open_id for X-GW-Person."""
+
+    return await _run_in_threadpool(
+        _run_runtime_tool,
+        ctx,
+        "resolve_person",
+        {"email": email},
+    )
 
 
 @runtime_mcp_server.tool(

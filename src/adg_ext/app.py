@@ -56,6 +56,7 @@ def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:
             "status": "rejected",
             "reason": POOL_EXHAUSTED,
             "detail": POOL_EXHAUSTED,
+            "message": "网关控制库连接已满，请稍后再试。",
             "retry_after_seconds": retry_after,
         },
         headers={"Retry-After": str(retry_after)},

@@ -357,7 +357,8 @@ def test_audit_failure_refuses_execution(
 
     monkeypatch.setattr(AuditService, "record_event", broken)
     out = query(gateway, key, "SELECT id FROM shop.orders")
-    assert out == {"status": "rejected", "reason": "audit_unavailable"}
+    assert out["status"] == "rejected" and out["reason"] == "audit_unavailable"
+    assert "审计" in out["message"]
     assert calls == []
 
 
@@ -379,7 +380,8 @@ def test_circuit_breaker_opens_after_repeated_datasource_failures(
         out = query(gateway, key, "SELECT id FROM shop.orders")
         assert out["error"]["type"] == "datasource_unavailable"
     fast = query(gateway, key, "SELECT id FROM shop.orders")
-    assert fast == {"status": "rejected", "reason": "admission_circuit_open"}
+    assert fast["status"] == "rejected" and fast["reason"] == "admission_circuit_open"
+    assert "连续失败" in fast["message"]
     assert len(calls) == 5  # the sixth request never reached the datasource
     assert gateway.admin_get("/admin/ext/metrics").json()["breakers"]
 

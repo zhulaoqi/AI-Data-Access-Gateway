@@ -6,6 +6,24 @@ import json
 from typing import Any
 
 
+_MESSAGES = {
+    "person_required": (
+        "这条授权限定了可以提问的人。请求没有带 X-GW-Person，网关不知道现在是谁，"
+        "所以没有返回库表。请在 MCP 连接的请求头里写上通讯录 open_id。"
+    ),
+    "person_not_entitled": (
+        "请求头 X-GW-Person 里的这个人不在这条授权的可见名单里，所以没有返回库表。"
+        "请让签发人把该 open_id 加入授权可见性，或换成名单上的人。"
+    ),
+}
+
+
+def audience_message(reason: str) -> str:
+    """Caller-facing explanation. The reason code stays stable for audit and metrics."""
+
+    return _MESSAGES.get(reason, "这条授权的可见性不允许当前请求查看库表。原因：" + reason)
+
+
 def audience_reason(raw: str | None, person: str | None) -> str | None:
     """None means this grant does not restrict who may call MCP."""
 

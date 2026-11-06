@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from adg.app.dependencies import AuthenticatedRuntimeKey, require_runtime_api_key
 from adg.control_plane.db import get_session
 from adg.gateway_runtime.tools import GatewayRuntimeService
+from adg.mcp_api.agent_message import attach_agent_message
 from adg.mcp_api.runtime_tools import dispatch_runtime_tool_call
 
 router = APIRouter(prefix="/api/tools", tags=["mcp"])
@@ -41,4 +42,4 @@ def call_tool(
         ) from None
 
     session.commit()
-    return response
+    return attach_agent_message(response)

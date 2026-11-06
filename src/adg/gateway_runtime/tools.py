@@ -63,6 +63,22 @@ class GatewayRuntimeService:
         raw = None if row is None else row.audience_json
         return audience_reason(raw, person)
 
+    def resolve_person(
+        self,
+        *,
+        identity: IdentityContext,
+        api_key_id: str,
+        email: str,
+    ) -> dict[str, Any]:
+        """Map one enterprise email to the directory open_id stored in the cache."""
+
+        from adg_ext.directory import lookup
+
+        found = lookup(email)
+        if found.get("status") == "ok":
+            self._record_discovery(identity, api_key_id, "resolve_person", None, [])
+        return found
+
     def list_datasources(
         self,
         *,
