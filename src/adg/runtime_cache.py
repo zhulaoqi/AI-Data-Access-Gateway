@@ -298,6 +298,7 @@ def refresh_policies(session: Session) -> None:
         return grouped
 
     refresh("policies", load)
+    _refresh_visibility(session)
 
 
 def _query_datasources(session: Session) -> list[dict[str, Any]]:
@@ -337,6 +338,7 @@ def refresh_datasources(session: Session) -> None:
     """Reload the datasource directory after a committed datasource change."""
 
     refresh("datasources", lambda: _query_datasources(session))
+    _refresh_visibility(session)
 
 
 def _query_tag_catalog(session: Session) -> dict[str, Any]:
@@ -378,6 +380,7 @@ def refresh_tags(session: Session) -> None:
     """Reload tags and their resource bindings after a committed label change."""
 
     refresh("tags", lambda: _query_tag_catalog(session))
+    _refresh_visibility(session)
 
 
 def _query_table_index(session: Session, datasource_id: str) -> list[dict[str, Any]]:
@@ -639,3 +642,12 @@ def refresh_catalog(session: Session, datasource_id: str) -> None:
 
     refresh_tables(session, datasource_id)
     refresh_time_columns(session, datasource_id)
+    _refresh_visibility(session)
+
+
+def _refresh_visibility(session: Session) -> None:
+    """Rebuild the per-user discovery snapshots after a committed catalog or policy change."""
+
+    from adg.visibility_cache import refresh_visibility
+
+    refresh_visibility(session)

@@ -39,6 +39,7 @@ from adg.runtime_cache import (
     refresh_policies,
     refresh_tags,
 )
+from adg.visibility_cache import refresh_visibility
 from adg_ext.config import ext_enabled
 
 router = APIRouter(prefix="/admin", tags=["admin-console"])
@@ -1091,6 +1092,7 @@ def create_user(
     )
     session.commit()
     session.refresh(user)
+    refresh_visibility(session)
     return {
         "id": user.id,
         "name": user.name,
@@ -1132,6 +1134,7 @@ def update_user(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
     session.commit()
     session.refresh(user)
+    refresh_visibility(session)
     return next(
         summary.to_dict()
         for summary in DirectoryService(session).list_users()
@@ -1152,6 +1155,7 @@ def delete_user(
     except NoResultFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
     session.commit()
+    refresh_visibility(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1199,6 +1203,7 @@ def execute_users_excel_import(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     session.commit()
+    refresh_visibility(session)
     return result.to_dict()
 
 
@@ -1218,6 +1223,7 @@ def pull_import_from_platform(
         if payload.mode == "execute":
             result = execute_excel_import(session, rows=rows, delimiter=batch.delimiter)
             session.commit()
+            refresh_visibility(session)
         else:
             result = preview_excel_import(session, rows=rows, delimiter=batch.delimiter)
     except ValueError as exc:
@@ -1267,6 +1273,7 @@ def update_role(
     _apply_updates(role, payload.model_dump(exclude_unset=True))
     session.commit()
     session.refresh(role)
+    refresh_visibility(session)
     return _serialize_role(role, session=session)
 
 

@@ -325,6 +325,159 @@ def test_discovery_reads_hot_copies_after_they_are_refreshed(
     assert [item["id"] for item in by_tag["resources"]] == ["res_orders"]
 
 
+def test_precomputed_lists_follow_allow_deny_and_do_not_rescan(
+    db_session: Session, monkeypatch: MonkeyPatch
+) -> None:
+    """A stored snapshot matches a live decision, including a deny from a second role."""
+
+    from tests.unit.policy.test_runtime_cache import _MemoryRedis
+
+    from adg.control_plane.models.directory import Role, User, UserRole
+    from adg.runtime_cache import (
+        refresh_datasources,
+        refresh_policies,
+        refresh_tables,
+        refresh_tags,
+    )
+    from adg.visibility_cache import refresh_visibility
+    from adg_ext.models import ExtCatalogNote
+
+    client = _MemoryRedis()
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+    add_datasource(db_session, description="finance warehouse")
+    add_resource(
+        db_session,
+        resource_id="schema_hidden",
+        path="warehouse.hidden",
+        kind="schema",
+        status="disabled",
+    )
+    add_resource(
+        db_session,
+        resource_id="res_secret",
+        path="warehouse.hidden.secret",
+        parent_id="schema_hidden",
+    )
+    orders = add_resource(db_session, resource_id="res_orders", path="sales.orders")
+    orders.description = "scanned comment"
+    payroll = add_resource(db_session, resource_id="res_payroll", path="sales.payroll")
+    for role_id in ("role_a", "role_b"):
+        db_session.add(Role(id=role_id, name=role_id, status="active"))
+    for user_id, role_ids in (
+        ("user_a", ["role_a"]),
+        ("user_b", ["role_b"]),
+        ("user_c", ["role_a", "role_b"]),
+    ):
+        db_session.add(User(id=user_id, name=user_id, external_ref=user_id, status="active"))
+        for role_id in role_ids:
+            db_session.add(UserRole(user_id=user_id, role_id=role_id))
+    db_session.add(Tag(id="tag_finance", name="finance", category="domain"))
+    db_session.add(ResourceTag(tag_id="tag_finance", resource_id=orders.id))
+    db_session.add(
+        ExtCatalogNote(
+            datasource_id="ds_1",
+            database_name="sales",
+            table_name="orders",
+            column_name="",
+            text="业务含义",
+        )
+    )
+    for role_id in ("role_a", "role_b"):
+        db_session.add(
+            ResourcePolicy(
+                subject_type="role",
+                subject_id=role_id,
+                effect="allow",
+                action="read",
+                datasource_id="ds_1",
+                status="active",
+            )
+        )
+    db_session.add(
+        ResourcePolicy(
+            subject_type="role",
+            subject_id="role_b",
+            effect="deny",
+            action="read",
+            resource_id=payroll.id,
+            status="active",
+        )
+    )
+    db_session.flush()
+    refresh_datasources(db_session)
+    refresh_tables(db_session, "ds_1")
+    refresh_tags(db_session)
+    refresh_policies(db_session)
+    refresh_visibility(db_session)
+
+    service = runtime(db_session)
+    expected = {
+        "user_a": ["res_orders", "res_payroll"],
+        "user_b": ["res_orders"],
+        "user_c": ["res_orders"],
+    }
+    engine = cast(Engine, db_session.get_bind())
+    scanned = 0
+
+    def count_catalog_scans(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        nonlocal scanned
+        lowered = statement.lower()
+        if "from resources" in lowered or "from resource_tags" in lowered:
+            scanned += 1
+
+    event.listen(engine, "before_cursor_execute", count_catalog_scans)
+    try:
+        for user_id, resource_ids in expected.items():
+            roles = ["role_a"] if user_id == "user_a" else ["role_b"]
+            if user_id == "user_c":
+                roles = ["role_a", "role_b"]
+            caller = IdentityContext(user_id=user_id, roles=roles)
+            live = [
+                resource.id
+                for resource in service._visible_resources(identity=caller)
+            ]
+            listed = service.list_resources(
+                identity=caller, api_key_id="key_1", datasource_id="ds_1"
+            )
+            assert live == resource_ids
+            assert [item["id"] for item in listed["resources"]] == resource_ids
+        caller_a = IdentityContext(user_id="user_a", roles=["role_a"])
+        assert service.list_datasources(identity=caller_a, api_key_id="key_1")["datasources"] == [
+            {
+                "id": "ds_1",
+                "name": "Datasource ds_1",
+                "type": "fake",
+                "datasource_kind": "relational",
+                "description": "finance warehouse",
+            }
+        ]
+        assert service.list_tags(identity=caller_a, api_key_id="key_1")["tags"] == [
+            {"id": "tag_finance", "name": "finance", "category": "domain"}
+        ]
+        by_tag = service.list_resources_by_tag(
+            identity=caller_a, api_key_id="key_1", tag_names=["finance"]
+        )
+        assert [item["id"] for item in by_tag["resources"]] == ["res_orders"]
+        assert by_tag["resources"][0]["description"] == "业务含义"
+        stripped = service.list_resources(
+            identity=IdentityContext(user_id="user_a", roles=[]),
+            api_key_id="key_1",
+            datasource_id="ds_1",
+        )
+        assert stripped["resources"] == []
+    finally:
+        event.remove(engine, "before_cursor_execute", count_catalog_scans)
+
+    assert scanned == 0
+
+
 def test_tags_only_include_accessible_resources(db_session: Session) -> None:
     add_datasource(db_session)
     allowed = add_resource(db_session, resource_id="res_allowed")

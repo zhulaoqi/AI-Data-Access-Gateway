@@ -77,6 +77,11 @@ def _warm_cache(
         refresh_policies(session)
         refresh_role(session, external_id)
         return
+    if object_type == "user":
+        from adg.visibility_cache import refresh_visibility
+
+        refresh_visibility(session)
+        return
     if object_type != "datasource_account" or not external_id:
         return
     refresh_catalog(session, external_id)

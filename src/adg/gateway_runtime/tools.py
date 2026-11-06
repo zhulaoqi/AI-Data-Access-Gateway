@@ -29,6 +29,25 @@ from adg_ext.catalog_notes import NoteIndex, prefer, table_address
 from adg_ext.config import ext_enabled
 
 
+def _resources_for_tags(cached: dict[str, Any], tag_names: list[str]) -> list[dict[str, Any]]:
+    """Resources in the snapshot whose tags include one of ``tag_names``."""
+
+    wanted = set(tag_names)
+    names = cached["tag_names"]
+    found: list[dict[str, Any]] = []
+    for source in cached["datasources"]:
+        rows = cached["by_datasource"].get(source["id"], [])
+        if not isinstance(rows, list):
+            continue
+        for resource in rows:
+            if not isinstance(resource, dict):
+                continue
+            have = names.get(resource.get("id"), [])
+            if isinstance(have, list) and wanted.intersection(have):
+                found.append(resource)
+    return found
+
+
 class GatewayRuntimeService:
     """Coordinates runtime discovery, SQL validation, policy checks, masking, and audit."""
 
@@ -61,22 +80,26 @@ class GatewayRuntimeService:
         """Return active datasources visible to runtime callers."""
 
         self._session.flush()
-        visible_datasource_ids = {
-            resource.datasource_id for resource in self._visible_resources(identity=identity)
-        }
-        response = {
-            "datasources": [
-                {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "type": row["type"],
-                    "datasource_kind": row["datasource_kind"],
-                    "description": row.get("description"),
-                }
-                for row in load_datasource_directory(self._session)
-                if row.get("id") in visible_datasource_ids and row.get("status") == "active"
-            ]
-        }
+        cached = self._ready_catalog(identity)
+        if cached is not None:
+            response = {"datasources": cached["datasources"]}
+        else:
+            visible_datasource_ids = {
+                resource.datasource_id for resource in self._visible_resources(identity=identity)
+            }
+            response = {
+                "datasources": [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "type": row["type"],
+                        "datasource_kind": row["datasource_kind"],
+                        "description": row.get("description"),
+                    }
+                    for row in load_datasource_directory(self._session)
+                    if row.get("id") in visible_datasource_ids and row.get("status") == "active"
+                ]
+            }
         self._record_discovery(identity, api_key_id, "list_datasources", None, [])
         return response
 
@@ -84,21 +107,25 @@ class GatewayRuntimeService:
         """Return tags attached to resources the identity may discover."""
 
         self._session.flush()
-        visible_resource_ids = {
-            resource.id for resource in self._visible_resources(identity=identity)
-        }
-        catalog = load_tag_catalog(self._session)
-        bindings = catalog["by_resource"]
-        visible_tag_ids: set[str] = set()
-        for resource_id in visible_resource_ids:
-            visible_tag_ids.update(bindings.get(resource_id, []))
-        response = {
-            "tags": [
-                {"id": tag["id"], "name": tag["name"], "category": tag.get("category")}
-                for tag in catalog["tags"]
-                if tag.get("id") in visible_tag_ids
-            ]
-        }
+        cached = self._ready_catalog(identity)
+        if cached is not None:
+            response = {"tags": cached["tags"]}
+        else:
+            visible_resource_ids = {
+                resource.id for resource in self._visible_resources(identity=identity)
+            }
+            catalog = load_tag_catalog(self._session)
+            bindings = catalog["by_resource"]
+            visible_tag_ids: set[str] = set()
+            for resource_id in visible_resource_ids:
+                visible_tag_ids.update(bindings.get(resource_id, []))
+            response = {
+                "tags": [
+                    {"id": tag["id"], "name": tag["name"], "category": tag.get("category")}
+                    for tag in catalog["tags"]
+                    if tag.get("id") in visible_tag_ids
+                ]
+            }
         self._record_discovery(identity, api_key_id, "list_tags", None, [])
         return response
 
@@ -112,11 +139,15 @@ class GatewayRuntimeService:
         """Return policy-visible relational resources for a datasource."""
 
         self._session.flush()
+        cached = self._ready_catalog(identity)
+        self._record_discovery(identity, api_key_id, "list_resources", datasource_id, [])
+        if cached is not None:
+            found = cached["by_datasource"].get(datasource_id, [])
+            return {"resources": found if isinstance(found, list) else []}
         resources = [
             resource
             for resource in self._visible_resources(identity=identity, datasource_id=datasource_id)
         ]
-        self._record_discovery(identity, api_key_id, "list_resources", datasource_id, [])
         notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
         return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
 
@@ -130,6 +161,10 @@ class GatewayRuntimeService:
         """Return policy-visible resources that have at least one requested tag."""
 
         self._session.flush()
+        cached = self._ready_catalog(identity)
+        self._record_discovery(identity, api_key_id, "list_resources_by_tag", None, [])
+        if cached is not None:
+            return {"resources": _resources_for_tags(cached, tag_names)}
         catalog = load_tag_catalog(self._session)
         wanted = {tag["id"] for tag in catalog["tags"] if tag.get("name") in set(tag_names)}
         tagged = {
@@ -142,7 +177,6 @@ class GatewayRuntimeService:
             for resource in self._visible_resources(identity=identity)
             if resource.id in tagged
         ]
-        self._record_discovery(identity, api_key_id, "list_resources_by_tag", None, [])
         notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
         return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
 
@@ -555,6 +589,13 @@ class GatewayRuntimeService:
         if isinstance(error, ConnectorDependencyError):
             return "Datasource connector dependency is unavailable. Contact an administrator."
         return "Datasource query execution failed. Reference query_id for details."
+
+    def _ready_catalog(self, identity: IdentityContext) -> dict[str, Any] | None:
+        """Precomputed lists for this caller, when Redis is holding them."""
+
+        from adg.visibility_cache import load_visible
+
+        return load_visible(self._session, identity)
 
     def _visible_resources(
         self,
