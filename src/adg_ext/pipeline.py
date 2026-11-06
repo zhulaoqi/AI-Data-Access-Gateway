@@ -236,6 +236,28 @@ def _person_values(session: Any, dimension_id: str, open_id: str) -> list[str] |
     return resolve_values(dimension_id, open_id, redis_get=redis_get, local_get=local)
 
 
+def _note_disclosure(
+    ctx: ctxmod.ExtContext,
+    audit_meta: dict[str, Any],
+    headers: dict[str, str | None] | None,
+    reason: str | None,
+    values: list[str] | None,
+) -> None:
+    """One line, and the same fields on the audit row, so a missing header is distinct from a missed splice."""
+
+    from adg_ext.disclosure import trace
+
+    fields = trace(
+        ctx.disclosure,
+        headers,
+        channel=str(audit_meta.get("channel") or "mcp"),
+        reason=reason,
+        values=values,
+    )
+    logger.info(kv(event="disclosure_query", **fields))
+    audit_meta["disclosure"] = fields
+
+
 def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> dict[str, Any]:
     """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
 
@@ -376,8 +398,12 @@ def run(
 
     if ctx.disclosure:
         if ctx.disclosure.get("conflict"):
+            _note_disclosure(ctx, audit_meta, disclosure_headers, "disclosure_conflict", None)
             return reject("permission_rejected", "disclosure_conflict")
         if audit_meta.get("channel") == "jdbc":
+            _note_disclosure(
+                ctx, audit_meta, disclosure_headers, "disclosure_not_supported_on_jdbc", None
+            )
             return reject("permission_rejected", "disclosure_not_supported_on_jdbc")
     if limit < 1:
         return reject("sql_rejected", "runtime_limit_invalid")
@@ -448,6 +474,14 @@ def run(
             channel=str(audit_meta.get("channel") or "mcp"),
             headers=disclosure_headers,
             lookup=lambda dimension_id, open_id: _person_values(session, dimension_id, open_id),
+        )
+        bound = ctx.user_params.get("gw_disclosure_values")
+        _note_disclosure(
+            ctx,
+            audit_meta,
+            disclosure_headers,
+            reason,
+            bound if isinstance(bound, list) else None,
         )
         if reason:
             return reject("permission_rejected", reason)

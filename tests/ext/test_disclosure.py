@@ -1,5 +1,5 @@
 from adg_ext.analyze import TableView
-from adg_ext.disclosure import bind, parse_external, resolve_values
+from adg_ext.disclosure import bind, parse_external, resolve_values, trace
 from adg_ext.rowfilter import compile_template, render
 
 
@@ -174,3 +174,27 @@ def test_missing_values_do_not_open_the_table() -> None:
     assert reason is not None
     assert "张三" in reason
     assert "10086" not in reason
+
+
+def test_trace_shows_a_missing_person_and_a_spliced_sample() -> None:
+    missing = trace(
+        {"dimensionId": "dim_1", "source": "manual"},
+        {},
+        channel="mcp",
+        reason="person_required",
+        values=None,
+    )
+    assert missing["person"] == "-"
+    assert missing["attached"] == "no"
+    assert missing["reason"] == "person_required"
+    spliced = trace(
+        {"dimensionId": "dim_1", "source": "manual"},
+        {"person": "ou_2"},
+        channel="mcp",
+        reason=None,
+        values=["10086", "10087", "10088", "10089", "10090", "10091"],
+    )
+    assert spliced["person"] == "ou_2"
+    assert spliced["attached"] == "yes"
+    assert spliced["values"] == 6
+    assert spliced["sample"] == "10086,10087,10088,10089,10090,+1"

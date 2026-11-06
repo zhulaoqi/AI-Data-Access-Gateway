@@ -61,6 +61,35 @@ def forget(dimension_id: str, open_id: str) -> None:
         return
 
 
+def trace(
+    disclosure: dict[str, Any] | None,
+    headers: dict[str, str | None] | None,
+    *,
+    channel: str,
+    reason: str | None,
+    values: list[str] | None,
+) -> dict[str, Any]:
+    """What arrived and whether the person predicate was attached. A sample, not the whole list."""
+
+    person = ((headers or {}).get("person") or "").strip()
+    scope = (headers or {}).get("scope")
+    shown = [item for item in (values or []) if isinstance(item, str)]
+    sample = ",".join(item[:64] for item in shown[:5])
+    if len(shown) > 5:
+        sample = f"{sample},+{len(shown) - 5}"
+    return {
+        "dimension": str((disclosure or {}).get("dimensionId") or "-"),
+        "source": str((disclosure or {}).get("source") or "-"),
+        "channel": channel or "-",
+        "person": person or "-",
+        "scope": "yes" if scope else "no",
+        "values": len(shown),
+        "sample": sample or "-",
+        "attached": "no" if reason else "yes",
+        "reason": reason or "-",
+    }
+
+
 def bind(
     disclosure: dict[str, Any] | None,
     views: list[TableView],
