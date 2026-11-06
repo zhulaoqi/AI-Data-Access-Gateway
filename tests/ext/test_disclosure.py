@@ -1,5 +1,17 @@
+import json
+
 from adg_ext.analyze import TableView
-from adg_ext.disclosure import bind, forget, parse_external, remember, resolve_values, trace
+from adg_ext.disclosure import (
+    bind,
+    forget,
+    parse_external,
+    redis_key,
+    remember,
+    remember_tables,
+    resolve_scope,
+    resolve_values,
+    trace,
+)
 from adg_ext.rowfilter import compile_template, render
 
 
@@ -162,6 +174,185 @@ def test_comma_separated_values_become_separate_sql_literals() -> None:
     )
     assert external_reason is None
     assert external == ["10086", "10087"]
+
+
+def test_each_table_keeps_its_own_values() -> None:
+    product = TableView(
+        path="dataeye.product",
+        restricted=True,
+        allow=frozenset({"project_id"}),
+        filters=[None],
+    )
+    event = TableView(
+        path="dataeye.bi_event",
+        restricted=True,
+        allow=frozenset({"product_id"}),
+        filters=[None],
+    )
+    params: dict[str, object] = {}
+    reason = bind(
+        {
+            "dimensionId": "dim_tables",
+            "source": "manual",
+            "columns": [
+                {"database": "dataeye", "table": "product", "column": "project_id"},
+                {"database": "dataeye", "table": "bi_event", "column": "product_id"},
+            ],
+        },
+        [product, event],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: {
+            "tables": {("dataeye", "product"): ["1", "3", "5", "8"], ("dataeye", "bi_event"): ["9", "10"]}
+        },
+    )
+    assert reason is None
+    assert params["gw_disclosure_values_0"] == ["1", "3", "5", "8"]
+    assert params["gw_disclosure_values_1"] == ["9", "10"]
+    assert product.filters[0] is not None and "project_id" in product.filters[0].where
+    assert event.filters[0] is not None and "product_id" in event.filters[0].where
+
+
+class _CasRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    def eval(self, _script: str, _numkeys: int, key: str, payload: str, at: str) -> int:
+        current = self.store.get(key)
+        new_at = int(at)
+        if current:
+            seen = json.loads(current).get("at")
+            if seen is not None and int(seen) > new_at:
+                return 0
+        self.store[key] = payload
+        return 1
+
+
+def test_redis_tables_do_not_fall_back_to_a_shared_local_list() -> None:
+    raw = json.dumps(
+        {
+            "v": 1,
+            "at": 20,
+            "tables": [
+                {"database": "dataeye", "table": "product", "values": ["1", "3"]},
+                {"database": "dataeye", "table": "bi_event", "values": ["9"]},
+            ],
+        }
+    )
+    scope = resolve_scope(
+        "dim_redis_tables",
+        "ou_1",
+        redis_get=lambda _key: raw,
+        local_get=lambda: ["1", "3", "5", "8"],
+    )
+    assert scope is not None
+    assert "values" not in scope
+    assert scope["tables"][("dataeye", "product")] == ["1", "3"]
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+
+
+def test_a_pending_marker_beats_a_local_per_table_snapshot() -> None:
+    local = {"tables": [{"database": "dataeye", "table": "product", "values": ["1", "3"]}]}
+    scope = resolve_scope(
+        "dim_pending_tables",
+        "ou_1",
+        redis_get=lambda _key: '{"v":1,"at":30,"pending":true}',
+        local_get=lambda: local,
+    )
+    assert scope is None
+
+
+def test_an_older_shared_list_does_not_cover_newer_table_values(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    key = redis_key("dim_cas", "ou_1")
+    redis.store[key] = json.dumps(
+        {
+            "v": 1,
+            "at": 20,
+            "tables": [
+                {"database": "dataeye", "table": "product", "values": ["1", "3"]},
+                {"database": "dataeye", "table": "bi_event", "values": ["9"]},
+            ],
+        }
+    )
+    remember("dim_cas", "ou_1", ["1", "3", "5", "8"], 10)
+    body = json.loads(redis.store[key])
+    assert body["at"] == 20
+    assert "values" not in body
+    scope = resolve_scope(
+        "dim_cas",
+        "ou_1",
+        redis_get=redis.get,
+        local_get=lambda: ["1", "3", "5", "8"],
+        now=10**12,
+    )
+    assert scope is not None
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+
+
+def test_a_newer_tombstone_clears_a_stale_per_table_allow(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    remember_tables(
+        "dim_tomb",
+        "ou_1",
+        [{"database": "dataeye", "table": "product", "values": ["1", "3"]}],
+        20,
+    )
+    redis.store[redis_key("dim_tomb", "ou_1")] = '{"v":1,"at":30,"pending":true}'
+    forget("dim_tomb", "ou_1", 20)
+    scope = resolve_scope(
+        "dim_tomb",
+        "ou_1",
+        redis_get=redis.get,
+        local_get=lambda: {"tables": [{"database": "dataeye", "table": "product", "values": ["1"]}]},
+        now=0,
+    )
+    assert scope is None
+
+
+def test_an_older_revoke_does_not_drop_newer_table_values(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    remember_tables(
+        "dim_keep",
+        "ou_1",
+        [{"database": "dataeye", "table": "bi_event", "values": ["9"]}],
+        20,
+    )
+    forget("dim_keep", "ou_1", 10)
+    scope = resolve_scope("dim_keep", "ou_1", redis_get=redis.get, local_get=lambda: None, now=0)
+    assert scope is not None
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+    assert "values" not in json.loads(redis.store[redis_key("dim_keep", "ou_1")])
+
+
+def test_a_table_without_its_own_values_is_rejected() -> None:
+    event = TableView(
+        path="dataeye.bi_event",
+        restricted=True,
+        allow=frozenset({"product_id"}),
+        filters=[None],
+    )
+    reason = bind(
+        {
+            "dimensionId": "dim_tables",
+            "source": "manual",
+            "columns": [{"database": "dataeye", "table": "bi_event", "column": "product_id"}],
+        },
+        [event],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: {"tables": {("dataeye", "product"): ["1", "3", "5", "8"]}},
+    )
+    assert reason is not None
+    assert event.filters == [None]
 
 
 def test_an_older_scope_does_not_replace_a_newer_one() -> None:

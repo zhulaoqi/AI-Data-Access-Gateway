@@ -202,13 +202,13 @@ def _note_hit_databases(meta: dict[str, Any], sql: str, dialect: str | None) -> 
         meta["databases"] = [selected.strip()]
 
 
-def _person_values(session: Any, dimension_id: str, open_id: str) -> list[str] | None:
+def _person_values(session: Any, dimension_id: str, open_id: str) -> Any:
     """One memory hit, else one Redis GET, else the last synced snapshot. Never the full table."""
 
-    from adg_ext.disclosure import _redis, resolve_values, sync_name
+    from adg_ext.disclosure import _redis, resolve_scope, sync_name
     from adg_ext.models import ExtSyncObject
 
-    def local() -> list[str] | None:
+    def local() -> Any:
         row = session.execute(
             select(ExtSyncObject).where(
                 ExtSyncObject.object_type == "person_scope",
@@ -221,7 +221,11 @@ def _person_values(session: Any, dimension_id: str, open_id: str) -> list[str] |
             spec = json.loads(row.spec_json)
         except json.JSONDecodeError:
             return None
-        values = spec.get("values") if isinstance(spec, dict) else None
+        if not isinstance(spec, dict):
+            return None
+        if isinstance(spec.get("tables"), list) and spec["tables"]:
+            return {"tables": spec["tables"]}
+        values = spec.get("values")
         if not isinstance(values, list):
             return None
         clean = [item for item in values if isinstance(item, str) and item]
@@ -233,7 +237,7 @@ def _person_values(session: Any, dimension_id: str, open_id: str) -> list[str] |
             raise RuntimeError("redis unavailable")
         return client.get(key)
 
-    return resolve_values(dimension_id, open_id, redis_get=redis_get, local_get=local)
+    return resolve_scope(dimension_id, open_id, redis_get=redis_get, local_get=local)
 
 
 def _note_disclosure(

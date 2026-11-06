@@ -191,6 +191,17 @@ class SyncService:
         if existing is not None and existing.hash == hash_ and existing.external_id:
             logger.debug(kv(event="sync_put", type=object_type, name=name, changed=False))
             return existing.external_id
+        if object_type == "person_scope" and _older_than_stored(existing, spec):
+            logger.info(
+                kv(
+                    event="sync_put",
+                    type=object_type,
+                    name=name,
+                    changed=False,
+                    reason="older_scope",
+                )
+            )
+            return existing.external_id or name
         handler = getattr(self, f"_put_{object_type}")
         external_id: str = handler(name, spec, existing)
         record = existing or ExtSyncObject(object_type=object_type, name=name)
@@ -797,13 +808,20 @@ class SyncService:
         if record is not None:
             record.status = "revoked"
 
-    def _put_person_scope(self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None) -> str:
+    def _put_person_scope(
+        self, name: str, spec: dict[str, Any], existing: ExtSyncObject | None
+    ) -> str:
         from adg_ext.disclosure import remember
 
         dimension = str(spec.get("dimensionId") or "")
         open_id = str(spec.get("openId") or "")
         values = [item for item in (spec.get("values") or []) if isinstance(item, str) and item]
-        if dimension and open_id and values:
+        tables = spec.get("tables")
+        if dimension and open_id and isinstance(tables, list) and tables:
+            from adg_ext.disclosure import remember_tables
+
+            remember_tables(dimension, open_id, tables, _scope_at(spec))
+        elif dimension and open_id and values:
             remember(dimension, open_id, values, _scope_at(spec))
         return name
 
@@ -812,7 +830,25 @@ class SyncService:
 
         spec = json.loads(existing.spec_json or "{}")
         if isinstance(spec, dict):
-            forget(str(spec.get("dimensionId") or ""), str(spec.get("openId") or ""), _scope_at(spec))
+            forget(
+                str(spec.get("dimensionId") or ""),
+                str(spec.get("openId") or ""),
+                _scope_at(spec),
+            )
+
+
+def _older_than_stored(existing: ExtSyncObject | None, spec: dict[str, Any]) -> bool:
+    """An older snapshot must not roll a per-table scope back into one shared list."""
+
+    if existing is None or not existing.spec_json:
+        return False
+    try:
+        current = json.loads(existing.spec_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(current, dict):
+        return False
+    return _scope_at(current) > _scope_at(spec)
 
 
 def _scope_at(spec: dict[str, Any]) -> int:
