@@ -13,7 +13,7 @@ from adg.control_plane.models.datasource import Datasource
 from adg.control_plane.models.governance import DatasourceTag, Tag
 from adg.control_plane.services.datasource_service import DatasourceService
 from adg.control_plane.services.metadata_scan_service import MetadataScanService
-from adg.runtime_cache import refresh_catalog, refresh_policies
+from adg.runtime_cache import refresh_catalog, refresh_datasources, refresh_policies
 from adg.shared.errors import NotFoundError, ValidationError
 
 router = APIRouter(prefix="/admin/datasources", tags=["admin"])
@@ -92,6 +92,7 @@ def create_datasource(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
     session.commit()
     session.refresh(datasource)
+    refresh_datasources(session)
     return _serialize_datasource(datasource)
 
 
@@ -139,6 +140,7 @@ def update_datasource(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
     session.commit()
     session.refresh(datasource)
+    refresh_datasources(session)
     return _serialize_datasource(
         datasource,
         _load_datasource_tags(session, [datasource.id]),
@@ -161,6 +163,7 @@ def delete_datasource(
     session.commit()
     refresh_policies(session)
     refresh_catalog(session, datasource_id)
+    refresh_datasources(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

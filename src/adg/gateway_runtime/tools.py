@@ -1,7 +1,7 @@
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import ColumnElement, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from adg.app.settings import get_settings
@@ -10,12 +10,14 @@ from adg.connectors.base import QueryResult
 from adg.connectors.errors import ConnectorDependencyError, ConnectorOperationError
 from adg.connectors.registry import ConnectorRegistry, get_connector_registry
 from adg.control_plane.models.datasource import Datasource
-from adg.control_plane.models.governance import ResourceTag, Tag
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg.masking.service import MaskingService
 from adg.policy.runtime import IdentityContext, RuntimePolicyService
 from adg.runtime_cache import (
+    access_rows,
+    load_datasource_directory,
     load_table_index,
+    load_tag_catalog,
     match_table_paths,
     resource_from_index,
     time_column_names,
@@ -62,24 +64,17 @@ class GatewayRuntimeService:
         visible_datasource_ids = {
             resource.datasource_id for resource in self._visible_resources(identity=identity)
         }
-        datasources = self._session.execute(
-            select(Datasource)
-            .where(
-                Datasource.status == "active",
-                Datasource.id.in_(visible_datasource_ids),
-            )
-            .order_by(Datasource.name)
-        ).scalars()
         response = {
             "datasources": [
                 {
-                    "id": datasource.id,
-                    "name": datasource.name,
-                    "type": datasource.type,
-                    "datasource_kind": datasource.datasource_kind,
-                    "description": datasource.description,
+                    "id": row["id"],
+                    "name": row["name"],
+                    "type": row["type"],
+                    "datasource_kind": row["datasource_kind"],
+                    "description": row.get("description"),
                 }
-                for datasource in datasources
+                for row in load_datasource_directory(self._session)
+                if row.get("id") in visible_datasource_ids and row.get("status") == "active"
             ]
         }
         self._record_discovery(identity, api_key_id, "list_datasources", None, [])
@@ -92,18 +87,16 @@ class GatewayRuntimeService:
         visible_resource_ids = {
             resource.id for resource in self._visible_resources(identity=identity)
         }
-        tags = self._session.execute(
-            select(Tag)
-            .join(ResourceTag, ResourceTag.tag_id == Tag.id)
-            .where(
-                ResourceTag.resource_id.in_(visible_resource_ids),
-            )
-            .order_by(Tag.name)
-        ).scalars()
+        catalog = load_tag_catalog(self._session)
+        bindings = catalog["by_resource"]
+        visible_tag_ids: set[str] = set()
+        for resource_id in visible_resource_ids:
+            visible_tag_ids.update(bindings.get(resource_id, []))
         response = {
             "tags": [
-                {"id": tag.id, "name": tag.name, "category": tag.category}
-                for tag in self._unique_tags(tags)
+                {"id": tag["id"], "name": tag["name"], "category": tag.get("category")}
+                for tag in catalog["tags"]
+                if tag.get("id") in visible_tag_ids
             ]
         }
         self._record_discovery(identity, api_key_id, "list_tags", None, [])
@@ -137,11 +130,18 @@ class GatewayRuntimeService:
         """Return policy-visible resources that have at least one requested tag."""
 
         self._session.flush()
-        tag_rows = self._session.execute(select(Tag).where(Tag.name.in_(tag_names))).scalars()
-        tag_ids = [tag.id for tag in tag_rows]
-        visible = self._visible_resources(identity=identity)
-        tagged = self._tagged_resource_ids(tag_ids)
-        resources = [resource for resource in visible if resource.id in tagged]
+        catalog = load_tag_catalog(self._session)
+        wanted = {tag["id"] for tag in catalog["tags"] if tag.get("name") in set(tag_names)}
+        tagged = {
+            resource_id
+            for resource_id, tag_ids in catalog["by_resource"].items()
+            if wanted.intersection(tag_ids)
+        }
+        resources = [
+            resource
+            for resource in self._visible_resources(identity=identity)
+            if resource.id in tagged
+        ]
         self._record_discovery(identity, api_key_id, "list_resources_by_tag", None, [])
         notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
         return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
@@ -562,28 +562,14 @@ class GatewayRuntimeService:
         identity: IdentityContext,
         datasource_id: str | None = None,
     ) -> list[Resource]:
-        """Load relational table/view resources and filter them through resource policies."""
+        """Tables and views the identity may read, taken from the hot catalog copies."""
 
-        conditions: list[ColumnElement[bool]] = [
-            Resource.kind.in_(["relational_table", "relational_view"]),
-            Resource.status == "active",
-        ]
-        if datasource_id is not None:
-            conditions.append(Resource.datasource_id == datasource_id)
-        resources = list(
-            self._session.execute(
-                select(Resource)
-                .join(Datasource, Datasource.id == Resource.datasource_id)
-                .where(Datasource.status == "active", *conditions)
-            ).scalars()
-        )
-        disabled_reasons = self._disabled_resource_reasons(resources)
-        candidates = [
-            resource for resource in resources if disabled_reasons.get(resource.id) is None
-        ]
+        tables, ancestors = access_rows(self._session, datasource_id)
+        candidates = [resource_from_index(row) for row in tables]
+        context = [resource_from_index(row) for row in ancestors]
         decisions = self._policy.check_resource_access_batch(
             identity=identity,
-            resources=candidates,
+            resources=[*candidates, *context],
             action="read",
         )
         return [
@@ -677,27 +663,6 @@ class GatewayRuntimeService:
         if resource is None:
             raise NotFoundError("Resource not found")
         return resource
-
-    def _tagged_resource_ids(self, tag_ids: list[str]) -> set[str]:
-        """Resource ids that carry one of ``tag_ids``. One query."""
-
-        if not tag_ids:
-            return set()
-        rows = self._session.execute(
-            select(ResourceTag.resource_id).where(ResourceTag.tag_id.in_(tag_ids))
-        ).scalars()
-        return set(rows)
-
-    def _unique_tags(self, tags: Any) -> list[Tag]:
-        """Preserve tag order while removing duplicates introduced by joins."""
-
-        seen: set[str] = set()
-        unique: list[Tag] = []
-        for tag in tags:
-            if tag.id not in seen:
-                seen.add(tag.id)
-                unique.append(tag)
-        return unique
 
     def _serialize_resource(self, resource: Resource, notes: NoteIndex) -> dict[str, Any]:
         """Shape a resource for MCP-style runtime responses.

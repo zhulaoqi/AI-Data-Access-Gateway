@@ -22,7 +22,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy
+from adg.control_plane.models.datasource import Datasource
+from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy, ResourceTag, Tag
 from adg.control_plane.models.resource import Resource, ResourceField
 from adg_ext.redis_share import get_client
 
@@ -111,6 +112,8 @@ def warm(session: Session) -> None:
     from adg_ext.context import refresh_role
 
     refresh_policies(session)
+    refresh_datasources(session)
+    refresh_tags(session)
     datasource_ids = list(session.execute(select(Datasource.id)).scalars())
     for datasource_id in datasource_ids:
         refresh_catalog(session, datasource_id)
@@ -297,6 +300,86 @@ def refresh_policies(session: Session) -> None:
     refresh("policies", load)
 
 
+def _query_datasources(session: Session) -> list[dict[str, Any]]:
+    rows = session.execute(
+        select(
+            Datasource.id,
+            Datasource.name,
+            Datasource.type,
+            Datasource.datasource_kind,
+            Datasource.description,
+            Datasource.status,
+        ).order_by(Datasource.name)
+    )
+    return [
+        {
+            "id": item.id,
+            "name": item.name,
+            "type": item.type,
+            "datasource_kind": item.datasource_kind,
+            "description": item.description,
+            "status": item.status,
+        }
+        for item in rows
+    ]
+
+
+def load_datasource_directory(session: Session) -> list[dict[str, Any]]:
+    """Every datasource the discovery tools may name. Refreshed when one is saved."""
+
+    raw = remember("datasources", lambda: _query_datasources(session))
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def refresh_datasources(session: Session) -> None:
+    """Reload the datasource directory after a committed datasource change."""
+
+    refresh("datasources", lambda: _query_datasources(session))
+
+
+def _query_tag_catalog(session: Session) -> dict[str, Any]:
+    tags = session.execute(select(Tag.id, Tag.name, Tag.category).order_by(Tag.name))
+    bindings = session.execute(select(ResourceTag.resource_id, ResourceTag.tag_id))
+    by_resource: dict[str, list[str]] = {}
+    for resource_id, tag_id in bindings:
+        by_resource.setdefault(str(resource_id), []).append(str(tag_id))
+    return {
+        "tags": [
+            {"id": item.id, "name": item.name, "category": item.category} for item in tags
+        ],
+        "by_resource": by_resource,
+    }
+
+
+def load_tag_catalog(session: Session) -> dict[str, Any]:
+    """Tags and the resources they label. Discovery and tag policies read this copy."""
+
+    raw = remember("tags", lambda: _query_tag_catalog(session))
+    if not isinstance(raw, dict):
+        return {"tags": [], "by_resource": {}}
+    tags = raw.get("tags")
+    by_resource = raw.get("by_resource")
+    return {
+        "tags": [row for row in tags if isinstance(row, dict)] if isinstance(tags, list) else [],
+        "by_resource": by_resource if isinstance(by_resource, dict) else {},
+    }
+
+
+def load_tag_bindings(session: Session) -> dict[str, list[str]]:
+    """Resource id to tag ids, from the same copy as :func:`load_tag_catalog`."""
+
+    bindings = load_tag_catalog(session)["by_resource"]
+    return bindings if isinstance(bindings, dict) else {}
+
+
+def refresh_tags(session: Session) -> None:
+    """Reload tags and their resource bindings after a committed label change."""
+
+    refresh("tags", lambda: _query_tag_catalog(session))
+
+
 def _query_table_index(session: Session, datasource_id: str) -> list[dict[str, Any]]:
     rows = session.execute(
         select(
@@ -306,6 +389,9 @@ def _query_table_index(session: Session, datasource_id: str) -> list[dict[str, A
             Resource.kind,
             Resource.name,
             Resource.path,
+            Resource.display_name,
+            Resource.description,
+            Resource.query_language,
             Resource.status,
         ).where(Resource.datasource_id == datasource_id)
     )
@@ -317,10 +403,53 @@ def _query_table_index(session: Session, datasource_id: str) -> list[dict[str, A
             "kind": item.kind,
             "name": item.name,
             "path": item.path,
+            "display_name": item.display_name,
+            "description": item.description,
+            "query_language": item.query_language,
             "status": item.status,
         }
         for item in rows
     ]
+
+
+def access_rows(
+    session: Session, datasource_id: str | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Active tables and views, plus ancestors, both taken from the hot copies.
+
+    The second list is only there so a policy on a schema resolves without reading
+    ``resources`` again. Callers return the first list after the policy check.
+    """
+
+    active = [
+        str(row["id"])
+        for row in load_datasource_directory(session)
+        if row.get("status") == "active" and row.get("id")
+    ]
+    if datasource_id is not None:
+        active = [datasource_id] if datasource_id in active else []
+    tables: list[dict[str, Any]] = []
+    extra: dict[str, dict[str, Any]] = {}
+    for current_id in active:
+        index = load_table_index(session, current_id)
+        by_id = {str(row["id"]): row for row in index if row.get("id")}
+        local = [
+            row
+            for row in index
+            if row.get("kind") in _TABLE_KINDS and not ancestor_disabled(row, by_id)
+        ]
+        tables.extend(local)
+        seen = {str(row["id"]) for row in local}
+        for row in local:
+            parent_id = row.get("parent_id")
+            while isinstance(parent_id, str) and parent_id not in seen:
+                parent = by_id.get(parent_id)
+                if parent is None:
+                    break
+                seen.add(parent_id)
+                extra[parent_id] = parent
+                parent_id = parent.get("parent_id")
+    return tables, list(extra.values())
 
 
 def load_table_index(session: Session, datasource_id: str) -> list[dict[str, Any]]:
@@ -379,6 +508,9 @@ def resource_from_index(row: dict[str, Any]) -> Resource:
     """Build a detached resource. Callers only read identity fields and must not flush it."""
 
     name = str(row.get("name") or "")
+    display_name = row.get("display_name")
+    description = row.get("description")
+    query_language = row.get("query_language")
     return Resource(
         id=str(row["id"]),
         datasource_id=str(row.get("datasource_id") or ""),
@@ -386,7 +518,9 @@ def resource_from_index(row: dict[str, Any]) -> Resource:
         kind=str(row.get("kind") or ""),
         name=name,
         path=str(row.get("path") or ""),
-        display_name=name,
+        display_name=str(display_name) if isinstance(display_name, str) and display_name else name,
+        description=description if isinstance(description, str) else None,
+        query_language=query_language if isinstance(query_language, str) else None,
         status=str(row.get("status") or "active"),
         metadata_json="{}",
         scanned_at=datetime.now(UTC),

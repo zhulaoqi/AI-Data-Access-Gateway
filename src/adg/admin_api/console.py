@@ -33,7 +33,12 @@ from adg.control_plane.models.resource import Resource, ResourceField
 from adg.control_plane.services.api_key_service import create_api_key as create_api_key_record
 from adg.control_plane.services.directory_service import DirectoryService
 from adg.mcp_api.runtime_tools import serialize_runtime_tool_definitions
-from adg.runtime_cache import refresh_catalog, refresh_field_policies, refresh_policies
+from adg.runtime_cache import (
+    refresh_catalog,
+    refresh_field_policies,
+    refresh_policies,
+    refresh_tags,
+)
 from adg_ext.config import ext_enabled
 
 router = APIRouter(prefix="/admin", tags=["admin-console"])
@@ -540,6 +545,7 @@ def create_tag(
     session.add(tag)
     session.commit()
     session.refresh(tag)
+    refresh_tags(session)
     return _serialize_tag(tag)
 
 
@@ -636,6 +642,7 @@ def update_tag(
     _apply_updates(tag, payload.model_dump(exclude_unset=True))
     session.commit()
     session.refresh(tag)
+    refresh_tags(session)
     return _serialize_tag(tag)
 
 
@@ -653,6 +660,7 @@ def delete_tag(
     if tag is not None:
         session.delete(tag)
     session.commit()
+    refresh_tags(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -677,6 +685,7 @@ def bind_resource_tag(
         session.add(binding)
         session.commit()
         session.refresh(binding)
+        refresh_tags(session)
     return {
         "id": binding.id,
         "tag_id": binding.tag_id,
@@ -700,6 +709,7 @@ def unbind_resource_tag(
         )
     )
     session.commit()
+    refresh_tags(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

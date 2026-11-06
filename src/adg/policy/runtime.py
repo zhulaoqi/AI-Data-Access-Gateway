@@ -5,9 +5,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from adg.control_plane.models.directory import Role, User, UserRole
-from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy, ResourceTag
+from adg.control_plane.models.governance import FieldPolicy, ResourcePolicy
 from adg.control_plane.models.resource import Resource
-from adg.runtime_cache import load_field_policies, load_policies
+from adg.runtime_cache import load_field_policies, load_policies, load_tag_bindings
 from adg_ext import hooks as ext_hooks
 
 
@@ -90,6 +90,7 @@ class RuntimePolicyService:
         self._session = session
         self._policy_groups: dict[str, list[ResourcePolicy]] | None = None
         self._field_policies: dict[str, list[FieldPolicy]] = {}
+        self._tag_bindings: dict[str, list[str]] | None = None
 
     def check_resource_access(
         self,
@@ -293,15 +294,7 @@ class RuntimePolicyService:
         if policy.datasource_id is not None:
             return policy.datasource_id == resource.datasource_id
         if policy.tag_id is not None:
-            return (
-                self._session.execute(
-                    select(ResourceTag).where(
-                        ResourceTag.resource_id == resource.id,
-                        ResourceTag.tag_id == policy.tag_id,
-                    )
-                ).scalar_one_or_none()
-                is not None
-            )
+            return policy.tag_id in self._tags_of(resource.id)
         return True
 
     def _subject_matches(
@@ -373,16 +366,7 @@ class RuntimePolicyService:
             if tag_ids_by_resource_id is not None:
                 resource_tag_ids = tag_ids_by_resource_id.get(resource.id, set())
                 return 1 if policy.tag_id in resource_tag_ids else None
-            matches = (
-                self._session.execute(
-                    select(ResourceTag).where(
-                        ResourceTag.resource_id == resource.id,
-                        ResourceTag.tag_id == policy.tag_id,
-                    )
-                ).scalar_one_or_none()
-                is not None
-            )
-            return 1 if matches else None
+            return 1 if policy.tag_id in self._tags_of(resource.id) else None
         return 0
 
     def _resource_scope_chains(self, resources: list[Resource]) -> dict[str, list[Resource]]:
@@ -431,23 +415,28 @@ class RuntimePolicyService:
     ) -> dict[str, set[str]]:
         """Load only policy-relevant tag bindings for many resources."""
 
-        policy_tag_ids = sorted({policy.tag_id for policy in policies if policy.tag_id is not None})
+        policy_tag_ids = {policy.tag_id for policy in policies if policy.tag_id is not None}
         if not resources or not policy_tag_ids:
             return {}
 
-        resource_ids = [resource.id for resource in resources]
-        rows = self._session.execute(
-            select(ResourceTag.resource_id, ResourceTag.tag_id).where(
-                ResourceTag.resource_id.in_(resource_ids),
-                ResourceTag.tag_id.in_(policy_tag_ids),
-            )
-        ).all()
-        tag_ids_by_resource_id: dict[str, set[str]] = {
-            resource_id: set() for resource_id in resource_ids
+        if self._tag_bindings is None:
+            self._tag_bindings = load_tag_bindings(self._session)
+        return {
+            resource.id: {
+                tag_id
+                for tag_id in self._tag_bindings.get(resource.id, [])
+                if tag_id in policy_tag_ids
+            }
+            for resource in resources
         }
-        for resource_id, tag_id in rows:
-            tag_ids_by_resource_id.setdefault(resource_id, set()).add(tag_id)
-        return tag_ids_by_resource_id
+
+    def _tags_of(self, resource_id: str) -> set[str]:
+        """Tag ids on one resource, from the hot copy loaded once per request."""
+
+        if self._tag_bindings is None:
+            self._tag_bindings = load_tag_bindings(self._session)
+        return set(self._tag_bindings.get(resource_id, []))
+
     def _resource_scope_chain(self, resource: Resource) -> list[Resource]:
         """Return one resource followed by its ancestors up to the datasource root."""
 

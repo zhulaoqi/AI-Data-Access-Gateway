@@ -16,7 +16,7 @@ from adg.app.dependencies import (
 from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.control_plane.db import get_session
-from adg.runtime_cache import refresh_catalog, refresh_policies
+from adg.runtime_cache import refresh_catalog, refresh_datasources, refresh_policies
 from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
 from adg_ext.config import get_ext_settings
@@ -80,6 +80,7 @@ def _warm_cache(
     if object_type != "datasource_account" or not external_id:
         return
     refresh_catalog(session, external_id)
+    refresh_datasources(session)
     if role_ids:
         refresh_policies(session)
         for role_id in role_ids:
@@ -169,6 +170,7 @@ def rescan_datasource(
         raise _fail(error) from error
     if datasource_id:
         refresh_catalog(session, datasource_id)
+        refresh_datasources(session)
     return {"status": "ok", **counts}
 
 

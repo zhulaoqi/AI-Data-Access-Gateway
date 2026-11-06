@@ -257,6 +257,74 @@ def test_list_datasources_includes_operator_description_for_agents(db_session: S
     ]
 
 
+def test_discovery_reads_hot_copies_after_they_are_refreshed(
+    db_session: Session, monkeypatch: MonkeyPatch
+) -> None:
+    """A refreshed catalog answers discovery without scanning resources or resource_tags."""
+
+    from tests.unit.policy.test_runtime_cache import _MemoryRedis
+
+    from adg.runtime_cache import (
+        refresh_datasources,
+        refresh_policies,
+        refresh_tables,
+        refresh_tags,
+    )
+
+    client = _MemoryRedis()
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+    add_datasource(db_session, description="finance warehouse")
+    resource = add_resource(db_session, resource_id="res_orders")
+    allow_resource_read(db_session, resource.id)
+    public = Tag(id="tag_public", name="public", category="exposure")
+    db_session.add(public)
+    db_session.add(ResourceTag(tag_id=public.id, resource_id=resource.id))
+    db_session.flush()
+    refresh_datasources(db_session)
+    refresh_tables(db_session, "ds_1")
+    refresh_policies(db_session)
+    refresh_tags(db_session)
+
+    engine = cast(Engine, db_session.get_bind())
+    scanned = 0
+
+    def count_catalog_scans(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        nonlocal scanned
+        lowered = statement.lower()
+        if "from resources" in lowered or "from resource_tags" in lowered:
+            scanned += 1
+
+    event.listen(engine, "before_cursor_execute", count_catalog_scans)
+    try:
+        datasources = runtime(db_session).list_datasources(identity=identity(), api_key_id="key_1")
+        tags = runtime(db_session).list_tags(identity=identity(), api_key_id="key_1")
+        by_tag = runtime(db_session).list_resources_by_tag(
+            identity=identity(), api_key_id="key_1", tag_names=["public"]
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_catalog_scans)
+
+    assert scanned == 0
+    assert datasources["datasources"] == [
+        {
+            "id": "ds_1",
+            "name": "Datasource ds_1",
+            "type": "fake",
+            "datasource_kind": "relational",
+            "description": "finance warehouse",
+        }
+    ]
+    assert tags["tags"] == [{"id": "tag_public", "name": "public", "category": "exposure"}]
+    assert [item["id"] for item in by_tag["resources"]] == ["res_orders"]
+
+
 def test_tags_only_include_accessible_resources(db_session: Session) -> None:
     add_datasource(db_session)
     allowed = add_resource(db_session, resource_id="res_allowed")
