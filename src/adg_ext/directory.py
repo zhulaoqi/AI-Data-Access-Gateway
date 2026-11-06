@@ -42,12 +42,45 @@ def lookup(email: str, redis_get: Callable[[str], str | None] | None = None) -> 
         "name": name,
         "header_name": "X-GW-Person",
         "header_value": open_id,
-        "reload_required": True,
+        "reload_required": False,
         "message": (
-            "把 header_value 写入 MCP 客户端配置的请求头 X-GW-Person，然后重新连接。"
-            "当前连接的请求头不会随这次结果改变，重连之前不要继续查数据。"
+            "这是通讯录 open_id。查数据时把同一个企业邮箱作为本次 preview_resource 或 "
+            "execute_query 的 email 参数。接入服务也可以把这个 open_id 放进请求头 X-GW-Person。"
+            "头里已有时，不要再传另一个人的 email。不要把 open_id 写进密钥或 MCP 配置。"
         ),
     }
+
+
+def resolve_caller(
+    header: object,
+    email: object,
+    redis_get: Callable[[str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Use the header open_id. An email on this call must resolve to that same person."""
+
+    who = header.strip() if isinstance(header, str) else ""
+    if email is None:
+        supplied = ""
+    elif not isinstance(email, str):
+        return _rejected("email_invalid", "需要完整的企业邮箱。")
+    else:
+        supplied = email.strip()
+    if not supplied:
+        return {"status": "ok", "open_id": who or None}
+    found = lookup(supplied, redis_get)
+    if found.get("status") != "ok":
+        return {"status": "rejected", "reason": found["reason"], "message": found["message"]}
+    open_id = found["open_id"]
+    if who and who != open_id:
+        return {
+            "status": "rejected",
+            "reason": "person_conflict",
+            "message": (
+                "请求头 X-GW-Person 和本次 email 查到的不是同一个人，"
+                "已拒绝查询，没有改成查整张表。"
+            ),
+        }
+    return {"status": "ok", "open_id": open_id}
 
 
 def _rejected(reason: str, message: str) -> dict[str, str]:

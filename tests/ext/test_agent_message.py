@@ -16,7 +16,8 @@ def test_codes_explain_the_next_step() -> None:
     hidden = explain_reason("column_not_allowed:salary")
     several = explain_reason("statement_not_allowed,wildcard_projection_not_allowed")
     prose = explain_reason("你还没有这项数据的查询权限。请联系数据负责人。")
-    assert "X-GW-Person" in missing
+    assert "X-GW-Person" in missing and "email" in missing
+    assert "同一个人" in explain_reason("person_conflict")
     assert "salary" in hidden and "没有开放的列" in hidden
     assert "；" in several and "SELECT *" in several
     assert prose.startswith("你还没有")

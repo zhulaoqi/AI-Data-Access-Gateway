@@ -287,6 +287,7 @@ async def preview_resource(
     ctx: McpContext,
     resource_id: str,
     limit: int = 20,
+    email: str = "",
 ) -> dict[str, Any]:
     """Preview rows from one resource with policy enforcement."""
 
@@ -297,6 +298,7 @@ async def preview_resource(
         {
             "resource_id": resource_id,
             "limit": limit,
+            "email": email,
         },
     )
 
@@ -311,6 +313,7 @@ async def execute_query(
     resource_ids: list[str],
     query: str,
     limit: int = 100,
+    email: str = "",
 ) -> dict[str, Any]:
     """Run one guarded read-only SQL query."""
 
@@ -323,5 +326,6 @@ async def execute_query(
             "resource_ids": resource_ids,
             "query": query,
             "limit": limit,
+            "email": email,
         },
     )

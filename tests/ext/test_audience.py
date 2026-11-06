@@ -1,4 +1,4 @@
-from adg_ext.audience import audience_message, audience_reason
+from adg_ext.audience import audience_message, audience_reason, query_identity_message
 
 
 def test_unrestricted_when_the_grant_has_no_list() -> None:
@@ -20,6 +20,9 @@ def test_rejection_explains_why_instead_of_only_hiding_the_catalog() -> None:
     assert "X-GW-Person" in missing and "没有返回库表" in missing
     assert "可见名单" in absent and "没有返回库表" in absent
     assert missing != absent
+    query = query_identity_message("person_required")
+    assert "email" in query and "没有返回库表" in query
+    assert query != missing
 
 
 def test_empty_or_broken_list_rejects_everyone() -> None:

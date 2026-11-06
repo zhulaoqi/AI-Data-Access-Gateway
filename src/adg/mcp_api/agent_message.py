@@ -13,8 +13,13 @@ from adg_ext.audience import audience_message
 
 _TEXT = {
     "person_required": (
-        "这份数据权限开了动态权限。请求没有带 X-GW-Person，网关不知道现在是谁，"
-        "已拒绝查询，没有改成查整张表。请在 MCP 连接的请求头里写上通讯录 open_id。"
+        "这份数据权限开了动态权限。请求头 X-GW-Person 和本次调用的 email 都没有，"
+        "网关不知道现在是谁，已拒绝查询，没有改成查整张表。"
+        "接入服务请在请求头写通讯录 open_id。"
+        "模型请在本次调用传入当前这个人的企业邮箱，不要猜测。"
+    ),
+    "person_conflict": (
+        "请求头 X-GW-Person 和本次 email 查到的不是同一个人，已拒绝查询，没有改成查整张表。"
     ),
     "person_not_entitled": audience_message("person_not_entitled"),
     "disclosure_conflict": "这条授权同时开了多份动态权限，网关无法决定按哪一份过滤，已拒绝查询。",

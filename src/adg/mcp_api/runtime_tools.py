@@ -41,25 +41,40 @@ RUNTIME_TOOL_DEFINITIONS = [
     ),
     RuntimeToolDefinition(
         name="preview_resource",
-        description="Preview rows from one resource with policy and masking enforcement.",
+        description=(
+            "预览一张表的行，并按数据权限和脱敏执行。"
+            "一把密钥给很多人用，网关不记得上次是谁。"
+            "请求头已有 X-GW-Person 时不要传 email。"
+            "没有这个头时，把当前这个人自己给出的企业邮箱作为本次 email 传入。"
+            "网关把它换成通讯录 open_id 后再套行权限。"
+            "不要猜测邮箱，不要把 open_id 写进密钥或 MCP 配置。"
+        ),
     ),
     RuntimeToolDefinition(
         name="execute_query",
-        description="Run one read-only SQL query scoped to declared resources.",
+        description=(
+            "对已声明的表执行一条只读 SQL。"
+            "一把密钥给很多人用，网关不记得上次是谁。"
+            "请求头已有 X-GW-Person 时不要传 email。"
+            "没有这个头时，把当前这个人自己给出的企业邮箱作为本次 email 传入。"
+            "网关把它换成通讯录 open_id 后再套行权限。"
+            "不要猜测邮箱，不要把 open_id 写进密钥或 MCP 配置。"
+        ),
     ),
     RuntimeToolDefinition(
         name="resolve_person",
         description=(
-            "用调用者自己的企业邮箱，查出他在本网关通讯录里的 open_id。"
-            "这个值只能由用户写进 MCP 客户端配置的请求头 X-GW-Person，然后重新连接。"
-            "本工具的返回值不会改变当前连接已经带上的请求头，也不能当作其他工具的参数。"
+            "用企业邮箱查出通讯录 open_id。查行不必先调这个工具，"
+            "preview_resource 和 execute_query 可以直接传 email。"
+            "本工具只返回 open_id，不改变当前连接，也不把人记在密钥上。"
+            "接入服务要把 open_id 放进请求头 X-GW-Person 时，用这里返回的值。"
             "只接受用户明确给出的完整企业邮箱，不要猜测、补全或改查别人的邮箱。"
-            "查到之后，把 open_id 原样告诉用户，请他写入 headers.X-GW-Person 并重连；"
-            "在他重连之前，不要继续查数据。"
             "不同飞书应用的 open_id 不同。这里返回的是本网关通讯录里的那个。"
         ),
     ),
 ]
+
+_QUERY_TOOLS = frozenset({"preview_resource", "execute_query"})
 
 FORBIDDEN_RUNTIME_IDENTITY_FIELDS = frozenset({"user_id", "roles", "groups"})
 
@@ -97,12 +112,30 @@ def dispatch_runtime_tool_call(
             email=str(payload.get("email") or ""),
         )
 
-    person = (disclosure_headers or {}).get("person") if disclosure_headers else None
-    blocked = runtime.audience_block(runtime_identity, person)
-    if blocked:
-        from adg_ext.audience import audience_message
+    headers = dict(disclosure_headers or {})
+    if tool_name in _QUERY_TOOLS:
+        from adg_ext.directory import resolve_caller
 
-        return {"status": "rejected", "reason": blocked, "message": audience_message(blocked)}
+        resolved = resolve_caller(headers.get("person"), payload.get("email"))
+        if resolved.get("status") != "ok":
+            return {
+                "status": "rejected",
+                "reason": resolved["reason"],
+                "message": resolved["message"],
+            }
+        headers["person"] = resolved.get("open_id")
+
+    person = headers.get("person")
+    blocked = runtime.audience_block(runtime_identity, person if isinstance(person, str) else None)
+    if blocked:
+        from adg_ext.audience import audience_message, query_identity_message
+
+        message = (
+            query_identity_message(blocked)
+            if tool_name in _QUERY_TOOLS and blocked == "person_required"
+            else audience_message(blocked)
+        )
+        return {"status": "rejected", "reason": blocked, "message": message}
 
     if tool_name == "list_datasources":
         return runtime.list_datasources(identity=runtime_identity, api_key_id=api_key_id)
@@ -124,7 +157,7 @@ def dispatch_runtime_tool_call(
             api_key_id=api_key_id,
             resource_id=str(payload["resource_id"]),
             limit=int(payload.get("limit", 20)),
-            disclosure_headers=disclosure_headers,
+            disclosure_headers=headers,
         )
     if tool_name == "execute_query":
         return runtime.execute_query(
@@ -134,6 +167,6 @@ def dispatch_runtime_tool_call(
             resource_ids=[str(item) for item in payload.get("resource_ids", [])],
             query=str(payload["query"]),
             limit=int(payload.get("limit", 100)),
-            disclosure_headers=disclosure_headers,
+            disclosure_headers=headers,
         )
     raise KeyError(tool_name)
