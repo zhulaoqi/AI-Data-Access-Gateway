@@ -121,10 +121,10 @@ def bind(
 
     if not disclosure or not disclosure.get("dimensionId"):
         return None
+    if channel == "jdbc":
+        return None
     if disclosure.get("conflict"):
         return "disclosure_conflict"
-    if channel == "jdbc":
-        return "disclosure_not_supported_on_jdbc"
     source = str(disclosure.get("source") or "manual")
     columns = disclosure.get("columns") or []
     if not isinstance(columns, list):

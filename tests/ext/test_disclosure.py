@@ -69,15 +69,24 @@ def test_bind_replaces_an_empty_row_filter_and_keeps_jdbc_closed() -> None:
     assert view.filters[0] is not None
     assert view.filters[0].where == "`creator_id` IN ({{gw_disclosure_values}})"
 
+    jdbc_view = _view()
+    jdbc_calls = {"n": 0}
+
+    def jdbc_lookup(_d: str, _p: str) -> list[str]:
+        jdbc_calls["n"] += 1
+        return ["10086"]
+
     jdbc = bind(
         {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
-        [_view()],
+        [jdbc_view],
         {},
         channel="jdbc",
         headers=None,
-        lookup=lambda _d, _p: ["10086"],
+        lookup=jdbc_lookup,
     )
-    assert jdbc == "disclosure_not_supported_on_jdbc"
+    assert jdbc is None
+    assert jdbc_calls["n"] == 0
+    assert jdbc_view.filters == [None]
 
 
 def test_bind_quotes_spaces_and_non_ascii_and_rejects_breakout() -> None:

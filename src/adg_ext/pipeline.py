@@ -396,15 +396,12 @@ def run(
             out["hint"] = hint
         return out
 
-    if ctx.disclosure:
+    # JDBC 不读人员、不查取值、不拼按人条件。渠道在委托请求里就是 jdbc。
+    jdbc = audit_meta.get("channel") == "jdbc"
+    if ctx.disclosure and not jdbc:
         if ctx.disclosure.get("conflict"):
             _note_disclosure(ctx, audit_meta, disclosure_headers, "disclosure_conflict", None)
             return reject("permission_rejected", "disclosure_conflict")
-        if audit_meta.get("channel") == "jdbc":
-            _note_disclosure(
-                ctx, audit_meta, disclosure_headers, "disclosure_not_supported_on_jdbc", None
-            )
-            return reject("permission_rejected", "disclosure_not_supported_on_jdbc")
     if limit < 1:
         return reject("sql_rejected", "runtime_limit_invalid")
     if limit > settings.runtime_query_max_limit:
@@ -464,7 +461,7 @@ def run(
         return reject("permission_rejected", f"field_disabled:{disabled_field}")
 
     views, _ = build_views(svc, ctx, actual)
-    if ctx.disclosure:
+    if ctx.disclosure and not jdbc:
         from adg_ext.disclosure import bind as bind_disclosure
 
         reason = bind_disclosure(
