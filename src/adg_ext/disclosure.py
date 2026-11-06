@@ -61,6 +61,10 @@ def forget(dimension_id: str, open_id: str) -> None:
         return
 
 
+def _unbound_policy(disclosure: dict[str, Any] | None) -> str:
+    return "allow" if (disclosure or {}).get("unbound") == "allow" else "deny"
+
+
 def trace(
     disclosure: dict[str, Any] | None,
     headers: dict[str, str | None] | None,
@@ -80,6 +84,7 @@ def trace(
     return {
         "dimension": str((disclosure or {}).get("dimensionId") or "-"),
         "source": str((disclosure or {}).get("source") or "-"),
+        "unbound": _unbound_policy(disclosure) if disclosure and disclosure.get("dimensionId") else "-",
         "channel": channel or "-",
         "person": person or "-",
         "scope": "yes" if scope else "no",
@@ -109,8 +114,17 @@ def bind(
         return "disclosure_not_supported_on_jdbc"
     source = str(disclosure.get("source") or "manual")
     columns = disclosure.get("columns") or []
-    if not isinstance(columns, list) or not columns:
+    if not isinstance(columns, list):
+        columns = []
+    policy = _unbound_policy(disclosure)
+    bound = _bindings(columns)
+    missing = [view for view in views if _column_for(view, bound) is None]
+    skipped = {id(view) for view in missing}
+    covered = [view for view in views if id(view) not in skipped]
+    if missing and policy != "allow":
         return "disclosure_column_missing"
+    if not covered:
+        return None if policy == "allow" else "disclosure_column_missing"
     if source == "external":
         values, reason = parse_external(headers or {}, str(disclosure["dimensionId"]))
         if reason:
@@ -131,8 +145,7 @@ def bind(
         return "disclosure_param_conflict"
     spec = ParamSpec(PARAM, "string_list", True, MAX_VALUES)
     clause = None
-    bound = _bindings(columns)
-    for view in views:
+    for view in covered:
         if not view.restricted:
             continue
         column = _column_for(view, bound)

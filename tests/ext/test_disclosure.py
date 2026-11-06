@@ -198,3 +198,57 @@ def test_trace_shows_a_missing_person_and_a_spliced_sample() -> None:
     assert spliced["attached"] == "yes"
     assert spliced["values"] == 6
     assert spliced["sample"] == "10086,10087,10088,10089,10090,+1"
+
+
+def test_unbound_tables_follow_the_saved_choice() -> None:
+    bound = {"database": "shop", "table": "orders", "column": "creator_id"}
+    customers = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    denied = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "deny", "columns": [bound]},
+        [_view(), customers],
+        {},
+        channel="mcp",
+        headers=None,
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert denied == "disclosure_column_missing"
+
+    orders = _view()
+    left_open = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    params: dict[str, object] = {}
+    allowed = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+        [orders, left_open],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert allowed is None
+    assert params["gw_disclosure_values"] == ["10086"]
+    assert orders.filters[0] is not None
+    assert left_open.filters == [None]
+
+    only_open = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    assert (
+        bind(
+            {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+            [only_open],
+            {},
+            channel="mcp",
+            headers=None,
+            lookup=lambda _d, _p: None,
+        )
+        is None
+    )
+    assert only_open.filters == [None]
+
+    still_closed = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+        [_view()],
+        {},
+        channel="mcp",
+        headers=None,
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert still_closed == "person_required"
