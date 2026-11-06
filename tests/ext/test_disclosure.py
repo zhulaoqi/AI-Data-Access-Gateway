@@ -1,5 +1,5 @@
 from adg_ext.analyze import TableView
-from adg_ext.disclosure import bind, parse_external, resolve_values, trace
+from adg_ext.disclosure import bind, forget, parse_external, remember, resolve_values, trace
 from adg_ext.rowfilter import compile_template, render
 
 
@@ -153,6 +153,24 @@ def test_comma_separated_values_become_separate_sql_literals() -> None:
     )
     assert external_reason is None
     assert external == ["10086", "10087"]
+
+
+def test_an_older_scope_does_not_replace_a_newer_one() -> None:
+    remember("dim_rev", "ou_1", ["new"], 20)
+    remember("dim_rev", "ou_1", ["old"], 10)
+    assert resolve_values("dim_rev", "ou_1", redis_get=lambda _key: None, local_get=lambda: ["local"]) == ["new"]
+
+
+def test_an_older_revoke_does_not_drop_a_newer_value() -> None:
+    remember("dim_rev", "ou_2", ["new"], 20)
+    forget("dim_rev", "ou_2", 10)
+    assert resolve_values("dim_rev", "ou_2", redis_get=lambda _key: None, local_get=lambda: ["local"]) == ["new"]
+
+
+def test_a_revoke_does_not_fall_back_to_the_local_snapshot() -> None:
+    remember("dim_rev", "ou_3", ["old"], 10)
+    forget("dim_rev", "ou_3", 20)
+    assert resolve_values("dim_rev", "ou_3", redis_get=lambda _key: None, local_get=lambda: ["old"]) is None
 
 
 def test_pending_marker_does_not_fall_back_to_a_stale_local_copy() -> None:

@@ -21,6 +21,21 @@ MAX_PERSON = 128
 
 _lock = threading.Lock()
 _memory: dict[tuple[str, str], tuple[float, list[str]]] = {}
+_revision: dict[tuple[str, str], int] = {}
+# Same rule as the control plane: a write lands only when its updated_at is not older.
+_CAS = """
+local cur = redis.call('GET', KEYS[1])
+local newAt = tonumber(ARGV[2])
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  local seen = ok and type(obj) == 'table' and tonumber(obj.at)
+  if seen and tonumber(obj.at) > newAt then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
 
 _NOT_ENTITLED = (
     "你还没有这项数据的查询权限。请联系数据负责人{names}，为你开通网关数据权限，"
@@ -36,29 +51,27 @@ def sync_name(dimension_id: str, open_id: str) -> str:
     return f"gw:ps:{dimension_id}:{open_id}"
 
 
-def remember(dimension_id: str, open_id: str, values: list[str]) -> None:
+def remember(dimension_id: str, open_id: str, values: list[str], at: int = 0) -> None:
     """Called when a scope is synced. Warms memory and Redis off the query path."""
 
+    body = {"v": 1, "at": int(at), "values": values}
+    if not _publish(dimension_id, open_id, body, int(at)):
+        return
+    if not _claim(dimension_id, open_id, int(at)):
+        return
     _store(dimension_id, open_id, values)
-    client = _redis()
-    if client is None:
-        return
-    try:
-        client.set(redis_key(dimension_id, open_id), json.dumps({"v": 1, "values": values}, ensure_ascii=False))
-    except Exception:
-        return
 
 
-def forget(dimension_id: str, open_id: str) -> None:
+def forget(dimension_id: str, open_id: str, at: int = 0) -> None:
+    """Leave a pending marker. Deleting the key would make a query fall back to a stale snapshot."""
+
+    body = {"v": 1, "at": int(at), "pending": True}
+    if not _publish(dimension_id, open_id, body, int(at)):
+        return
+    if not _claim(dimension_id, open_id, int(at)):
+        return
     with _lock:
         _memory.pop((dimension_id, open_id), None)
-    client = _redis()
-    if client is None:
-        return
-    try:
-        client.delete(redis_key(dimension_id, open_id))
-    except Exception:
-        return
 
 
 def _unbound_policy(disclosure: dict[str, Any] | None) -> str:
@@ -188,15 +201,22 @@ def resolve_values(
         except Exception:
             failed = True
     if not failed and raw:
+        revised = _payload_at(raw)
+        if _newer_known(dimension_id, open_id, revised):
+            return _read(dimension_id, open_id, clock)
         parsed = _payload(raw)
-        if parsed is not None:
-            _store(dimension_id, open_id, parsed, clock)
-            return parsed
-        return None
-    if local_get is None:
+        _claim(dimension_id, open_id, revised)
+        if parsed is None:
+            with _lock:
+                _memory.pop((dimension_id, open_id), None)
+            return None
+        _store(dimension_id, open_id, parsed, clock)
+        return parsed
+    if local_get is None or _newer_known(dimension_id, open_id, 0):
         return None
     local = local_get()
     if local:
+        _claim(dimension_id, open_id, 0)
         _store(dimension_id, open_id, local, clock)
         return local
     return None
@@ -267,6 +287,48 @@ def _friendly(disclosure: dict[str, Any]) -> str:
         if clean:
             label = "（" + "、".join(clean) + "）"
     return _NOT_ENTITLED.format(names=label)
+
+
+def _payload_at(raw: str) -> int:
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(body, dict):
+        return 0
+    try:
+        return int(body.get("at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _publish(dimension_id: str, open_id: str, body: dict[str, Any], at: int) -> bool:
+    """False when Redis already holds a newer value, so memory is left alone."""
+
+    client = _redis()
+    if client is None:
+        return True
+    try:
+        payload = json.dumps(body, ensure_ascii=False)
+        written = client.eval(_CAS, 1, redis_key(dimension_id, open_id), payload, str(at))
+    except Exception:
+        return False
+    return int(written or 0) == 1
+
+
+def _claim(dimension_id: str, open_id: str, at: int) -> bool:
+    with _lock:
+        prev = _revision.get((dimension_id, open_id))
+        if prev is not None and prev > at:
+            return False
+        _revision[(dimension_id, open_id)] = at
+        return True
+
+
+def _newer_known(dimension_id: str, open_id: str, at: int) -> bool:
+    with _lock:
+        prev = _revision.get((dimension_id, open_id))
+    return prev is not None and prev > at
 
 
 def _payload(raw: str) -> list[str] | None:

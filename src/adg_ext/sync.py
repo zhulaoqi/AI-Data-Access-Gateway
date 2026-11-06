@@ -804,7 +804,7 @@ class SyncService:
         open_id = str(spec.get("openId") or "")
         values = [item for item in (spec.get("values") or []) if isinstance(item, str) and item]
         if dimension and open_id and values:
-            remember(dimension, open_id, values)
+            remember(dimension, open_id, values, _scope_at(spec))
         return name
 
     def _delete_person_scope(self, name: str, existing: ExtSyncObject) -> None:
@@ -812,4 +812,11 @@ class SyncService:
 
         spec = json.loads(existing.spec_json or "{}")
         if isinstance(spec, dict):
-            forget(str(spec.get("dimensionId") or ""), str(spec.get("openId") or ""))
+            forget(str(spec.get("dimensionId") or ""), str(spec.get("openId") or ""), _scope_at(spec))
+
+
+def _scope_at(spec: dict[str, Any]) -> int:
+    try:
+        return int(spec.get("updatedAt") or 0)
+    except (TypeError, ValueError):
+        return 0
