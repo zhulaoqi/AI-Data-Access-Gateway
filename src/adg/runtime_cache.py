@@ -98,41 +98,6 @@ def refresh(key: str, load: Callable[[], Any]) -> None:
         _drop(key, version)
 
 
-def warm(session: Session) -> None:
-    """Load every hot key from the database before the process accepts queries.
-
-    Permission sync refreshes the keys it changes. This covers a restart or an empty
-    Redis, so the first query does not wait on a cold read of the whole catalog.
-    """
-
-    if get_client() is None:
-        return
-    from adg.control_plane.models.datasource import Datasource
-    from adg.control_plane.models.directory import Role
-    from adg_ext.context import refresh_role
-
-    refresh_policies(session)
-    refresh_datasources(session)
-    refresh_tags(session)
-    datasource_ids = list(session.execute(select(Datasource.id)).scalars())
-    for datasource_id in datasource_ids:
-        refresh_catalog(session, datasource_id)
-    role_ids = list(session.execute(select(Role.id)).scalars())
-    for role_id in role_ids:
-        refresh_role(session, role_id)
-    resource_ids = list(
-        session.execute(select(FieldPolicy.resource_id).distinct()).scalars()
-    )
-    for resource_id in resource_ids:
-        refresh_field_policies(session, resource_id)
-    logger.info(
-        "event=hot_cache_warmed datasources=%s roles=%s field_resources=%s",
-        len(datasource_ids),
-        len(role_ids),
-        len(resource_ids),
-    )
-
-
 def _data_key(key: str) -> str:
     return PREFIX + key
 
