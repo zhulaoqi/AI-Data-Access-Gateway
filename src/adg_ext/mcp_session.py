@@ -8,6 +8,12 @@ transport still handles the JSON-RPC call: the server runs in the SDK's
 stateless mode, which starts the protocol as already initialized, and the
 response keeps the original session id.
 
+The borrowed transport answers the POST with one JSON body. An SSE response
+on that transport has no listener: the client's listen stream, when it still
+exists, is on the replica that created the session. The POST then stays open
+until the proxy cuts it. A GET for a session this process does not own is
+refused, so a misrouted listen stream does not pin a server task.
+
 Without ``redis.host`` nothing is stored and the SDK behavior is unchanged.
 """
 
@@ -78,11 +84,16 @@ async def dispatch(
     if session_id and not local_owner:
         state = get_share().read_mcp_session(session_id)
         if state == MCP_HIT:
-            await serve_shared_session(manager, scope, receive, send, session_id)
+            if method == "GET":
+                await _listen_elsewhere(scope, receive, send)
+                get_share().save_mcp_session(session_id)
+                return
             if method == "DELETE":
                 get_share().clear_mcp_session(session_id)
-            else:
-                get_share().save_mcp_session(session_id)
+                await _no_content(scope, receive, send)
+                return
+            await serve_shared_session(manager, scope, receive, send, session_id)
+            get_share().save_mcp_session(session_id)
             return
         if state == MCP_UNAVAILABLE:
             response = JSONResponse(
@@ -110,7 +121,9 @@ async def serve_shared_session(
 
     A fresh transport carries the shared session id, so the client keeps using
     it. ``stateless=True`` marks the protocol initialized: the client already
-    completed ``initialize`` on whichever replica received it.
+    completed ``initialize`` on whichever replica received it. JSON is forced
+    on: this transport is discarded after the call, so the result has to be
+    the POST body.
     """
 
     task_group = manager._task_group
@@ -118,7 +131,7 @@ async def serve_shared_session(
         raise RuntimeError("MCP session manager is not running")
     transport = StreamableHTTPServerTransport(
         mcp_session_id=session_id,
-        is_json_response_enabled=bool(manager.json_response),
+        is_json_response_enabled=True,
         event_store=None,
         security_settings=manager.security_settings,
     )
@@ -145,6 +158,26 @@ async def serve_shared_session(
         await transport.handle_request(scope, receive, send)
     finally:
         await transport.terminate()
+
+
+async def _listen_elsewhere(scope: Scope, receive: Receive, send: Send) -> None:
+    """Refuse a listen stream this process cannot feed.
+
+    Tool results for a borrowed session are written on the POST. Holding an
+    SSE GET open here would keep ``app.run`` alive until the client leaves.
+    """
+
+    response = JSONResponse(
+        status_code=405,
+        content={"detail": "Method Not Allowed"},
+        headers={"Allow": "POST, DELETE"},
+    )
+    await response(scope, receive, send)
+
+
+async def _no_content(scope: Scope, receive: Receive, send: Send) -> None:
+    response = JSONResponse(status_code=200, content=None)
+    await response(scope, receive, send)
 
 
 def _session_id(scope: Scope) -> str | None:
