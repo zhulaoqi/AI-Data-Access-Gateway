@@ -22,6 +22,7 @@ _TEXT = {
         "请求头 X-GW-Person 和本次 email 查到的不是同一个人，已拒绝查询，没有改成查整张表。"
     ),
     "person_not_entitled": audience_message("person_not_entitled"),
+    "person_not_in_directory": audience_message("person_not_in_directory"),
     "disclosure_conflict": "这条授权同时开了多份动态权限，网关无法决定按哪一份过滤，已拒绝查询。",
     "disclosure_column_missing": (
         "这次查询碰到的表里有还没绑定披露列的表。按当前策略整次拒绝，不会改成查整张表。"

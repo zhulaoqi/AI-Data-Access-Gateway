@@ -32,6 +32,23 @@ def test_lookup_rejects_missing_ambiguous_and_invalid_email() -> None:
     assert lookup("not-an-email", store.get)["reason"] == "email_invalid"
 
 
+def test_membership_reads_the_open_id_index() -> None:
+    from adg_ext.directory import membership
+
+    store = {"gw:directory:openid:ou_a": '{"status":"active"}'}
+
+    assert membership("ou_a", store.get) == "active"
+    assert membership("ou_b", store.get) == "missing"
+    assert membership("not an id", store.get) == "missing"
+
+
+def test_sync_keeps_directory_audience() -> None:
+    from adg_ext.sync import _audience_json
+
+    assert _audience_json({"audience": {"mode": "directory"}}) == '{"mode":"directory"}'
+    assert _audience_json({"audience": {"mode": "all"}}) is None
+
+
 def test_lookup_reports_cache_outage_separately() -> None:
     def broken(_key: str) -> str | None:
         raise RuntimeError("down")

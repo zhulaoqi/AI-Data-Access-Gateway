@@ -1,12 +1,15 @@
-"""Directory email index. The query path reads Redis only, never the management database."""
+"""Directory cache. The query path reads Redis only, never the management database."""
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
 EMAIL_PREFIX = "gw:directory:email:"
+OPEN_ID_PREFIX = "gw:directory:openid:"
+_OPEN_ID = re.compile(r"[A-Za-z0-9_.:@-]{1,128}")
 
 
 def normalize(email: str | None) -> str | None:
@@ -81,6 +84,25 @@ def resolve_caller(
             ),
         }
     return {"status": "ok", "open_id": open_id}
+
+
+def membership(
+    open_id: str | None,
+    redis_get: Callable[[str], str | None] | None = None,
+) -> str:
+    """``active``, ``missing``, or ``unavailable`` when the cache cannot be read."""
+
+    who = (open_id or "").strip()
+    if not _OPEN_ID.fullmatch(who):
+        return "missing"
+    getter = redis_get or _redis_get
+    try:
+        raw = getter(OPEN_ID_PREFIX + who)
+    except Exception:
+        return "unavailable"
+    if _object(raw).get("status") == "active":
+        return "active"
+    return "missing"
 
 
 def _rejected(reason: str, message: str) -> dict[str, str]:

@@ -868,10 +868,14 @@ class SyncService:
 
 
 def _audience_json(spec: dict[str, Any]) -> str | None:
-    """Store a listed audience. Any other shape clears it."""
+    """Store listed or directory audience. Any other shape clears it."""
 
     audience = spec.get("audience")
-    if not isinstance(audience, dict) or audience.get("mode") != "listed":
+    if not isinstance(audience, dict):
+        return None
+    if audience.get("mode") == "directory":
+        return json.dumps({"mode": "directory"}, separators=(",", ":"))
+    if audience.get("mode") != "listed":
         return None
     raw = audience.get("openIds")
     ids = [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []

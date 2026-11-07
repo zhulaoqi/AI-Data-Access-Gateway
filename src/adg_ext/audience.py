@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
-
 
 _MESSAGES = {
     "person_required": (
@@ -15,6 +15,10 @@ _MESSAGES = {
         "这次请求标明的这个人不在这条授权的可见名单里，所以没有返回库表。"
         "请让签发人把该 open_id 加入授权可见性，或换成名单上的人。"
     ),
+    "person_not_in_directory": (
+        "这次请求标明的这个人不在通讯录在职人员里，所以没有返回库表。"
+    ),
+    "directory_unavailable": "通讯录缓存暂时不可用，请稍后再试。",
 }
 
 _QUERY_PERSON_REQUIRED = (
@@ -39,7 +43,11 @@ def query_identity_message(reason: str) -> str:
     return audience_message(reason)
 
 
-def audience_reason(raw: str | None, person: str | None) -> str | None:
+def audience_reason(
+    raw: str | None,
+    person: str | None,
+    redis_get: Callable[[str], str | None] | None = None,
+) -> str | None:
     """None means this grant does not restrict who may call MCP."""
 
     if raw is None or raw == "":
@@ -48,7 +56,11 @@ def audience_reason(raw: str | None, person: str | None) -> str | None:
         body: Any = json.loads(raw)
     except json.JSONDecodeError:
         return "person_not_entitled"
-    if not isinstance(body, dict) or body.get("mode") != "listed":
+    if not isinstance(body, dict):
+        return "person_not_entitled"
+    if body.get("mode") == "directory":
+        return _directory(person, redis_get)
+    if body.get("mode") != "listed":
         return "person_not_entitled"
     values = body.get("openIds")
     allowed = (
@@ -59,4 +71,18 @@ def audience_reason(raw: str | None, person: str | None) -> str | None:
         return "person_required"
     if who not in allowed:
         return "person_not_entitled"
+    return None
+
+
+def _directory(person: str | None, redis_get: Callable[[str], str | None] | None) -> str | None:
+    who = (person or "").strip()
+    if not who:
+        return "person_required"
+    from adg_ext.directory import membership
+
+    state = membership(who, redis_get)
+    if state == "unavailable":
+        return "directory_unavailable"
+    if state != "active":
+        return "person_not_in_directory"
     return None
