@@ -74,6 +74,18 @@ return 1
 """
 
 
+def read_cached(key: str) -> Any | None:
+    """Return the stored copy, or ``None`` when there is nothing to patch.
+
+    Unlike :func:`remember`, a miss does not load from the database.
+    """
+
+    found = _read(key)
+    if found is _MISS:
+        return None
+    return found
+
+
 def remember(key: str, load: Callable[[], Any]) -> Any:
     """Return the cached JSON value, or load it and store the copy if still absent."""
 
@@ -312,8 +324,12 @@ def load_visible(
     return stored
 
 
-def refresh_policies(session: Session) -> None:
-    """Reload active resource policies after a committed policy change."""
+def refresh_policies(session: Session, *, visibility: bool = True) -> None:
+    """Reload active resource policies after a committed policy change.
+
+    ``visibility=False`` leaves discovery snapshots alone. Sync passes that and then
+    refreshes only the datasource it just wrote, instead of every user's full catalog.
+    """
 
     def load() -> dict[str, list[dict[str, Any]]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -325,7 +341,8 @@ def refresh_policies(session: Session) -> None:
         return grouped
 
     refresh("policies", load)
-    _refresh_visibility(session)
+    if visibility:
+        _refresh_visibility(session)
 
 
 def _query_datasources(session: Session) -> list[dict[str, Any]]:
@@ -361,11 +378,16 @@ def load_datasource_directory(session: Session) -> list[dict[str, Any]]:
     return [row for row in raw if isinstance(row, dict)]
 
 
-def refresh_datasources(session: Session) -> None:
-    """Reload the datasource directory after a committed datasource change."""
+def refresh_datasources(session: Session, *, visibility: bool = True) -> None:
+    """Reload the datasource directory after a committed datasource change.
+
+    Sync has already patched the one datasource's discovery snapshot, so it passes
+    ``visibility=False`` and does not walk every other database.
+    """
 
     refresh("datasources", lambda: _query_datasources(session))
-    _refresh_visibility(session)
+    if visibility:
+        _refresh_visibility(session)
 
 
 def _query_tag_catalog(session: Session) -> dict[str, Any]:
@@ -663,11 +685,13 @@ def refresh_field_policies(session: Session, resource_id: str) -> None:
 
 
 def refresh_catalog(session: Session, datasource_id: str) -> None:
-    """Reload the table index and time-column names of one datasource."""
+    """Reload one datasource's index, then patch discovery snapshots for that datasource only."""
 
     refresh_tables(session, datasource_id)
     refresh_time_columns(session, datasource_id)
-    _refresh_visibility(session)
+    from adg.visibility_cache import refresh_visibility
+
+    refresh_visibility(session, datasource_id=datasource_id)
 
 
 def _refresh_visibility(session: Session) -> None:

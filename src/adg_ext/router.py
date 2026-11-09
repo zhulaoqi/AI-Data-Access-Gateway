@@ -131,28 +131,30 @@ def _warm_cache(
 ) -> None:
     """Reload the copies a committed sync just changed. Failures stay in the cache log."""
 
-    if object_type == "catalog_note":
-        from adg.visibility_cache import refresh_visibility
+    from adg.visibility_cache import refresh_visibility
 
-        refresh_visibility(session)
+    if object_type == "catalog_note":
+        if external_id:
+            refresh_visibility(session, datasource_id=external_id)
         return
     if object_type == "role" and external_id:
-        refresh_policies(session)
+        refresh_policies(session, visibility=False)
         refresh_role(session, external_id)
+        refresh_visibility(session, role_id=external_id)
         return
     if object_type == "user":
-        from adg.visibility_cache import refresh_visibility
-
-        refresh_visibility(session)
+        if external_id:
+            refresh_visibility(session, user_id=external_id)
         return
     if object_type != "datasource_account" or not external_id:
         return
     refresh_catalog(session, external_id)
-    refresh_datasources(session)
+    refresh_datasources(session, visibility=False)
     if role_ids:
-        refresh_policies(session)
+        refresh_policies(session, visibility=False)
         for role_id in role_ids:
             refresh_role(session, role_id)
+            refresh_visibility(session, role_id=role_id)
 
 
 def _fail(error: ExtSyncError) -> HTTPException:
