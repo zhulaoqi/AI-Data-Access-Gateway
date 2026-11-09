@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from adg.control_plane.models.directory import Role, User, UserRole
+from adg.control_plane.models.governance import ResourceTag, Tag
 from adg.control_plane.models.resource import Resource
 from adg.policy.runtime import IdentityContext, RuntimePolicyService
 from adg.runtime_cache import (
@@ -60,11 +61,12 @@ def refresh_visibility(
         if datasource_id is not None and user_id is None and role_id is None:
             _patch_datasource(session, datasource_id)
             return
+        if role_id is not None and user_id is None:
+            _patch_role(session, role_id)
+            return
         user_ids: set[str] = set()
         if user_id is not None:
             user_ids.add(user_id)
-        if role_id is not None:
-            user_ids.update(_users_of_role(session, role_id))
         _patch_users(session, user_ids)
     finally:
         _GUARD.on = False
@@ -106,6 +108,53 @@ def _patch_datasource(session: Session, datasource_id: str) -> None:
     )
 
 
+def _patch_role(session: Session, role_id: str) -> None:
+    """Recheck only the datasources this role grants. A user's other databases stay put."""
+
+    user_ids = _users_of_role(session, role_id)
+    datasource_ids = _datasources_of_role(session, role_id)
+    identities = _identities(session, user_ids)
+    catalog = _load_catalog(session, datasource_ids) if datasource_ids else None
+    patched = 0
+    for identity in identities:
+        if identity.user_id is None:
+            continue
+        if catalog is not None and _patch_one(identity, catalog, datasource_ids, replace=False):
+            patched += 1
+        if _drop_ungranted(identity, _datasources_of_user(session, identity.user_id)):
+            patched += 1
+    logger.info(
+        "event=visibility_refreshed users=%s patched=%s role=%s datasources=%s",
+        len(identities),
+        patched,
+        role_id,
+        len(datasource_ids),
+    )
+
+
+def _drop_ungranted(identity: IdentityContext, granted: set[str]) -> bool:
+    """Remove databases this user can no longer see, without reading their tables."""
+
+    user_id = identity.user_id
+    if user_id is None:
+        return False
+    previous = read_cached(f"visible:{user_id}")
+    if not isinstance(previous, dict) or not isinstance(previous.get("by_datasource"), dict):
+        return False
+    stale = {str(key) for key in previous["by_datasource"] if str(key) not in granted}
+    if not stale:
+        return False
+    merged = merge_visible(
+        previous,
+        {"by_datasource": {}, "datasources": [], "tags": [], "tag_names": {}},
+        stale,
+        identity,
+        replace=False,
+    )
+    refresh(f"visible:{user_id}", lambda merged=merged: merged)
+    return True
+
+
 def _patch_users(session: Session, user_ids: set[str]) -> None:
     """Rebuild only the datasources each user's current roles still grant."""
 
@@ -118,11 +167,11 @@ def _patch_users(session: Session, user_ids: set[str]) -> None:
         catalog = _load_catalog(session, datasource_ids)
         if _patch_one(identity, catalog, datasource_ids, replace=True):
             patched += 1
-        logger.info(
-            "event=visibility_refreshed users=%s patched=%s scope=granted",
-            len(identities),
-            patched,
-        )
+    logger.info(
+        "event=visibility_refreshed users=%s patched=%s scope=granted",
+        len(identities),
+        patched,
+    )
 
 
 def _patch_one(
@@ -273,6 +322,15 @@ def _users_of_datasources(session: Session, datasource_ids: set[str]) -> set[str
     return {str(row) for row in rows}
 
 
+def _datasources_of_role(session: Session, role_id: str) -> set[str]:
+    rows = session.execute(
+        select(Resource.datasource_id)
+        .join(ExtRoleTable, ExtRoleTable.resource_id == Resource.id)
+        .where(ExtRoleTable.role_id == role_id)
+    ).scalars()
+    return {str(row) for row in rows if row}
+
+
 def _datasources_of_user(session: Session, user_id: str) -> set[str]:
     rows = session.execute(
         select(Resource.datasource_id)
@@ -294,6 +352,25 @@ def _resource_ids(by_datasource: dict[str, list[Any]], only: set[str]) -> set[st
     return found
 
 
+def _tag_catalog(session: Session, datasource_ids: set[str] | None) -> dict[str, Any]:
+    """Tag names for the datasources being refreshed. The full binding table is not read."""
+
+    if datasource_ids is None:
+        return load_tag_catalog(session)
+    tags = session.execute(select(Tag.id, Tag.name, Tag.category).order_by(Tag.name))
+    tag_rows = [{"id": tag.id, "name": tag.name, "category": tag.category} for tag in tags]
+    by_resource: dict[str, list[str]] = {}
+    if datasource_ids:
+        bindings = session.execute(
+            select(ResourceTag.resource_id, ResourceTag.tag_id)
+            .join(Resource, Resource.id == ResourceTag.resource_id)
+            .where(Resource.datasource_id.in_(datasource_ids))
+        )
+        for resource_id, tag_id in bindings:
+            by_resource.setdefault(str(resource_id), []).append(str(tag_id))
+    return {"tags": tag_rows, "by_resource": by_resource}
+
+
 def _load_catalog(session: Session, datasource_ids: set[str] | None = None) -> dict[str, Any]:
     """Shared inputs for one snapshot. ``datasource_ids`` limits the tables that are checked."""
 
@@ -308,7 +385,7 @@ def _load_catalog(session: Session, datasource_ids: set[str] | None = None) -> d
             part_tables, part_ancestors = access_rows(session, one_id)
             tables.extend(part_tables)
             ancestors.extend(part_ancestors)
-    catalog = load_tag_catalog(session)
+    catalog = _tag_catalog(session, datasource_ids)
     names_by_id = {
         str(tag["id"]): str(tag["name"])
         for tag in catalog["tags"]

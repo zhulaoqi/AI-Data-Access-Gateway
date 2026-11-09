@@ -324,6 +324,54 @@ def load_visible(
     return stored
 
 
+def merge_policy_cache(
+    current: dict[str, Any],
+    subject_type: str,
+    subject_id: str,
+    fresh: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Replace one subject's policies and leave every other subject in place."""
+
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for action, items in current.items():
+        if not isinstance(items, list):
+            continue
+        merged[str(action)] = [
+            row
+            for row in items
+            if not (
+                isinstance(row, dict)
+                and row.get("subject_type") == subject_type
+                and row.get("subject_id") == subject_id
+            )
+        ]
+    for row in fresh:
+        merged.setdefault(str(row.get("action") or ""), []).append(row)
+    return {action: rows for action, rows in merged.items() if rows}
+
+
+def refresh_subject_policies(session: Session, subject_type: str, subject_id: str) -> None:
+    """Refresh the policy cache for one role or user. Other subjects stay as they are.
+
+    A missing cache is left for the next read to fill completely. Publishing only this
+    subject's rows would hide everyone else's policies.
+    """
+
+    current = read_cached("policies")
+    if not isinstance(current, dict):
+        return
+    rows = session.execute(
+        select(ResourcePolicy).where(
+            ResourcePolicy.status == "active",
+            ResourcePolicy.subject_type == subject_type,
+            ResourcePolicy.subject_id == subject_id,
+        )
+    ).scalars()
+    fresh = [_policy_row(policy) for policy in rows]
+    merged = merge_policy_cache(current, subject_type, subject_id, fresh)
+    refresh("policies", lambda merged=merged: merged)
+
+
 def refresh_policies(session: Session, *, visibility: bool = True) -> None:
     """Reload active resource policies after a committed policy change.
 

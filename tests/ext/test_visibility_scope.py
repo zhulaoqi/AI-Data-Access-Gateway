@@ -1,4 +1,5 @@
 from adg.policy.runtime import IdentityContext
+from adg.runtime_cache import merge_policy_cache
 from adg.visibility_cache import merge_visible
 
 
@@ -67,3 +68,20 @@ def test_a_grant_change_drops_datasources_the_role_no_longer_includes() -> None:
     assert list(merged["by_datasource"]) == ["ds-new"]
     assert merged["by_datasource"]["ds-new"][0]["id"] == "table-live"
     assert merged["roles"] == ["role-new"]
+
+
+def test_policy_cache_replaces_only_the_synced_role() -> None:
+    current = {
+        "read": [
+            {"action": "read", "subject_type": "role", "subject_id": "role-a", "resource_id": "old"},
+            {"action": "read", "subject_type": "role", "subject_id": "role-b", "resource_id": "keep"},
+        ]
+    }
+    merged = merge_policy_cache(
+        current,
+        "role",
+        "role-a",
+        [{"action": "read", "subject_type": "role", "subject_id": "role-a", "resource_id": "new"}],
+    )
+    subjects = {(row["subject_id"], row["resource_id"]) for row in merged["read"]}
+    assert subjects == {("role-a", "new"), ("role-b", "keep")}

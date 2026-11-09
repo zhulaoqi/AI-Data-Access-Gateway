@@ -18,7 +18,7 @@ from adg.app.log_config import kv
 from adg.app.settings import get_settings
 from adg.connectors.registry import get_connector_registry
 from adg.control_plane.db import get_session
-from adg.runtime_cache import refresh_catalog, refresh_datasources, refresh_policies
+from adg.runtime_cache import refresh_catalog, refresh_datasources, refresh_subject_policies
 from adg_ext import audit_query, blocklist, revocation
 from adg_ext import metrics as metrics_text
 from adg_ext.catalog_job import CatalogJobs, scan_account_spec
@@ -138,7 +138,7 @@ def _warm_cache(
             refresh_visibility(session, datasource_id=external_id)
         return
     if object_type == "role" and external_id:
-        refresh_policies(session, visibility=False)
+        refresh_subject_policies(session, "role", external_id)
         refresh_role(session, external_id)
         refresh_visibility(session, role_id=external_id)
         return
@@ -151,8 +151,8 @@ def _warm_cache(
     refresh_catalog(session, external_id)
     refresh_datasources(session, visibility=False)
     if role_ids:
-        refresh_policies(session, visibility=False)
         for role_id in role_ids:
+            refresh_subject_policies(session, "role", role_id)
             refresh_role(session, role_id)
             refresh_visibility(session, role_id=role_id)
 
