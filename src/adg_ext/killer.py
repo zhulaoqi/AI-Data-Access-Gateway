@@ -24,6 +24,8 @@ def kill_query(connector_type: str, config: dict[str, object], tag: str) -> bool
             return _kill_mysql(checked, tag)
         if connector_type == "clickhouse":
             return _kill_clickhouse(checked, tag)
+        if connector_type == "postgres":
+            return _kill_postgres(checked, tag)
     except Exception:
         logger.warning("kill query failed for tag %s", tag, exc_info=False)
     return False
@@ -76,3 +78,42 @@ def _kill_clickhouse(config: dict[str, object], tag: str) -> bool:
         return True
     finally:
         client.close()
+
+
+def _kill_postgres(config: dict[str, object], tag: str) -> bool:
+    if not tag.isalnum():
+        return False
+    driver: Any = importlib.import_module("psycopg")
+    port = config.get("port")
+    kwargs: dict[str, object] = {
+        "host": str(config.get("host", "")),
+        "port": int(str(port)) if port else 5432,
+        "user": str(config.get("username", "")),
+        "password": str(config.get("password", "")),
+        "dbname": str(config.get("database") or ""),
+        "connect_timeout": 3,
+    }
+    sslmode = str(config.get("sslmode") or "").strip()
+    if sslmode:
+        kwargs["sslmode"] = sslmode
+    connection = driver.connect(**kwargs)
+    try:
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT pid
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND usename = current_user
+                  AND query LIKE %s
+                  AND query NOT LIKE 'SELECT pid FROM pg_stat_activity%%'
+                """,
+                (f"%req={tag}%",),
+            )
+            pids = [row[0] for row in cursor.fetchall()]
+            for pid in pids:
+                cursor.execute("SELECT pg_cancel_backend(%s)", (int(pid),))
+            return bool(pids)
+    finally:
+        connection.close()

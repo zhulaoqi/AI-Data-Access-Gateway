@@ -98,7 +98,7 @@ class GuardVerdict:
         return not self.reasons and self.result.allowed and self.result.normalized_sql is not None
 
 
-def _structural_reasons(statement: exp.Expression) -> list[str]:
+def _structural_reasons(statement: exp.Expression, dialect: str | None) -> list[str]:
     reasons: list[str] = []
 
     def add(reason: str) -> None:
@@ -141,7 +141,14 @@ def _structural_reasons(statement: exp.Expression) -> list[str]:
             if node.args.get("catalog"):
                 add("catalog_not_allowed")
             db = node.args.get("db")
-            if db is not None and db.name.lower() in SYSTEM_DATABASES:
+            if db is not None and is_system_database(db.name):
+                add("system_database_not_allowed")
+            elif (
+                dialect == "postgres"
+                and db is None
+                and isinstance(node.this, exp.Identifier)
+                and node.name.lower().startswith("pg_")
+            ):
                 add("system_database_not_allowed")
             if node.args.get("pivots"):
                 add("pivot_not_allowed")
@@ -149,9 +156,38 @@ def _structural_reasons(statement: exp.Expression) -> list[str]:
             if alias is not None and alias.args.get("columns"):
                 # `file('x', 'CSV')` style table functions parse as a table with a column list
                 add("table_function_not_allowed")
+        elif isinstance(node, exp.Copy):
+            add("copy_not_allowed")
+        elif isinstance(node, exp.Anonymous) and _dangerous_function(node.name):
+            add(f"function_not_allowed:{node.name.lower()}")
         elif isinstance(node, exp.Join) and (node.args.get("kind") or "").upper() == "ARRAY":
             add("array_join_not_allowed")
     return reasons
+
+
+def is_system_database(name: str) -> bool:
+    """True for catalogs the gateway never treats as a user schema or database."""
+
+    lowered = name.lower()
+    return lowered in SYSTEM_DATABASES or lowered.startswith(("pg_temp", "pg_toast_temp"))
+
+
+_DANGEROUS_FUNCTIONS = frozenset(
+    {
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "dblink",
+        "dblink_exec",
+        "lo_import",
+        "lo_export",
+    }
+)
+
+
+def _dangerous_function(name: str) -> bool:
+    return name.lower() in _DANGEROUS_FUNCTIONS
 
 
 _FLIPPED = {"GT": "LT", "GTE": "LTE", "LT": "GT", "LTE": "GTE", "EQ": "EQ"}
@@ -270,7 +306,7 @@ def check(
     for node in statement.walk():
         node.comments = None
     upstream = guard.check(statement.sql(dialect=dialect))
-    reasons = _structural_reasons(statement)
+    reasons = _structural_reasons(statement, dialect)
     reasons += [r for r in upstream.rejection_reasons if r not in reasons]
     ops = operations or Operations()
     if ops.deny_functions:

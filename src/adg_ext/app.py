@@ -22,6 +22,7 @@ from adg_ext.mcp_session import install_shared_sessions
 from adg_ext.metrics import get_query_metrics
 from adg_ext.mysql_scoped import ScopedMySqlConnector
 from adg_ext.pipeline import get_admission, start_capacity_log
+from adg_ext.postgres_scoped import ScopedPostgresConnector
 from adg_ext.router import admin_router, audit_router, delegated_router
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     registry = get_connector_registry()
     registry.register("clickhouse", ClickHouseConnector)
     registry.register("mysql", ScopedMySqlConnector)
+    registry.register("postgres", ScopedPostgresConnector)
     app.state.catalog_jobs = CatalogJobs(session_factory, registry)
     app.include_router(admin_router)
     app.include_router(audit_router)

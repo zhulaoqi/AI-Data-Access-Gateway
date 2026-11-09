@@ -161,6 +161,7 @@ def test_dialect_mapping() -> None:
     assert dialect_for("mysql") == "mysql"
     assert dialect_for("doris") == "starrocks"
     assert dialect_for("clickhouse") == "clickhouse"
+    assert dialect_for("postgres") == "postgres"
     assert dialect_for("unknown") is None
 
 
@@ -179,3 +180,18 @@ def test_deny_syntax_tokens_forbid_the_matching_constructs() -> None:
         assert f"syntax_not_allowed:{token}" in v.reasons, sql
     ok = check("SELECT a FROM t", dialect="mysql", default_limit=10, max_limit=10, operations=ops)
     assert ok.allowed
+
+
+def test_postgres_rejects_file_access_and_system_schemas() -> None:
+    cases = {
+        "copy t to stdout": "statement_not_allowed",
+        "select pg_read_file('/etc/passwd')": "function_not_allowed:pg_read_file",
+        "select dblink('host=db', 'select 1')": "function_not_allowed:dblink",
+        "select nspname from pg_catalog.pg_namespace": "system_database_not_allowed",
+        "select nspname from pg_temp_1.foo": "system_database_not_allowed",
+        "select relname from pg_class": "system_database_not_allowed",
+        "set search_path to public": "set_not_allowed",
+    }
+    for sql, reason in cases.items():
+        result = verdict(sql, "postgres")
+        assert reason in result.reasons, (sql, result.reasons)

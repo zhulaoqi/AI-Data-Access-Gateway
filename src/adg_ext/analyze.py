@@ -13,7 +13,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from adg_ext.errors import ExtRejection
-from adg_ext.guard import SYSTEM_DATABASES, GuardVerdict
+from adg_ext.guard import GuardVerdict, is_system_database
 from adg_ext.params import ParamSpec
 from adg_ext.rowfilter import (
     Binding,
@@ -102,7 +102,7 @@ def qualify_session_database(sql: str, database: str, dialect: str | None) -> st
     """
 
     database = database.strip()
-    if not database or database.lower() in SYSTEM_DATABASES:
+    if not database or is_system_database(database):
         return sql
     try:
         tree = cast(exp.Expression, sqlglot.parse_one(sql, read=dialect))

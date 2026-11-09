@@ -63,6 +63,8 @@ _ENGINE_TO_CONNECTOR = {
     "starrocks": "doris",
     "doris": "doris",
     "clickhouse": "clickhouse",
+    "postgres": "postgres",
+    "postgresql": "postgres",
 }
 _MASK_STRATEGIES = {
     "hash": ("hash", {}),
@@ -167,6 +169,11 @@ def connector_target(spec: dict[str, Any]) -> tuple[str, dict[str, object]]:
     }
     if spec.get("database"):
         config["database"] = spec["database"]
+    extra = spec.get("extra")
+    if isinstance(extra, dict) and extra.get("sslmode"):
+        config["sslmode"] = str(extra["sslmode"])
+    if connector_type == "postgres" and not config.get("database"):
+        raise ExtSyncError(422, "postgres requires a database")
     if "databases" in spec:
         raw_databases = spec.get("databases")
         if isinstance(raw_databases, list):
