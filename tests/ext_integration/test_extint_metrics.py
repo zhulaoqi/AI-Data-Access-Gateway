@@ -148,7 +148,8 @@ def test_audit_unavailable_counter(
     monkeypatch.setattr(AuditService, "record_event", broken)
     assert prom(gateway)["adg_ext_audit_unavailable_total", ()] == 0
     out = query(gateway, key, "SELECT id FROM shop.orders")
-    assert out == {"status": "rejected", "reason": "audit_unavailable"}
+    assert out["status"] == "rejected" and out["reason"] == "audit_unavailable"
+    assert out["message"]
     s = prom(gateway)
     assert s["adg_ext_audit_unavailable_total", ()] == 1
     assert total(s, "rejected") == 1 and total(s, "completed") == 0

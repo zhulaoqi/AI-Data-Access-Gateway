@@ -23,6 +23,7 @@ AI Data Access Gateway is a secure data access gateway MVP for AI agents. It exp
 ## Working Rules
 
 - Keep release-facing English and Chinese docs in sync.
+- Push our branches to both GitLab `gst/AI-Data-Access-Gateway` and GitHub `zhulaoqi/AI-Data-Access-Gateway`. Track `gitlab`, whose push URLs are both of those remotes. A branch tracking `origin` updates GitHub only and is not done. Do not push `upstream` (HanZephyr) unless explicitly asked. See CONTRIBUTING.md, section Remotes.
 - Do not describe roadmap items as current features.
 - Prefer minimal, bounded edits over broad unrelated cleanup.
 - Do not remove or overwrite internal planning artifacts unless explicitly asked.

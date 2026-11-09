@@ -1,0 +1,472 @@
+import json
+
+from adg_ext.analyze import TableView
+from adg_ext.disclosure import (
+    bind,
+    forget,
+    parse_external,
+    redis_key,
+    remember,
+    remember_tables,
+    resolve_scope,
+    resolve_values,
+    trace,
+)
+from adg_ext.rowfilter import compile_template, render
+
+
+def _view() -> TableView:
+    return TableView(
+        path="shop.orders",
+        restricted=True,
+        allow=frozenset({"creator_id", "id"}),
+        filters=[None],
+    )
+
+
+def test_external_header_accepts_version_one() -> None:
+    values, reason = parse_external(
+        {"person": "agent-1", "scope": '{"v":1,"dimensionId":"dim_1","values":["10086","10086"]}'},
+        "dim_1",
+    )
+    assert reason is None
+    assert values == ["10086"]
+
+
+def test_external_header_rejects_a_missing_or_foreign_dimension() -> None:
+    assert parse_external({"person": "agent-1"}, "dim_1")[1] == "external_scope_required"
+    assert (
+        parse_external(
+            {"person": "agent-1", "scope": '{"v":2,"dimensionId":"dim_1","values":["1"]}'},
+            "dim_1",
+        )[1]
+        == "external_scope_unsupported"
+    )
+    assert (
+        parse_external(
+            {"person": "agent-1", "scope": '{"v":1,"dimensionId":"other","values":["1"]}'},
+            "dim_1",
+        )[1]
+        == "external_scope_mismatch"
+    )
+
+
+def test_memory_hit_does_not_read_redis() -> None:
+    calls = {"n": 0}
+
+    def redis_get(_key: str) -> str:
+        calls["n"] += 1
+        return '{"v":1,"values":["9"]}'
+
+    resolve_values("dim_mem", "ou_1", redis_get=redis_get, local_get=lambda: ["8"])
+    assert calls["n"] == 1
+    again = resolve_values("dim_mem", "ou_1", redis_get=redis_get, local_get=lambda: ["8"])
+    assert again == ["9"]
+    assert calls["n"] == 1
+
+
+def test_bind_replaces_an_empty_row_filter_and_keeps_jdbc_closed() -> None:
+    view = _view()
+    params: dict[str, object] = {}
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [view],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert reason is None
+    assert params["gw_disclosure_values"] == ["10086"]
+    assert view.filters[0] is not None
+    assert view.filters[0].where == "`creator_id` IN ({{gw_disclosure_values}})"
+
+    jdbc_view = _view()
+    jdbc_calls = {"n": 0}
+
+    def jdbc_lookup(_d: str, _p: str) -> list[str]:
+        jdbc_calls["n"] += 1
+        return ["10086"]
+
+    jdbc = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [jdbc_view],
+        {},
+        channel="jdbc",
+        headers=None,
+        lookup=jdbc_lookup,
+    )
+    assert jdbc is None
+    assert jdbc_calls["n"] == 0
+    assert jdbc_view.filters == [None]
+
+
+def test_bind_quotes_spaces_and_non_ascii_and_rejects_breakout() -> None:
+    name = "event 的列"
+    view = TableView(path="shop.orders", restricted=True, allow=frozenset({name}), filters=[None])
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": name}]},
+        [view],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert reason is None
+    assert view.filters[0] is not None
+    assert view.filters[0].where == "`event 的列` IN ({{gw_disclosure_values}})"
+    compile_template(view.filters[0].where, view.filters[0].params, dialect="mysql")
+
+    quoted = TableView(path="shop.orders", restricted=True, allow=frozenset({"a`b"}), filters=[None])
+    bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "a`b"}]},
+        [quoted],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["1"],
+    )
+    assert quoted.filters[0] is not None
+    assert quoted.filters[0].where.startswith("`a``b` IN")
+
+    rejected = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "a;b"}]},
+        [TableView(path="shop.orders", restricted=True, allow=frozenset({"a;b"}), filters=[None])],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["1"],
+    )
+    assert rejected is not None
+    assert rejected.startswith("row_filter_column_not_permitted:")
+
+
+def test_comma_separated_values_become_separate_sql_literals() -> None:
+    view = _view()
+    params: dict[str, object] = {}
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [view],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086, 10087", "O'Brien"],
+    )
+    assert reason is None
+    assert params["gw_disclosure_values"] == ["10086", "10087", "O'Brien"]
+    assert view.filters[0] is not None
+    template = compile_template(view.filters[0].where, view.filters[0].params, dialect="mysql")
+    assert render(template, params).sql(dialect="mysql") == "`creator_id` IN ('10086', '10087', 'O''Brien')"
+
+    rejected = bind(
+        {"dimensionId": "dim_1", "source": "manual", "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [_view()],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086，10087"],
+    )
+    assert rejected == "disclosure_value_invalid"
+
+    external, external_reason = parse_external(
+        {"person": "agent-1", "scope": '{"v":1,"dimensionId":"dim_1","values":["10086,10087"]}'},
+        "dim_1",
+    )
+    assert external_reason is None
+    assert external == ["10086", "10087"]
+
+
+def test_each_table_keeps_its_own_values() -> None:
+    product = TableView(
+        path="dataeye.product",
+        restricted=True,
+        allow=frozenset({"project_id"}),
+        filters=[None],
+    )
+    event = TableView(
+        path="dataeye.bi_event",
+        restricted=True,
+        allow=frozenset({"product_id"}),
+        filters=[None],
+    )
+    params: dict[str, object] = {}
+    reason = bind(
+        {
+            "dimensionId": "dim_tables",
+            "source": "manual",
+            "columns": [
+                {"database": "dataeye", "table": "product", "column": "project_id"},
+                {"database": "dataeye", "table": "bi_event", "column": "product_id"},
+            ],
+        },
+        [product, event],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: {
+            "tables": {("dataeye", "product"): ["1", "3", "5", "8"], ("dataeye", "bi_event"): ["9", "10"]}
+        },
+    )
+    assert reason is None
+    assert params["gw_disclosure_values_0"] == ["1", "3", "5", "8"]
+    assert params["gw_disclosure_values_1"] == ["9", "10"]
+    assert product.filters[0] is not None and "project_id" in product.filters[0].where
+    assert event.filters[0] is not None and "product_id" in event.filters[0].where
+
+
+class _CasRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    def eval(self, _script: str, _numkeys: int, key: str, payload: str, at: str) -> int:
+        current = self.store.get(key)
+        new_at = int(at)
+        if current:
+            seen = json.loads(current).get("at")
+            if seen is not None and int(seen) > new_at:
+                return 0
+        self.store[key] = payload
+        return 1
+
+
+def test_redis_tables_do_not_fall_back_to_a_shared_local_list() -> None:
+    raw = json.dumps(
+        {
+            "v": 1,
+            "at": 20,
+            "tables": [
+                {"database": "dataeye", "table": "product", "values": ["1", "3"]},
+                {"database": "dataeye", "table": "bi_event", "values": ["9"]},
+            ],
+        }
+    )
+    scope = resolve_scope(
+        "dim_redis_tables",
+        "ou_1",
+        redis_get=lambda _key: raw,
+        local_get=lambda: ["1", "3", "5", "8"],
+    )
+    assert scope is not None
+    assert "values" not in scope
+    assert scope["tables"][("dataeye", "product")] == ["1", "3"]
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+
+
+def test_a_pending_marker_beats_a_local_per_table_snapshot() -> None:
+    local = {"tables": [{"database": "dataeye", "table": "product", "values": ["1", "3"]}]}
+    scope = resolve_scope(
+        "dim_pending_tables",
+        "ou_1",
+        redis_get=lambda _key: '{"v":1,"at":30,"pending":true}',
+        local_get=lambda: local,
+    )
+    assert scope is None
+
+
+def test_an_older_shared_list_does_not_cover_newer_table_values(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    key = redis_key("dim_cas", "ou_1")
+    redis.store[key] = json.dumps(
+        {
+            "v": 1,
+            "at": 20,
+            "tables": [
+                {"database": "dataeye", "table": "product", "values": ["1", "3"]},
+                {"database": "dataeye", "table": "bi_event", "values": ["9"]},
+            ],
+        }
+    )
+    remember("dim_cas", "ou_1", ["1", "3", "5", "8"], 10)
+    body = json.loads(redis.store[key])
+    assert body["at"] == 20
+    assert "values" not in body
+    scope = resolve_scope(
+        "dim_cas",
+        "ou_1",
+        redis_get=redis.get,
+        local_get=lambda: ["1", "3", "5", "8"],
+        now=10**12,
+    )
+    assert scope is not None
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+
+
+def test_a_newer_tombstone_clears_a_stale_per_table_allow(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    remember_tables(
+        "dim_tomb",
+        "ou_1",
+        [{"database": "dataeye", "table": "product", "values": ["1", "3"]}],
+        20,
+    )
+    redis.store[redis_key("dim_tomb", "ou_1")] = '{"v":1,"at":30,"pending":true}'
+    forget("dim_tomb", "ou_1", 20)
+    scope = resolve_scope(
+        "dim_tomb",
+        "ou_1",
+        redis_get=redis.get,
+        local_get=lambda: {"tables": [{"database": "dataeye", "table": "product", "values": ["1"]}]},
+        now=0,
+    )
+    assert scope is None
+
+
+def test_an_older_revoke_does_not_drop_newer_table_values(monkeypatch) -> None:
+    redis = _CasRedis()
+    monkeypatch.setattr("adg_ext.redis_share.get_client", lambda: redis)
+    remember_tables(
+        "dim_keep",
+        "ou_1",
+        [{"database": "dataeye", "table": "bi_event", "values": ["9"]}],
+        20,
+    )
+    forget("dim_keep", "ou_1", 10)
+    scope = resolve_scope("dim_keep", "ou_1", redis_get=redis.get, local_get=lambda: None, now=0)
+    assert scope is not None
+    assert scope["tables"][("dataeye", "bi_event")] == ["9"]
+    assert "values" not in json.loads(redis.store[redis_key("dim_keep", "ou_1")])
+
+
+def test_a_table_without_its_own_values_is_rejected() -> None:
+    event = TableView(
+        path="dataeye.bi_event",
+        restricted=True,
+        allow=frozenset({"product_id"}),
+        filters=[None],
+    )
+    reason = bind(
+        {
+            "dimensionId": "dim_tables",
+            "source": "manual",
+            "columns": [{"database": "dataeye", "table": "bi_event", "column": "product_id"}],
+        },
+        [event],
+        {},
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: {"tables": {("dataeye", "product"): ["1", "3", "5", "8"]}},
+    )
+    assert reason is not None
+    assert event.filters == [None]
+
+
+def test_an_older_scope_does_not_replace_a_newer_one() -> None:
+    remember("dim_rev", "ou_1", ["new"], 20)
+    remember("dim_rev", "ou_1", ["old"], 10)
+    assert resolve_values("dim_rev", "ou_1", redis_get=lambda _key: None, local_get=lambda: ["local"]) == ["new"]
+
+
+def test_an_older_revoke_does_not_drop_a_newer_value() -> None:
+    remember("dim_rev", "ou_2", ["new"], 20)
+    forget("dim_rev", "ou_2", 10)
+    assert resolve_values("dim_rev", "ou_2", redis_get=lambda _key: None, local_get=lambda: ["local"]) == ["new"]
+
+
+def test_a_revoke_does_not_fall_back_to_the_local_snapshot() -> None:
+    remember("dim_rev", "ou_3", ["old"], 10)
+    forget("dim_rev", "ou_3", 20)
+    assert resolve_values("dim_rev", "ou_3", redis_get=lambda _key: None, local_get=lambda: ["old"]) is None
+
+
+def test_pending_marker_does_not_fall_back_to_a_stale_local_copy() -> None:
+    def redis_get(_key: str) -> str:
+        return '{"v":1,"pending":true}'
+
+    assert resolve_values("dim_pending", "ou_9", redis_get=redis_get, local_get=lambda: ["10086"]) is None
+
+
+def test_missing_values_do_not_open_the_table() -> None:
+    reason = bind(
+        {"dimensionId": "dim_1", "source": "manual", "ownerNames": ["张三"], "columns": [{"database": "shop", "table": "orders", "column": "creator_id"}]},
+        [_view()],
+        {},
+        channel="mcp",
+        headers={"person": "ou_2"},
+        lookup=lambda _d, _p: None,
+    )
+    assert reason is not None
+    assert "张三" in reason
+    assert "10086" not in reason
+
+
+def test_trace_shows_a_missing_person_and_a_spliced_sample() -> None:
+    missing = trace(
+        {"dimensionId": "dim_1", "source": "manual"},
+        {},
+        channel="mcp",
+        reason="person_required",
+        values=None,
+    )
+    assert missing["person"] == "-"
+    assert missing["attached"] == "no"
+    assert missing["reason"] == "person_required"
+    spliced = trace(
+        {"dimensionId": "dim_1", "source": "manual"},
+        {"person": "ou_2"},
+        channel="mcp",
+        reason=None,
+        values=["10086", "10087", "10088", "10089", "10090", "10091"],
+    )
+    assert spliced["person"] == "ou_2"
+    assert spliced["attached"] == "yes"
+    assert spliced["values"] == 6
+    assert spliced["sample"] == "10086,10087,10088,10089,10090,+1"
+
+
+def test_unbound_tables_follow_the_saved_choice() -> None:
+    bound = {"database": "shop", "table": "orders", "column": "creator_id"}
+    customers = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    denied = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "deny", "columns": [bound]},
+        [_view(), customers],
+        {},
+        channel="mcp",
+        headers=None,
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert denied == "disclosure_column_missing"
+
+    orders = _view()
+    left_open = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    params: dict[str, object] = {}
+    allowed = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+        [orders, left_open],
+        params,
+        channel="mcp",
+        headers={"person": "ou_1"},
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert allowed is None
+    assert params["gw_disclosure_values"] == ["10086"]
+    assert orders.filters[0] is not None
+    assert left_open.filters == [None]
+
+    only_open = TableView(path="shop.customers", restricted=True, allow=frozenset({"id"}), filters=[None])
+    assert (
+        bind(
+            {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+            [only_open],
+            {},
+            channel="mcp",
+            headers=None,
+            lookup=lambda _d, _p: None,
+        )
+        is None
+    )
+    assert only_open.filters == [None]
+
+    still_closed = bind(
+        {"dimensionId": "dim_1", "source": "manual", "unbound": "allow", "columns": [bound]},
+        [_view()],
+        {},
+        channel="mcp",
+        headers=None,
+        lookup=lambda _d, _p: ["10086"],
+    )
+    assert still_closed == "person_required"

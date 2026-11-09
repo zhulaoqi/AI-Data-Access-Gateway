@@ -25,8 +25,10 @@ from adg.runtime_cache import (
 from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
 from adg_ext import pipeline as ext_pipeline
+from adg_ext.audience import audience_reason
 from adg_ext.catalog_notes import NoteIndex, prefer, table_address
 from adg_ext.config import ext_enabled
+from adg_ext.models import ExtUserAttribute
 
 
 def _resources_for_tags(cached: dict[str, Any], tag_names: list[str]) -> list[dict[str, Any]]:
@@ -70,6 +72,31 @@ class GatewayRuntimeService:
             masking_encryption_key=getattr(settings, "masking_encryption_key", settings.secret_key),
             kdf_iterations=getattr(settings, "secret_kdf_iterations", 390_000),
         )
+
+    def audience_block(self, identity: IdentityContext, person: str | None) -> str | None:
+        """Reject MCP callers missing from this grant's directory list."""
+
+        if not identity.user_id:
+            return None
+        row = self._session.get(ExtUserAttribute, identity.user_id)
+        raw = None if row is None else row.audience_json
+        return audience_reason(raw, person)
+
+    def resolve_person(
+        self,
+        *,
+        identity: IdentityContext,
+        api_key_id: str,
+        email: str,
+    ) -> dict[str, Any]:
+        """Map one enterprise email to the directory open_id stored in the cache."""
+
+        from adg_ext.directory import lookup
+
+        found = lookup(email)
+        if found.get("status") == "ok":
+            self._record_discovery(identity, api_key_id, "resolve_person", None, [])
+        return found
 
     def list_datasources(
         self,
@@ -144,10 +171,7 @@ class GatewayRuntimeService:
         if cached is not None:
             found = cached["by_datasource"].get(datasource_id, [])
             return {"resources": found if isinstance(found, list) else []}
-        resources = [
-            resource
-            for resource in self._visible_resources(identity=identity, datasource_id=datasource_id)
-        ]
+        resources = self._visible_resources(identity=identity, datasource_id=datasource_id)
         notes = NoteIndex.load(self._session, {resource.datasource_id for resource in resources})
         return {"resources": [self._serialize_resource(resource, notes) for resource in resources]}
 
@@ -275,6 +299,7 @@ class GatewayRuntimeService:
         api_key_id: str,
         resource_id: str,
         limit: int,
+        disclosure_headers: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Run a bounded SELECT * preview through the same guarded query pipeline."""
 
@@ -329,6 +354,7 @@ class GatewayRuntimeService:
             query=f"select {preview_columns} from {resource.path}",
             limit=limit,
             event_type="resource_preview",
+            disclosure_headers=disclosure_headers,
         )
 
     def execute_query(
@@ -341,6 +367,7 @@ class GatewayRuntimeService:
         query: str,
         limit: int,
         event_type: str = "query_execution",
+        disclosure_headers: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Validate, authorize, execute, mask, and audit a read-only runtime query."""
 
@@ -355,6 +382,7 @@ class GatewayRuntimeService:
                 query=query,
                 limit=limit,
                 event_type=event_type,
+                disclosure_headers=disclosure_headers,
             )
             if managed is not None:
                 return managed

@@ -31,15 +31,22 @@ def create_engine_from_url(database_url: str) -> Engine:
         "",
         ":memory:",
     )
+    if poolclass is None and not in_memory and not database_url.startswith("sqlite"):
+        # Drop connections the server has already closed, and recycle before wait_timeout.
+        pool_args["pool_pre_ping"] = True
+        pool_args["pool_recycle"] = 1800
     if poolclass is None and not in_memory and ext_enabled():
-        # adg_ext: bounded wait for a pooled connection (503 ``admission_pool_exhausted`` upstream of here
-        # instead of the 30 s default followed by a 500) and a pool sized for the worker threads.
+        # adg_ext: bounded wait for a pooled connection. A timeout becomes 503
+        # ``admission_pool_exhausted`` instead of the 30 s default followed by a 500.
+        # The pool is sized for the worker threads.
         ext = get_ext_settings()
-        pool_args = {
-            "pool_size": ext.control_plane_pool_size,
-            "max_overflow": ext.control_plane_pool_max_overflow,
-            "pool_timeout": ext.control_plane_pool_timeout_seconds,
-        }
+        pool_args.update(
+            {
+                "pool_size": ext.control_plane_pool_size,
+                "max_overflow": ext.control_plane_pool_max_overflow,
+                "pool_timeout": ext.control_plane_pool_timeout_seconds,
+            }
+        )
 
     return create_engine(
         database_url,

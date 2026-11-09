@@ -64,7 +64,7 @@ def test_audit_trail_of_real_queries(gateway: Gateway, mysql_seed: dict[str, str
     column = query(gateway, key, "SELECT ssn FROM shop.orders")
     assert column["reason"].startswith("column_not_allowed")
     other = query(gateway, key, "SELECT id FROM shop.dim")
-    assert other["reason"] == "table_not_accessible"
+    assert other["reason"] == "table_not_accessible:shop.dim"
 
     # admission: hold the slot, queue one request, overflow the next
     ds, ids = target(gateway, key)
@@ -122,7 +122,7 @@ def test_audit_trail_of_real_queries(gateway: Gateway, mysql_seed: dict[str, str
     def reasons(**params: Any) -> list[str | None]:
         return [i["reason"] for i in audit(gateway, "/ext/audit/events", **params).json()["items"]]
 
-    assert reasons(reason="table_not_accessible") == ["table_not_accessible"]
+    assert reasons(reason="table_not_accessible") == ["table_not_accessible:shop.dim"]
     assert reasons(reason="column_not_allowed", decision="rejected") == [column["reason"]]
     assert reasons(reason="admission_queue_full") == ["admission_queue_full"]
     assert reasons(status="timeout") == ["query_timeout"]
@@ -139,7 +139,7 @@ def test_audit_trail_of_real_queries(gateway: Gateway, mysql_seed: dict[str, str
     assert stats["total"] == stats["allowed"] + stats["rejected"]
     assert stats["rejected"] >= 3 and stats["admissionRejected"] == 1 and stats["timeouts"] == 1
     top = {t["reason"]: t["count"] for t in stats["reasonTop"]}
-    assert top["table_not_accessible"] == 1 and top["admission_queue_full"] == 1
+    assert top["table_not_accessible:shop.dim"] == 1 and top["admission_queue_full"] == 1
     assert len(stats["reasonTop"]) <= 10
 
     # ---- detail: SQL, rewritten SQL, and the read is audited

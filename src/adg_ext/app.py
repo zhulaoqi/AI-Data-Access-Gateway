@@ -14,6 +14,7 @@ from adg.connectors.registry import get_connector_registry
 from adg.control_plane.models.api_key import ApiKey
 from adg.mcp_server.server import runtime_mcp_server
 from adg_ext import blocklist, revocation
+from adg_ext.catalog_job import CatalogJobs
 from adg_ext.clickhouse import ClickHouseConnector
 from adg_ext.clientip import ClientIpMiddleware
 from adg_ext.config import get_ext_settings
@@ -55,6 +56,7 @@ def _pool_exhausted(_: Request, error: Exception) -> JSONResponse:
             "status": "rejected",
             "reason": POOL_EXHAUSTED,
             "detail": POOL_EXHAUSTED,
+            "message": "网关控制库连接已满，请稍后再试。",
             "retry_after_seconds": retry_after,
         },
         headers={"Retry-After": str(retry_after)},
@@ -81,6 +83,7 @@ def install(app: FastAPI, session_factory: sessionmaker[Session]) -> None:
     registry = get_connector_registry()
     registry.register("clickhouse", ClickHouseConnector)
     registry.register("mysql", ScopedMySqlConnector)
+    app.state.catalog_jobs = CatalogJobs(session_factory, registry)
     app.include_router(admin_router)
     app.include_router(audit_router)
     app.include_router(delegated_router)

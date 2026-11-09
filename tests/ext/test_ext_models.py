@@ -24,9 +24,9 @@ def test_migration_creates_the_ext_tables(tmp_path: Path) -> None:
         "ext_user_attributes",
         "ext_datasource_capacities",
     } <= tables
-    assert "limits_json" in {
-        column["name"] for column in inspector.get_columns("ext_user_attributes")
-    }
+    columns = {column["name"] for column in inspector.get_columns("ext_user_attributes")}
+    assert "limits_json" in columns
+    assert "audience_json" in columns
     command.downgrade(config, "202606110001")
     assert "ext_sync_objects" not in set(inspect(create_engine(url)).get_table_names())
 

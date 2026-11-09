@@ -1,0 +1,571 @@
+"""Per-person disclosure. Values are applied before SQL runs. A memory hit does not touch Redis."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from typing import Any, Callable
+
+from adg_ext.analyze import FilterDef, TableView
+from adg_ext.params import ParamSpec
+
+_UNSAFE = (";", "--", "/*", "*/", "\\", "{", "}")
+PARAM = "gw_disclosure_values"
+REDIS_PREFIX = "gw:person_scope:"
+MEMORY_TTL = 15.0
+MAX_VALUES = 1000
+MAX_VALUE_LEN = 256
+MAX_HEADER = 7168
+MAX_PERSON = 128
+
+_lock = threading.Lock()
+_memory: dict[tuple[str, str], tuple[float, list[str]]] = {}
+_revision: dict[tuple[str, str], int] = {}
+# Same rule as the control plane: a write lands only when its updated_at is not older.
+_CAS = """
+local cur = redis.call('GET', KEYS[1])
+local newAt = tonumber(ARGV[2])
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  local seen = ok and type(obj) == 'table' and tonumber(obj.at)
+  if seen and tonumber(obj.at) > newAt then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+
+_NOT_ENTITLED = (
+    "你还没有这项数据的查询权限。请联系数据负责人{names}，为你开通网关数据权限，"
+    "并在数据可视化中开通相应权限。开通后无需登录管理端，可以直接再问。"
+)
+
+
+def redis_key(dimension_id: str, open_id: str) -> str:
+    return f"{REDIS_PREFIX}{dimension_id}:{open_id}"
+
+
+def sync_name(dimension_id: str, open_id: str) -> str:
+    return f"gw:ps:{dimension_id}:{open_id}"
+
+
+def remember(dimension_id: str, open_id: str, values: list[str], at: int = 0) -> None:
+    """Called when a scope is synced. Warms memory and Redis off the query path."""
+
+    body = {"v": 1, "at": int(at), "values": values}
+    if not _publish(dimension_id, open_id, body, int(at)):
+        return
+    if not _claim(dimension_id, open_id, int(at)):
+        return
+    _store(dimension_id, open_id, values)
+
+
+def remember_tables(dimension_id: str, open_id: str, tables: list[Any], at: int = 0) -> None:
+    """Per-table values. A table omitted here is not entitled, even if another table has values."""
+
+    parsed = _tables_from_list(tables)
+    if not parsed:
+        return
+    body = {
+        "v": 1,
+        "at": int(at),
+        "tables": [
+            {"database": database, "table": table, "values": values}
+            for (database, table), values in parsed.items()
+        ],
+    }
+    if not _publish(dimension_id, open_id, body, int(at)):
+        return
+    if not _claim(dimension_id, open_id, int(at)):
+        return
+    _store_scope(dimension_id, open_id, {"tables": parsed})
+
+
+def forget(dimension_id: str, open_id: str, at: int = 0) -> None:
+    """Leave a pending marker. Deleting the key would make a query fall back to a stale snapshot."""
+
+    body = {"v": 1, "at": int(at), "pending": True}
+    if _publish(dimension_id, open_id, body, int(at)):
+        if _claim(dimension_id, open_id, int(at)):
+            with _lock:
+                _memory.pop((dimension_id, open_id), None)
+        return
+    # Redis already holds something newer. A newer allow stays. A newer tombstone must
+    # drop the stale allow, or this process keeps serving it until the memory TTL.
+    raw = _redis_raw(dimension_id, open_id)
+    if not raw or _scope_from_raw(raw) is not None:
+        return
+    revised = _payload_at(raw)
+    if revised < int(at) or not _claim(dimension_id, open_id, revised):
+        return
+    with _lock:
+        _memory.pop((dimension_id, open_id), None)
+
+
+def _unbound_policy(disclosure: dict[str, Any] | None) -> str:
+    return "allow" if (disclosure or {}).get("unbound") == "allow" else "deny"
+
+
+def trace(
+    disclosure: dict[str, Any] | None,
+    headers: dict[str, str | None] | None,
+    *,
+    channel: str,
+    reason: str | None,
+    values: list[str] | None,
+) -> dict[str, Any]:
+    """What arrived and whether the person predicate was attached. A sample, not the whole list."""
+
+    person = ((headers or {}).get("person") or "").strip()
+    scope = (headers or {}).get("scope")
+    shown = [item for item in (values or []) if isinstance(item, str)]
+    sample = ",".join(item[:64] for item in shown[:5])
+    if len(shown) > 5:
+        sample = f"{sample},+{len(shown) - 5}"
+    return {
+        "dimension": str((disclosure or {}).get("dimensionId") or "-"),
+        "source": str((disclosure or {}).get("source") or "-"),
+        "unbound": (
+            _unbound_policy(disclosure) if disclosure and disclosure.get("dimensionId") else "-"
+        ),
+        "channel": channel or "-",
+        "person": person or "-",
+        "scope": "yes" if scope else "no",
+        "values": len(shown),
+        "sample": sample or "-",
+        "attached": "no" if reason else "yes",
+        "reason": reason or "-",
+    }
+
+
+def bind(
+    disclosure: dict[str, Any] | None,
+    views: list[TableView],
+    user_params: dict[str, Any],
+    *,
+    channel: str,
+    headers: dict[str, str | None] | None,
+    lookup,
+) -> str | None:
+    """Return a rejection reason, or None after the person predicate is attached to every view."""
+
+    if not disclosure or not disclosure.get("dimensionId"):
+        return None
+    if channel == "jdbc":
+        return None
+    if disclosure.get("conflict"):
+        return "disclosure_conflict"
+    source = str(disclosure.get("source") or "manual")
+    columns = disclosure.get("columns") or []
+    if not isinstance(columns, list):
+        columns = []
+    policy = _unbound_policy(disclosure)
+    bound = _bindings(columns)
+    missing = [view for view in views if _column_for(view, bound) is None]
+    skipped = {id(view) for view in missing}
+    covered = [view for view in views if id(view) not in skipped]
+    if missing and policy != "allow":
+        return "disclosure_column_missing"
+    if not covered:
+        return None if policy == "allow" else "disclosure_column_missing"
+    if source == "external":
+        values, reason = parse_external(headers or {}, str(disclosure["dimensionId"]))
+        if reason:
+            return reason
+    else:
+        person = ((headers or {}).get("person") or "").strip()
+        if not person or len(person) > MAX_PERSON or _control(person):
+            return "person_required"
+        found = lookup(str(disclosure["dimensionId"]), person)
+        if not found:
+            return _friendly(disclosure)
+    if source == "external":
+        shared: list[str] | None = values
+        per_table = None
+    else:
+        shared, per_table = _split_scope(found)
+        if shared is None and not per_table:
+            return _friendly(disclosure)
+    if PARAM in user_params:
+        return "disclosure_param_conflict"
+    clause = None
+    attached = 0
+    for view in covered:
+        if not view.restricted:
+            continue
+        column = _column_for(view, bound)
+        if column is None:
+            return "disclosure_column_missing"
+        quoted = _quote(column)
+        if quoted is None or not view.permits(column):
+            return f"row_filter_column_not_permitted:{column}"
+        picked = _pick_values(view, shared, per_table)
+        if not picked:
+            return _friendly(disclosure)
+        clean, problem = _comma_values(picked)
+        if problem == "too_large":
+            if source == "external":
+                return "external_scope_too_large"
+            return "person_scope_too_large:" + _friendly(disclosure)
+        if clean is None:
+            return "external_scope_required" if source == "external" else "disclosure_value_invalid"
+        param = PARAM if per_table is None else f"{PARAM}_{attached}"
+        spec = ParamSpec(param, "string_list", True, MAX_VALUES)
+        piece = f"{quoted} IN ({{{{{param}}}}})"
+        clause = piece
+        if not view.filters:
+            view.filters = [FilterDef(piece, (spec,))]
+        else:
+            view.filters = [_and(item, piece, spec) for item in view.filters]
+        user_params[param] = list(clean)
+        attached += 1
+    if clause is None:
+        return "disclosure_column_missing"
+    return None
+
+
+def resolve_values(
+    dimension_id: str,
+    open_id: str,
+    *,
+    redis_get: Callable[[str], str | None] | None = None,
+    local_get: Callable[[], Any] | None = None,
+    now: float | None = None,
+) -> list[str] | None:
+    """Flat value list. A per-table scope has no single list, so this returns None."""
+
+    scope = resolve_scope(dimension_id, open_id, redis_get=redis_get, local_get=local_get, now=now)
+    values = (scope or {}).get("values")
+    if isinstance(values, list) and values:
+        return list(values)
+    return None
+
+
+def resolve_scope(
+    dimension_id: str,
+    open_id: str,
+    *,
+    redis_get: Callable[[str], str | None] | None = None,
+    local_get: Callable[[], Any] | None = None,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Memory, then one Redis GET, then the synced snapshot. Missing means not entitled."""
+
+    clock = time.monotonic() if now is None else now
+    cached = _read(dimension_id, open_id, clock)
+    if cached is not None:
+        return cached
+    raw = None
+    failed = False
+    if redis_get is not None:
+        try:
+            raw = redis_get(redis_key(dimension_id, open_id))
+        except Exception:
+            failed = True
+    if not failed and raw:
+        revised = _payload_at(raw)
+        if _newer_known(dimension_id, open_id, revised):
+            return _read(dimension_id, open_id, clock)
+        parsed = _scope_from_raw(raw)
+        _claim(dimension_id, open_id, revised)
+        if parsed is None:
+            with _lock:
+                _memory.pop((dimension_id, open_id), None)
+            return None
+        _store_scope(dimension_id, open_id, parsed, clock)
+        return parsed
+    if local_get is None or _newer_known(dimension_id, open_id, 0):
+        return None
+    local = _normalize_scope(local_get())
+    if local:
+        _claim(dimension_id, open_id, 0)
+        _store_scope(dimension_id, open_id, local, clock)
+        return local
+    return None
+
+
+def parse_external(
+    headers: dict[str, str | None], dimension_id: str
+) -> tuple[list[str] | None, str | None]:
+    person = headers.get("person") or ""
+    if not person or len(person) > MAX_PERSON or _control(person):
+        return None, "external_scope_required"
+    raw = headers.get("scope")
+    if raw is None or raw == "":
+        return None, "external_scope_required"
+    if len(raw.encode("utf-8")) > MAX_HEADER or "\n" in raw or "\r" in raw:
+        return None, "external_scope_too_large"
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "external_scope_required"
+    if not isinstance(body, dict):
+        return None, "external_scope_required"
+    version = body.get("v")
+    if version != 1:
+        return None, "external_scope_unsupported"
+    if body.get("dimensionId") != dimension_id:
+        return None, "external_scope_mismatch"
+    values = body.get("values")
+    if not isinstance(values, list) or not values:
+        return None, "external_scope_required"
+    clean, problem = _comma_values(values)
+    if problem == "too_large":
+        return None, "external_scope_too_large"
+    if clean is None:
+        return None, "external_scope_required"
+    return clean, None
+
+
+def _bindings(columns: list[Any]) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    for item in columns:
+        if not isinstance(item, dict):
+            continue
+        database = str(item.get("database") or "")
+        table = str(item.get("table") or "")
+        column = str(item.get("column") or "")
+        if database and table and column:
+            out.append((database, table, column))
+    return out
+
+
+def _column_for(view: TableView, columns: list[tuple[str, str, str]]) -> str | None:
+    for database, table, column in columns:
+        if view.matches(database, table):
+            return column
+    return None
+
+
+def _and(existing: FilterDef | None, clause: str, spec: ParamSpec) -> FilterDef:
+    if existing is None:
+        return FilterDef(clause, (spec,))
+    return FilterDef(f"({existing.where}) AND ({clause})", existing.params + (spec,))
+
+
+def _friendly(disclosure: dict[str, Any]) -> str:
+    names = disclosure.get("ownerNames") or []
+    label = ""
+    if isinstance(names, list):
+        clean = [str(n) for n in names if isinstance(n, str) and n.strip()][:3]
+        if clean:
+            label = "（" + "、".join(clean) + "）"
+    return _NOT_ENTITLED.format(names=label)
+
+
+def _payload_at(raw: str) -> int:
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(body, dict):
+        return 0
+    try:
+        return int(body.get("at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _publish(dimension_id: str, open_id: str, body: dict[str, Any], at: int) -> bool:
+    """False when Redis already holds a newer value, so memory is left alone."""
+
+    client = _redis()
+    if client is None:
+        return True
+    try:
+        payload = json.dumps(body, ensure_ascii=False)
+        written = client.eval(_CAS, 1, redis_key(dimension_id, open_id), payload, str(at))
+    except Exception:
+        return False
+    return int(written or 0) == 1
+
+
+def _claim(dimension_id: str, open_id: str, at: int) -> bool:
+    with _lock:
+        prev = _revision.get((dimension_id, open_id))
+        if prev is not None and prev > at:
+            return False
+        _revision[(dimension_id, open_id)] = at
+        return True
+
+
+def _newer_known(dimension_id: str, open_id: str, at: int) -> bool:
+    with _lock:
+        prev = _revision.get((dimension_id, open_id))
+    return prev is not None and prev > at
+
+
+def _split_scope(found: Any) -> tuple[list[str] | None, dict[tuple[str, str], list[str]] | None]:
+    if isinstance(found, list):
+        return found, None
+    if isinstance(found, dict) and isinstance(found.get("tables"), dict):
+        return None, found["tables"]
+    if isinstance(found, dict) and isinstance(found.get("values"), list):
+        return found["values"], None
+    return None, None
+
+
+def _pick_values(
+    view: TableView,
+    shared: list[str] | None,
+    per_table: dict[tuple[str, str], list[str]] | None,
+) -> list[str] | None:
+    if per_table is None:
+        return shared
+    for (database, table), values in per_table.items():
+        if view.matches(database, table):
+            return values
+    return None
+
+
+def _tables_from_list(rows: list[Any]) -> dict[tuple[str, str], list[str]]:
+    out: dict[tuple[str, str], list[str]] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        database = str(item.get("database") or "")
+        table = str(item.get("table") or "")
+        raw_values = item.get("values")
+        if isinstance(raw_values, list):
+            clean, problem = _comma_values(raw_values)
+        else:
+            clean, problem = None, "invalid"
+        if database and table and clean and not problem:
+            out[(database, table)] = clean
+    return out
+
+
+def _normalize_scope(local: Any) -> dict[str, Any] | None:
+    if isinstance(local, list) and local:
+        return {"values": list(local)}
+    if not isinstance(local, dict):
+        return None
+    if isinstance(local.get("tables"), list):
+        tables = _tables_from_list(local["tables"])
+        return {"tables": tables} if tables else None
+    if isinstance(local.get("tables"), dict) and local["tables"]:
+        return {"tables": local["tables"]}
+    values = local.get("values")
+    if isinstance(values, list) and values:
+        return {"values": list(values)}
+    return None
+
+
+def _scope_from_raw(raw: str) -> dict[str, Any] | None:
+    """None means the payload is present but must not be used, and must not fall back."""
+
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(body, dict) or body.get("pending") is True:
+        return None
+    if isinstance(body.get("tables"), list):
+        tables = _tables_from_list(body["tables"])
+        return {"tables": tables} if tables else None
+    values = body.get("values")
+    clean, problem = _comma_values(values) if isinstance(values, list) else (None, "invalid")
+    if problem or clean is None:
+        return None
+    return {"values": clean}
+
+
+def _payload(raw: str) -> list[str] | None:
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(body, dict) or body.get("pending") is True:
+        return None
+    values = body.get("values")
+    clean, problem = _comma_values(values) if isinstance(values, list) else (None, "invalid")
+    if problem or clean is None:
+        return None
+    return clean
+
+
+def _read(dimension_id: str, open_id: str, now: float) -> dict[str, Any] | None:
+    with _lock:
+        hit = _memory.get((dimension_id, open_id))
+        if hit is None or hit[0] <= now:
+            if hit is not None:
+                _memory.pop((dimension_id, open_id), None)
+            return None
+        scope = hit[1]
+        if isinstance(scope, dict):
+            return scope
+        return {"values": list(scope)}
+
+
+def _store(dimension_id: str, open_id: str, values: list[str], now: float | None = None) -> None:
+    _store_scope(dimension_id, open_id, {"values": list(values)}, now)
+
+
+def _store_scope(
+    dimension_id: str, open_id: str, scope: dict[str, Any], now: float | None = None
+) -> None:
+    clock = time.monotonic() if now is None else now
+    with _lock:
+        _memory[(dimension_id, open_id)] = (clock + MEMORY_TTL, scope)
+
+
+_BAD_VALUE = ("，", "、", ";", "；")
+
+
+def _comma_values(values: list[Any]) -> tuple[list[str] | None, str]:
+    """Split each item on English commas. A value is one token, never a second separator."""
+
+    if not isinstance(values, list) or not values:
+        return None, "invalid"
+    out: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or _control(item) or any(mark in item for mark in _BAD_VALUE):
+            return None, "invalid"
+        for part in item.split(","):
+            text = part.strip()
+            if not text:
+                continue
+            if len(text) > MAX_VALUE_LEN:
+                return None, "too_large"
+            if text not in out:
+                out.append(text)
+            if len(out) > MAX_VALUES:
+                return None, "too_large"
+    if not out:
+        return None, "invalid"
+    return out, ""
+
+
+def _control(value: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def _quote(name: str) -> str | None:
+    """Quote a catalog column. Spaces and non-ASCII stay; breakout characters do not."""
+
+    if not name or len(name) > 200 or _control(name) or any(token in name for token in _UNSAFE):
+        return None
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _redis_raw(dimension_id: str, open_id: str) -> str | None:
+    client = _redis()
+    if client is None:
+        return None
+    try:
+        value = client.get(redis_key(dimension_id, open_id))
+    except Exception:
+        return None
+    if isinstance(value, bytes):
+        return value.decode()
+    return value if isinstance(value, str) else None
+
+
+def _redis() -> Any:
+    try:
+        from adg_ext.redis_share import get_client
+    except Exception:
+        return None
+    return get_client()

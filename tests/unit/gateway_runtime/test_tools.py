@@ -439,10 +439,7 @@ def test_precomputed_lists_follow_allow_deny_and_do_not_rescan(
             if user_id == "user_c":
                 roles = ["role_a", "role_b"]
             caller = IdentityContext(user_id=user_id, roles=roles)
-            live = [
-                resource.id
-                for resource in service._visible_resources(identity=caller)
-            ]
+            live = [resource.id for resource in service._visible_resources(identity=caller)]
             listed = service.list_resources(
                 identity=caller, api_key_id="key_1", datasource_id="ds_1"
             )

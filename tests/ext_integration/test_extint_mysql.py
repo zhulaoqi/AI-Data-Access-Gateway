@@ -188,7 +188,9 @@ def test_other_tables_and_unknown_tables_answer_alike(
     a = query(gateway, key, "SELECT id FROM shop.dim")
     b = query(gateway, key, "SELECT id FROM shop.no_such_table")
     c = query(gateway, key, "SELECT table_name FROM information_schema.tables")
-    assert a["reason"] == b["reason"] == "table_not_accessible"
+    assert a["reason"] == "table_not_accessible:shop.dim"
+    assert b["reason"] == "table_not_accessible:shop.no_such_table"
+    assert a["reason"].split(":", 1)[0] == b["reason"].split(":", 1)[0]
     assert c["status"] == "rejected"
 
 

@@ -202,6 +202,66 @@ def _note_hit_databases(meta: dict[str, Any], sql: str, dialect: str | None) -> 
         meta["databases"] = [selected.strip()]
 
 
+def _person_values(session: Any, dimension_id: str, open_id: str) -> Any:
+    """One memory hit, else one Redis GET, else the last synced snapshot. Never the full table."""
+
+    from adg_ext.disclosure import _redis, resolve_scope, sync_name
+    from adg_ext.models import ExtSyncObject
+
+    def local() -> Any:
+        row = session.execute(
+            select(ExtSyncObject).where(
+                ExtSyncObject.object_type == "person_scope",
+                ExtSyncObject.name == sync_name(dimension_id, open_id),
+            )
+        ).scalar_one_or_none()
+        if row is None or not row.spec_json:
+            return None
+        try:
+            spec = json.loads(row.spec_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(spec, dict):
+            return None
+        if isinstance(spec.get("tables"), list) and spec["tables"]:
+            return {"tables": spec["tables"]}
+        values = spec.get("values")
+        if not isinstance(values, list):
+            return None
+        clean = [item for item in values if isinstance(item, str) and item]
+        return clean or None
+
+    def redis_get(key: str) -> str | None:
+        client = _redis()
+        if client is None:
+            raise RuntimeError("redis unavailable")
+        return client.get(key)
+
+    return resolve_scope(dimension_id, open_id, redis_get=redis_get, local_get=local)
+
+
+def _note_disclosure(
+    ctx: ctxmod.ExtContext,
+    audit_meta: dict[str, Any],
+    headers: dict[str, str | None] | None,
+    reason: str | None,
+    values: list[str] | None,
+) -> None:
+    """One line, and the same fields on the audit row, so a missing header is distinct from a missed splice."""
+
+    from adg_ext.disclosure import trace
+
+    fields = trace(
+        ctx.disclosure,
+        headers,
+        channel=str(audit_meta.get("channel") or "mcp"),
+        reason=reason,
+        values=values,
+    )
+    logger.info(kv(event="disclosure_query", **fields))
+    audit_meta["disclosure"] = fields
+
+
 def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> dict[str, Any]:
     """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
 
@@ -315,6 +375,7 @@ def run(
     event_type: str,
     request_id: str | None = None,
     audit_extra: dict[str, Any] | None = None,
+    disclosure_headers: dict[str, str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Run the extended flow; ``None`` means "not managed by the extension, use upstream"."""
 
@@ -339,6 +400,12 @@ def run(
             out["hint"] = hint
         return out
 
+    # JDBC 不读人员、不查取值、不拼按人条件。渠道在委托请求里就是 jdbc。
+    jdbc = audit_meta.get("channel") == "jdbc"
+    if ctx.disclosure and not jdbc:
+        if ctx.disclosure.get("conflict"):
+            _note_disclosure(ctx, audit_meta, disclosure_headers, "disclosure_conflict", None)
+            return reject("permission_rejected", "disclosure_conflict")
     if limit < 1:
         return reject("sql_rejected", "runtime_limit_invalid")
     if limit > settings.runtime_query_max_limit:
@@ -387,17 +454,43 @@ def run(
         resource_paths=verdict.result.accessed_resources,
     )
     declared_ids = set(resource_ids)
-    # Unknown, undeclared and unauthorised tables answer identically: no existence oracle.
+    # Unknown, undeclared and unauthorised tables answer with the same code. The suffix is
+    # only the name written in the SQL, so it does not say whether that table exists.
     if len(actual) != len(verdict.result.accessed_resources) or not {r.id for r in actual}.issubset(
         declared_ids
     ):
-        return reject("permission_rejected", "table_not_accessible")
+        denied = inaccessible_tables(verdict.result.accessed_resources, actual, declared_ids)
+        reason = (
+            ",".join(f"table_not_accessible:{path}" for path in denied) or "table_not_accessible"
+        )
+        return reject("permission_rejected", reason)
 
     disabled_field = svc._first_disabled_field(actual, verdict.result.accessed_fields)
     if disabled_field is not None:
         return reject("permission_rejected", f"field_disabled:{disabled_field}")
 
     views, _ = build_views(svc, ctx, actual)
+    if ctx.disclosure and not jdbc:
+        from adg_ext.disclosure import bind as bind_disclosure
+
+        reason = bind_disclosure(
+            ctx.disclosure,
+            views,
+            ctx.user_params,
+            channel=str(audit_meta.get("channel") or "mcp"),
+            headers=disclosure_headers,
+            lookup=lambda dimension_id, open_id: _person_values(session, dimension_id, open_id),
+        )
+        bound = ctx.user_params.get("gw_disclosure_values")
+        _note_disclosure(
+            ctx,
+            audit_meta,
+            disclosure_headers,
+            reason,
+            bound if isinstance(bound, list) else None,
+        )
+        if reason:
+            return reject("permission_rejected", reason)
     outcome = rewrite(
         verdict,
         views,
@@ -852,3 +945,30 @@ def _run_connector(
         )
     )
     return "connector_operation_error"
+
+
+def inaccessible_tables(
+    accessed: list[str], actual: list[Resource], declared_ids: set[str]
+) -> list[str]:
+    """SQL paths that do not uniquely match a declared, authorised resource.
+
+    Each result is the path written in the statement, never a name the caller did not send.
+    """
+
+    allowed = [
+        resource.path for resource in actual if resource.id in declared_ids and resource.path
+    ]
+    denied: list[str] = []
+    for path in accessed:
+        token = _table_token(path)
+        if not token:
+            continue
+        hits = [item for item in allowed if item == path or item.endswith("." + path)]
+        if len(hits) != 1:
+            denied.append(token)
+    return denied
+
+
+def _table_token(path: str) -> str:
+    cleaned = "".join(ch for ch in path if ch.isalnum() or ch in "._$")
+    return cleaned[:128]

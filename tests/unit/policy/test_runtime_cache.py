@@ -2,7 +2,14 @@
 
 from typing import Any
 
-from adg.runtime_cache import match_table_paths, refresh, remember
+from adg.runtime_cache import (
+    bump_visible_epoch,
+    load_visible,
+    match_table_paths,
+    refresh,
+    remember,
+    visible_epoch,
+)
 
 
 class _MemoryRedis:
@@ -23,6 +30,7 @@ class _MemoryRedis:
         if self.fail_set:
             raise ConnectionError("down")
         self.seq[key] = self.seq.get(key, 0) + 1
+        self.store[key] = str(self.seq[key])
         return self.seq[key]
 
     def eval(self, script: str, numkeys: int, *args: str) -> int:
@@ -183,6 +191,47 @@ def test_match_drops_a_table_under_a_disabled_parent() -> None:
         },
     ]
     assert match_table_paths(index, ["orders"]) == []
+
+
+def test_visible_list_is_rebuilt_when_the_generation_changes(monkeypatch: Any) -> None:
+    client = _MemoryRedis()
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+    calls = {"n": 0}
+
+    def load() -> dict[str, list[dict[str, Any]]]:
+        calls["n"] += 1
+        return {"datasources": [{"id": "ds"}], "resources": [{"id": f"r{calls['n']}"}]}
+
+    assert visible_epoch() == 0
+    first = load_visible("user-1:role-a", visible_epoch(), load)
+    second = load_visible("user-1:role-a", visible_epoch(), load)
+    assert first["resources"] == [{"id": "r1"}]
+    assert second["resources"] == [{"id": "r1"}]
+    assert calls["n"] == 1
+
+    bump_visible_epoch()
+    third = load_visible("user-1:role-a", visible_epoch(), load)
+    assert third["resources"] == [{"id": "r2"}]
+    assert calls["n"] == 2
+    assert load_visible("user-1:role-a", visible_epoch(), load)["resources"] == [{"id": "r2"}]
+    assert calls["n"] == 2
+    stale = load_visible("user-1:role-a", 0, load)
+    assert stale["resources"] == [{"id": "r3"}]
+    assert load_visible("user-1:role-a", visible_epoch(), load)["resources"] == [{"id": "r2"}]
+    assert calls["n"] == 3
+
+
+def test_visible_list_falls_back_when_redis_cannot_be_read(monkeypatch: Any) -> None:
+    client = _MemoryRedis()
+    client.fail_get = True
+    monkeypatch.setattr("adg.runtime_cache.get_client", lambda: client)
+
+    def load() -> dict[str, list[dict[str, Any]]]:
+        return {"datasources": [], "resources": [{"id": "r"}]}
+
+    assert visible_epoch() is None
+    assert load_visible("user-1:", None, load)["resources"] == [{"id": "r"}]
+    assert client.store == {}
 
 
 def test_match_skips_ambiguous_paths() -> None:

@@ -1,6 +1,7 @@
 """Rescan of a synced datasource: the catalog follows the live source although the spec is unchanged."""
 
 import hashlib
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -113,7 +114,15 @@ def test_rescan_picks_up_tables_the_first_scan_did_not_see(client: tuple[TestCli
 
     r = http.post(f"/admin/ext/sync/datasource_account/{DS}/rescan", headers=ADMIN)
     assert r.status_code == 200, r.text
-    assert r.json()["status"] == "ok"
+    assert r.json()["status"] in {"queued", "reading", "writing", "completed"}
+    deadline = time.monotonic() + 5
+    status = r.json()
+    while status["status"] != "completed" or status.get("pending"):
+        assert time.monotonic() < deadline, status
+        polled = http.get(f"/admin/ext/sync/datasource_account/{DS}/rescan", headers=ADMIN)
+        assert polled.status_code == 200, polled.text
+        status = polled.json()
+        time.sleep(0.02)
     assert any(p.endswith("admin_logs") for p in _paths(factory))
 
 
