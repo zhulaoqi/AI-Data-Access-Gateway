@@ -1,6 +1,7 @@
 """HTTP surface of the extension: sync, dry-run and audit queries (admin), delegated (entry)."""
 
 import logging
+import threading
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -67,6 +68,61 @@ audit_router = APIRouter(
 )
 
 
+_warm_guard = threading.Lock()
+_warm_queue: list[tuple[Any, str, str | None, list[str]]] = []
+_warm_running = False
+
+
+def _defer_warm(
+    request: Request,
+    object_type: str,
+    external_id: str | None,
+    role_ids: list[str],
+) -> None:
+    """Rebuild caches after the response is sent.
+
+    A role or user write commits in about a second, then rebuilding every user's
+    catalog snapshot can take longer than the caller's read timeout. The caller
+    would record a timeout even though the row is already stored, and every retry
+    would rebuild again. The rebuild therefore happens off the request.
+    """
+
+    factory = getattr(request.app.state, "session_factory", None)
+    if factory is None:
+        logger.warning(kv(event="sync_warm_skipped", type=object_type, reason="no_session_factory"))
+        return
+    global _warm_running
+    with _warm_guard:
+        _warm_queue.append((factory, object_type, external_id, list(role_ids)))
+        if _warm_running:
+            return
+        _warm_running = True
+
+    def run() -> None:
+        global _warm_running
+        while True:
+            with _warm_guard:
+                batch = list(_warm_queue)
+                _warm_queue.clear()
+            if not batch:
+                with _warm_guard:
+                    if _warm_queue:
+                        continue
+                    _warm_running = False
+                    return
+            for item_factory, kind, ext_id, roles in batch:
+                try:
+                    with item_factory() as session:
+                        _warm_cache(session, kind, ext_id, roles)
+                except Exception:
+                    logger.warning(
+                        kv(event="sync_warm_failed", type=kind),
+                        exc_info=True,
+                    )
+
+    threading.Thread(target=run, name="sync-cache-warm", daemon=True).start()
+
+
 def _warm_cache(
     session: Session,
     object_type: str,
@@ -109,6 +165,7 @@ def put_object(
     object_type: str,
     name: str,
     body: SyncBody,
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
 ) -> dict[str, str]:
     service = SyncService(session)
@@ -127,7 +184,8 @@ def put_object(
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
-    _warm_cache(session, object_type, external_id, [])
+    if service.changed:
+        _defer_warm(request, object_type, external_id, [])
     return {"externalId": external_id}
 
 
@@ -135,6 +193,7 @@ def put_object(
 def delete_object(
     object_type: str,
     name: str,
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
 ) -> Response:
     service = SyncService(session)
@@ -146,7 +205,6 @@ def delete_object(
     except ExtSyncError as error:
         session.rollback()
         raise _fail(error) from error
-    _warm_cache(session, object_type, external_id, role_ids)
     if external_id and object_type in {"user", "credential"}:
         # revocation must also stop requests that are already queued or running
         cancelled = get_admission().revoke(external_id)
@@ -154,6 +212,7 @@ def delete_object(
             logger.info(
                 kv(event="revoked_inflight", type=object_type, name=name, cancelled=cancelled)
             )
+    _defer_warm(request, object_type, external_id, role_ids)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

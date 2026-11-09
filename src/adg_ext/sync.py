@@ -208,6 +208,9 @@ class SyncService:
         self._registry = registry or get_connector_registry()
         # Set by the HTTP layer after the live catalog was scanned with no connection held.
         self.prepared_snapshot: dict[str, Any] | None = None
+        # False when this put matched what is already stored. The HTTP layer must not rebuild
+        # caches for that: the previous response may have timed out after the commit.
+        self.changed = False
 
     # ---- public API -----------------------------------------------------------------------
 
@@ -218,6 +221,7 @@ class SyncService:
         existing = self._find(object_type, name)
         if existing is not None and existing.hash == hash_ and existing.external_id:
             logger.debug(kv(event="sync_put", type=object_type, name=name, changed=False))
+            self.changed = False
             return existing.external_id
         if object_type == "person_scope" and _older_than_stored(existing, spec):
             logger.info(
@@ -229,6 +233,7 @@ class SyncService:
                     reason="older_scope",
                 )
             )
+            self.changed = False
             return existing.external_id or name
         handler = getattr(self, f"_put_{object_type}")
         external_id: str = handler(name, spec, existing)
@@ -249,6 +254,7 @@ class SyncService:
                 external_id=external_id,
             )
         )
+        self.changed = True
         return external_id
 
     def delete(self, object_type: str, name: str) -> None:

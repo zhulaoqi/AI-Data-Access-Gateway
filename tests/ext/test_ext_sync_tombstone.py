@@ -1,6 +1,7 @@
 """K-3 and the replay risk: revoked credentials and deleted users are tombstones for the sync API."""
 
 import hashlib
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -202,6 +203,34 @@ def test_reinstating_lifts_the_tombstone_explicitly(env: Env) -> None:
     assert env.reinstate("credential", CRED).json() == {"reinstated": True}
     assert env.put("credential", CRED, env.cred_spec()).status_code == 200
     assert env.key_authenticates()
+
+
+def test_repeat_put_acks_without_rebuilding_the_catalog(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    warmed: list[str] = []
+
+    def mark(session: object, object_type: str, external_id: str | None, role_ids: list[str]) -> None:
+        del session, external_id, role_ids
+        warmed.append(object_type)
+
+    monkeypatch.setattr("adg_ext.router._warm_cache", mark)
+    spec = {"tables": []}
+    name = "gw:role:warm:v1"
+    started = time.monotonic()
+    assert env.put("role", name, spec).status_code == 200
+    assert time.monotonic() - started < 1
+    deadline = time.monotonic() + 2
+    while not warmed and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert warmed == ["role"]
+
+    warmed.clear()
+    started = time.monotonic()
+    again = env.put("role", name, spec)
+    time.sleep(0.3)
+    assert again.status_code == 200
+    assert again.json()["externalId"]
+    assert warmed == []
+    assert time.monotonic() - started < 1
 
 
 def test_reinstate_is_admin_only_and_validates_its_arguments(env: Env) -> None:
