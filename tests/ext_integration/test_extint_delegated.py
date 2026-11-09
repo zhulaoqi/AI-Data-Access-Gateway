@@ -120,7 +120,7 @@ def test_audit_carries_request_id_and_channel_for_every_outcome(
     column = post("SELECT ssn FROM shop.orders", "req-ssn").json()
     assert column["reason"].startswith("column_not_allowed")
     other = post("SELECT id FROM shop.dim", "req-dim", channel="JDBC").json()
-    assert other["reason"] == "table_not_accessible"
+    assert other["reason"] == "table_not_accessible:shop.dim"
     insert = post("DELETE FROM shop.orders", "req-del").json()
     assert insert["status"] == "rejected"
 
@@ -147,7 +147,7 @@ def test_audit_carries_request_id_and_channel_for_every_outcome(
     for request_id, reason in [
         ("req-wild", "wildcard_projection_not_allowed"),
         ("req-ssn", "column_not_allowed:ssn"),
-        ("req-dim", "table_not_accessible"),
+        ("req-dim", "table_not_accessible:shop.dim"),
         ("req-del", None),
         ("req-busy", "admission_queue_full"),
     ]:

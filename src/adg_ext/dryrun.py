@@ -27,6 +27,18 @@ def _params(spec: dict[str, Any]) -> tuple[ParamSpec, ...]:
     )
 
 
+def _missing_tables(views: list[TableView], resources: list[str]) -> list[str]:
+    """Paths in the statement that do not match exactly one table in the profile."""
+
+    missing: list[str] = []
+    for path in resources:
+        db, _, name = path.rpartition(".")
+        matched = [view for view in views if view.matches(db or None, name)]
+        if len(matched) != 1:
+            missing.append(path)
+    return missing
+
+
 def _tables_in_statement(views: list[TableView], resources: list[str]) -> list[TableView] | None:
     """Spec tables this statement actually reads.
 
@@ -116,6 +128,13 @@ def dry_run(body: dict[str, Any]) -> dict[str, Any]:
     # unknown column list would otherwise look like "every table has this column".
     judged = views
     if verdict.allowed:
+        missing = _missing_tables(views, verdict.result.accessed_resources)
+        if missing:
+            return {
+                "allowed": False,
+                "rejectReasons": [f"table_not_accessible:{path}" for path in missing],
+                "warnings": warnings,
+            }
         judged = _tables_in_statement(views, verdict.result.accessed_resources)
         if judged is None:
             return {

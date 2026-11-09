@@ -449,7 +449,8 @@ def rewrite(
     def lookup(db: str | None, name: str) -> Binding | None:
         found = [v for v in views if v.matches(db, name)]
         if len(found) != 1:
-            raise ExtRejection("table_not_accessible")
+            shown = f"{db}.{name}" if db else name
+            raise ExtRejection("table_not_accessible", detail=shown)
         return _predicate(found[0], user_params, dialect)
 
     try:

@@ -314,7 +314,7 @@ def test_dry_run_matches_the_live_decision(gateway: Gateway, mysql_seed: dict[st
     other = gateway.client.post(
         "/admin/ext/dry-run", json={**base, "sql": "SELECT id FROM shop.other"}, headers=h
     ).json()
-    assert other["rejectReasons"] == ["table_not_accessible"]
+    assert other["rejectReasons"] == ["table_not_accessible:shop.other"]
     noparam = gateway.client.post(
         "/admin/ext/dry-run",
         json={**base, "params": {}, "sql": "SELECT id FROM shop.orders"},

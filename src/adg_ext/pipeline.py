@@ -454,11 +454,16 @@ def run(
         resource_paths=verdict.result.accessed_resources,
     )
     declared_ids = set(resource_ids)
-    # Unknown, undeclared and unauthorised tables answer identically: no existence oracle.
+    # Unknown, undeclared and unauthorised tables answer with the same code. The suffix is
+    # only the name written in the SQL, so it does not say whether that table exists.
     if len(actual) != len(verdict.result.accessed_resources) or not {r.id for r in actual}.issubset(
         declared_ids
     ):
-        return reject("permission_rejected", "table_not_accessible")
+        denied = inaccessible_tables(verdict.result.accessed_resources, actual, declared_ids)
+        reason = (
+            ",".join(f"table_not_accessible:{path}" for path in denied) or "table_not_accessible"
+        )
+        return reject("permission_rejected", reason)
 
     disabled_field = svc._first_disabled_field(actual, verdict.result.accessed_fields)
     if disabled_field is not None:
@@ -940,3 +945,30 @@ def _run_connector(
         )
     )
     return "connector_operation_error"
+
+
+def inaccessible_tables(
+    accessed: list[str], actual: list[Resource], declared_ids: set[str]
+) -> list[str]:
+    """SQL paths that do not uniquely match a declared, authorised resource.
+
+    Each result is the path written in the statement, never a name the caller did not send.
+    """
+
+    allowed = [
+        resource.path for resource in actual if resource.id in declared_ids and resource.path
+    ]
+    denied: list[str] = []
+    for path in accessed:
+        token = _table_token(path)
+        if not token:
+            continue
+        hits = [item for item in allowed if item == path or item.endswith("." + path)]
+        if len(hits) != 1:
+            denied.append(token)
+    return denied
+
+
+def _table_token(path: str) -> str:
+    cleaned = "".join(ch for ch in path if ch.isalnum() or ch in "._$")
+    return cleaned[:128]

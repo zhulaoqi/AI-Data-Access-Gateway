@@ -42,4 +42,26 @@ def test_column_missing_on_the_queried_table_is_still_rejected() -> None:
 
 def test_table_outside_the_profile_is_still_rejected() -> None:
     result = _run("SELECT id FROM info.missing")
-    assert result["rejectReasons"] == ["table_not_accessible"]
+    assert result["rejectReasons"] == ["table_not_accessible:info.missing"]
+
+
+def test_inaccessible_tables_names_only_the_paths_written_in_sql() -> None:
+    from adg.control_plane.models.resource import Resource
+    from adg_ext.pipeline import inaccessible_tables
+
+    orders = Resource(
+        id="r-orders",
+        datasource_id="d",
+        kind="relational_table",
+        name="orders",
+        path="shop.orders",
+        display_name="orders",
+        status="active",
+        metadata_json="{}",
+    )
+    assert inaccessible_tables(["shop.orders"], [orders], {"r-orders"}) == []
+    assert inaccessible_tables(["shop.dim", "shop.no_such_table"], [orders], {"r-orders"}) == [
+        "shop.dim",
+        "shop.no_such_table",
+    ]
+    assert inaccessible_tables(["shop.orders"], [orders], set()) == ["shop.orders"]
