@@ -182,6 +182,27 @@ def test_deny_syntax_tokens_forbid_the_matching_constructs() -> None:
     assert ok.allowed
 
 
+def test_postgres_accepts_navicat_mysql_identifier_quotes() -> None:
+    opened = "SELECT * FROM `public`.`actor_catalog` LIMIT 0, 1000"
+    parsed = verdict(opened, "postgres")
+    assert "wildcard_projection_not_allowed" in parsed.reasons
+    assert not any(reason.startswith("parse_error") for reason in parsed.reasons)
+
+    listed = "SELECT id FROM `public`.`actor_catalog` WHERE id = 'a`b' LIMIT 0, 1000"
+    result = verdict(listed, "postgres", reject_wildcards=False)
+    assert result.allowed, result.reasons
+    normalized = result.result.normalized_sql or ""
+    assert '"public"."actor_catalog"' in normalized
+    assert "LIMIT 1000 OFFSET 0" in normalized
+    assert "'a`b'" in normalized
+
+
+def test_postgres_string_backtick_is_not_rewritten() -> None:
+    result = verdict("SELECT id FROM t WHERE note = 'a`b'", "postgres", reject_wildcards=False)
+    assert result.allowed, result.reasons
+    assert "'a`b'" in (result.result.normalized_sql or "")
+
+
 def test_postgres_rejects_file_access_and_system_schemas() -> None:
     cases = {
         "copy t to stdout": "statement_not_allowed",

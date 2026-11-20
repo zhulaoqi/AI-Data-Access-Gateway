@@ -292,12 +292,19 @@ def check(
         dialect=dialect,
     )
     try:
-        statements = [
-            cast(exp.Expression, s) for s in sqlglot.parse(sql, read=dialect) if s is not None
-        ]
+        statements = _statements(sql, dialect)
     except sqlglot.errors.SqlglotError:
-        raw = guard.check(sql)
-        return GuardVerdict(raw, None, list(raw.rejection_reasons) or ["parse_error"])
+        # Navicat 连的是 MySQL 协议入口，打开表时用反引号。PostgreSQL 解析会直接失败。
+        translated = _mysql_quoted_as_postgres(sql) if dialect == "postgres" else None
+        if translated is None:
+            raw = guard.check(sql)
+            return GuardVerdict(raw, None, list(raw.rejection_reasons) or ["parse_error"])
+        sql = translated
+        try:
+            statements = _statements(sql, dialect)
+        except sqlglot.errors.SqlglotError:
+            raw = guard.check(sql)
+            return GuardVerdict(raw, None, list(raw.rejection_reasons) or ["parse_error"])
     if len(statements) != 1:
         raw = guard.check(sql)
         return GuardVerdict(raw, None, list(raw.rejection_reasons) or ["multiple_statements"])
@@ -328,6 +335,27 @@ def check(
         ):
             reasons.append("time_range_required")
     return GuardVerdict(upstream, statement, reasons)
+
+
+def _statements(sql: str, dialect: str | None) -> list[exp.Expression]:
+    return [cast(exp.Expression, s) for s in sqlglot.parse(sql, read=dialect) if s is not None]
+
+
+def _mysql_quoted_as_postgres(sql: str) -> str | None:
+    """把仅含一条语句、且用 MySQL 反引号的 SQL 改写成 PostgreSQL 标识符。
+
+    解析不了，或不止一条语句时返回 None，调用方仍按原来的解析失败处理。
+    """
+
+    if "`" not in sql:
+        return None
+    try:
+        statements = _statements(sql, "mysql")
+    except sqlglot.errors.SqlglotError:
+        return None
+    if len(statements) != 1:
+        return None
+    return statements[0].sql(dialect="postgres")
 
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
