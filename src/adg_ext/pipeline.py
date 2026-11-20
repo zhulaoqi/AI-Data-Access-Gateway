@@ -32,6 +32,7 @@ from adg_ext import clientip, guard
 from adg_ext import context as ctxmod
 from adg_ext.admission import Admission, AdmissionRejected, Ticket
 from adg_ext.analyze import FilterDef, TableView, referenced_databases, rewrite
+from adg_ext.caller import stamp as stamp_caller
 from adg_ext.config import get_ext_settings
 from adg_ext.credential_usage import note_api_key
 from adg_ext.fingerprint import sql_fingerprint
@@ -266,7 +267,8 @@ def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> d
     """Metadata every audit row of one query carries: ``channel`` and (if known) ``request_id``.
 
     ``channel`` defaults to ``mcp`` (the MCP/HTTP runtime path never passes one); the delegated
-    entry passes ``jdbc`` etc. through ``audit_extra``.
+    entry passes ``jdbc`` etc. through ``audit_extra``. An MCP call may also carry ``caller``
+    from the ``X-GW-Caller`` header. JDBC rows never do.
     """
 
     meta: dict[str, Any] = {"channel": "mcp"}
@@ -280,7 +282,7 @@ def _audit_meta(request_id: str | None, audit_extra: dict[str, Any] | None) -> d
             meta.pop("client_ip", None)
     if request_id:
         meta["request_id"] = request_id
-    return meta
+    return stamp_caller(meta)
 
 
 def _record_rejection(

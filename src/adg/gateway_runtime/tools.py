@@ -26,6 +26,7 @@ from adg.shared.errors import NotFoundError
 from adg.sql_guard.guard import SqlGuard
 from adg_ext import pipeline as ext_pipeline
 from adg_ext.audience import audience_reason
+from adg_ext.caller import stamp as stamp_caller
 from adg_ext.catalog_notes import NoteIndex, prefer, table_address
 from adg_ext.config import ext_enabled
 from adg_ext.models import ExtUserAttribute
@@ -582,11 +583,13 @@ class GatewayRuntimeService:
             query_id=query_id,
             sql_text=guard_result.normalized_sql,
             reason=None,
-            metadata={
-                "warnings": guard_result.warnings,
-                "accessed_fields": guard_result.accessed_fields,
-                "masked_columns": masked_columns,
-            },
+            metadata=stamp_caller(
+                {
+                    "warnings": guard_result.warnings,
+                    "accessed_fields": guard_result.accessed_fields,
+                    "masked_columns": masked_columns,
+                }
+            ),
         )
         self._session.flush()
         return {
@@ -921,7 +924,7 @@ class GatewayRuntimeService:
             query_id=None,
             sql_text=None,
             reason=None,
-            metadata={"tool": tool_name},
+            metadata=stamp_caller({"tool": tool_name}),
         )
         self._session.flush()
 
@@ -947,7 +950,7 @@ class GatewayRuntimeService:
             query_id=None,
             sql_text=sql_text,
             reason=reason,
-            metadata={},
+            metadata=stamp_caller({}),
         )
         self._session.flush()
 
@@ -977,11 +980,13 @@ class GatewayRuntimeService:
             query_id=query_id,
             sql_text=sql_text,
             reason=error_type,
-            metadata={
-                "warnings": warnings,
-                "accessed_fields": accessed_fields,
-                "error_type": error_type,
-                "query_id": query_id,
-            },
+            metadata=stamp_caller(
+                {
+                    "warnings": warnings,
+                    "accessed_fields": accessed_fields,
+                    "error_type": error_type,
+                    "query_id": query_id,
+                }
+            ),
         )
         self._session.flush()

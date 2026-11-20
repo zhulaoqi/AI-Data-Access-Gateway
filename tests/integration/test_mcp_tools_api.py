@@ -291,6 +291,23 @@ def test_mcp_tool_route_rejects_request_identity_fields() -> None:
     assert response.json()["detail"] == "Runtime identity fields are not accepted"
 
 
+def test_mcp_tool_route_records_caller_header() -> None:
+    client, session_factory = build_mcp_app()
+
+    response = client.post(
+        "/api/tools/list_datasources",
+        json={},
+        headers={"X-ADG-API-Key": "adg_runtime", "X-GW-Caller": "  alice@example.com  "},
+    )
+
+    assert response.status_code == 200
+    with session_factory() as session:
+        event = session.execute(select(AuditEvent)).scalar_one()
+    assert event.event_type == "metadata_discovery"
+    assert event.audit_metadata["channel"] == "mcp"
+    assert event.audit_metadata["caller"] == "alice@example.com"
+
+
 def test_mcp_tool_route_commits_runtime_audit_events() -> None:
     client, session_factory = build_mcp_app()
 

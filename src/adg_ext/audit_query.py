@@ -479,6 +479,9 @@ def event_detail(
     out["accessedFields"] = (
         [a for a in accessed if isinstance(a, str)] if isinstance(accessed, list) else []
     )
+    # Caller is an MCP audit label. JDBC details omit the field entirely.
+    if out.get("channel") == "mcp":
+        out["caller"] = _meta_text(meta, "caller")
     AuditService(session).record_sql_view(
         api_key_id=api_key_id, user_id=user_id, target_event=event
     )

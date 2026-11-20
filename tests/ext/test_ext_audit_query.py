@@ -438,7 +438,11 @@ def _add_channel_rows(env: Env) -> None:
             env,
             ago=timedelta(minutes=22),
             query_id="qry_m1",
-            metadata={"phase": "completed", "channel": "mcp"},
+            metadata={
+                "phase": "completed",
+                "channel": "mcp",
+                "caller": "alice@example.com",
+            },
         )
         add(
             session,
@@ -468,11 +472,17 @@ def test_events_expose_request_id_and_channel(env: Env) -> None:
     assert rejected["queryId"] is None and rejected["decision"] == "rejected"
     assert items[env.ids["mcp_done"]]["channel"] == "mcp"
     assert items[env.ids["mcp_done"]]["requestId"] is None
+    assert "caller" not in items[env.ids["mcp_done"]]
     old = items[env.ids["done"]]
     assert old["requestId"] is None and old["channel"] is None
     detail = env.get(f"/ext/audit/events/{env.ids['jdbc_done']}").json()
     assert detail["requestId"] == "req-100" and detail["channel"] == "jdbc"
+    assert "caller" not in detail
     assert env.get(f"/ext/audit/events/{env.ids['jdbc_rejected']}").json()["requestId"] == "req-101"
+    mcp = env.get(f"/ext/audit/events/{env.ids['mcp_done']}").json()
+    assert mcp["caller"] == "alice@example.com"
+    bare = env.get(f"/ext/audit/events/{env.ids['forged']}").json()
+    assert bare["channel"] == "mcp" and bare["caller"] is None
 
 
 def test_filter_by_request_id_and_channel(env: Env) -> None:

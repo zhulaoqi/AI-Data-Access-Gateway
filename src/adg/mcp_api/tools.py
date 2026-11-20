@@ -8,6 +8,8 @@ from adg.control_plane.db import get_session
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.mcp_api.agent_message import attach_agent_message
 from adg.mcp_api.runtime_tools import dispatch_runtime_tool_call
+from adg_ext.caller import HEADER as CALLER_HEADER
+from adg_ext.caller import bound as bind_caller
 
 router = APIRouter(prefix="/api/tools", tags=["mcp"])
 
@@ -20,6 +22,7 @@ def call_tool(
     api_key: Annotated[AuthenticatedRuntimeKey, Depends(require_runtime_api_key)],
     x_gw_person: Annotated[str | None, Header(alias="X-GW-Person")] = None,
     x_gw_scope: Annotated[str | None, Header(alias="X-GW-Scope")] = None,
+    x_gw_caller: Annotated[str | None, Header(alias=CALLER_HEADER)] = None,
 ) -> dict[str, Any]:
     """Dispatch one MCP-style HTTP tool call to the shared runtime service."""
 
@@ -27,14 +30,15 @@ def call_tool(
 
     # Keep transport routing thin so future MCP transports can reuse GatewayRuntimeService.
     try:
-        response = dispatch_runtime_tool_call(
-            runtime,
-            tool_name,
-            payload,
-            api_key.runtime_identity,
-            api_key.id,
-            {"person": x_gw_person, "scope": x_gw_scope},
-        )
+        with bind_caller(x_gw_caller):
+            response = dispatch_runtime_tool_call(
+                runtime,
+                tool_name,
+                payload,
+                api_key.runtime_identity,
+                api_key.id,
+                {"person": x_gw_person, "scope": x_gw_scope},
+            )
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

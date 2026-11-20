@@ -17,6 +17,8 @@ from adg.control_plane.db import SessionLocal
 from adg.gateway_runtime.tools import GatewayRuntimeService
 from adg.mcp_api.agent_message import attach_agent_message
 from adg.mcp_api.runtime_tools import RUNTIME_TOOL_DEFINITIONS, dispatch_runtime_tool_call
+from adg_ext.caller import HEADER as CALLER_HEADER
+from adg_ext.caller import bound as bind_caller
 
 _TOOL_DESCRIPTION = {item.name: item.description for item in RUNTIME_TOOL_DEFINITIONS}
 
@@ -194,17 +196,18 @@ def _run_runtime_tool(ctx: McpContext, tool_name: str, payload: dict[str, Any]) 
 
     with session_factory() as session:
         runtime = GatewayRuntimeService(session)
-        response = dispatch_runtime_tool_call(
-            runtime,
-            tool_name,
-            payload,
-            authenticated.runtime_identity,
-            authenticated.id,
-            {
-                "person": request.headers.get("x-gw-person"),
-                "scope": request.headers.get("x-gw-scope"),
-            },
-        )
+        with bind_caller(request.headers.get(CALLER_HEADER)):
+            response = dispatch_runtime_tool_call(
+                runtime,
+                tool_name,
+                payload,
+                authenticated.runtime_identity,
+                authenticated.id,
+                {
+                    "person": request.headers.get("x-gw-person"),
+                    "scope": request.headers.get("x-gw-scope"),
+                },
+            )
         session.commit()
         return attach_agent_message(response)
 
